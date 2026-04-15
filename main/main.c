@@ -56,6 +56,7 @@
 #include "wc_mdns.h"
 #include "hw_config.h"
 #include "dev_status.h"
+#include "precondition.h"
 #include "debug_logs.h"
 #include "debug_logs_config.h"
 
@@ -236,10 +237,13 @@ static void can_tx_task(void *pvParameters)
 	}
 }
 #define HEAP_CAPS   (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+#define PRECONDITION_TICK_PERIOD_US 40000
+
 static void can_rx_task(void *pvParameters)
 {
 //	static uint32_t num_msg = 0;
 	static int64_t time_old = 0;
+	static int64_t precondition_tick_last = 0;
 //	float bvoltage = 0;
 //	time_old = esp_timer_get_time();
 	while(1)
@@ -274,8 +278,23 @@ static void can_rx_task(void *pvParameters)
 		
 		dev_status_wait_for_bits(DEV_AWAKE_BIT, portMAX_DELAY);
 
+		// TODO(ejones): ideally, we'd use esp_timer_start_periodic. but for now,
+		// i don't want to deal with race conditions on the precondition globals, so
+		// let's just do it here for now (should be good enough for most cases)
+        if ((esp_timer_get_time() - precondition_tick_last) >= PRECONDITION_TICK_PERIOD_US) {
+            precondition_tick_last = esp_timer_get_time();
+            precondition_tick();
+        }
+
         while(can_receive(&rx_msg, 0) ==  ESP_OK)
         {
+            precondition_can_rx_hook(&rx_msg);
+            {
+                twai_message_t fwd_msg = rx_msg;
+                if (precondition_fwd_hook(&fwd_msg) == FWD_MODIFIED) {
+                    can_send(&fwd_msg, 1);
+                }
+            }
 //        	num_msg++;
 
         	process_led(1);
