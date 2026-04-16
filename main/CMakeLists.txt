@@ -37,6 +37,7 @@ set(srcs
     "multipart_upload.c"
     "sync_sys_time.c"
     "config_mode.c"
+    "precondition.c"
 )
 
 # Define required components
