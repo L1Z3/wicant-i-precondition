@@ -113,7 +113,7 @@ dependencies:
       type: service
     version: 1.19.2
   meatpihq/usb_host_ch34x_vcp:
-    component_hash: a448631fda325ce5f3f1b4bb4707c7cb075c6a4d71ff4026a22ef2191efc9af4
+    component_hash: 82582a9b425e0939583b806cb8fdf0789ed60c80e1a3fb0ebd900227379d0f3b
     dependencies:
     - name: espressif/usb_host_cdc_acm
       public: true
@@ -126,7 +126,7 @@ dependencies:
       type: git
     version: c80a574e26b4807816fdcb939218d143841b852c
   nopnop2002/sqlite3:
-    component_hash: 3deae8ed52e238e19eb13d2a347f1b2a9efe1d7e04007be6df7b04555a5543f7
+    component_hash: 5cdde4e74291922e8da9a1ccfc870fe01a0893a6df3ebdd558ff8cd17869111f
     dependencies: []
     source:
       git: https://github.com/nopnop2002/esp32-idf-sqlite3.git
