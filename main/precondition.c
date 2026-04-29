@@ -189,6 +189,8 @@ static void start_preconditioning(uint32_t now) {
     precondition_starting_confirmed = false;
     precondition_started_confirmed = false;
     precondition_retries = 0U;
+    // HACK: disable retries
+    precondition_starting_confirmed = true;
 }
 
 static void stop_preconditioning(uint32_t now) {
@@ -197,48 +199,51 @@ static void stop_preconditioning(uint32_t now) {
     precondition_stop_ticks_remaining = PRECONDITION_STOP_TICKS;
     precondition_stop_confirmed = false;
     precondition_retries = 0U;
+    // HACK: disable retries
+    precondition_stop_confirmed = true;
 }
 
 void precondition_can_rx_hook(twai_message_t *to_push) {
     // 0x2AD status frame: second byte indicates precondition state
     //   0x01 = off/idle, 0x05 = starting, 0x15 = fully running
-    if (to_push->identifier == 0x2ADU) {
-        uint8_t status = to_push->data[1];
-        if (precondition_requested && !precondition_starting_confirmed) {
-            if (status == 0x05U || status == 0x15U) {
-                precondition_starting_confirmed = true;
-            }
-        }
-        if (precondition_requested && !precondition_started_confirmed) {
-            if (status == 0x15U) {
-                precondition_started_confirmed = true;
-            }
-        }
-        if (precondition_requested && precondition_started_confirmed) {
-            if (status == 0x05U) {
-                // preconditioning was previously fully active, but now it's only showing as starting.
-                // this is a weird situation to be in; let's just reset the current attempt time,
-                // and let the retry logic continue as normal if it doesn't resolve itself after a while
-                precondition_last_attempt_ts = now_us();
-                precondition_started_confirmed = false;
-            }
-            if (status == 0x01U) {
-                // preconditioning was previously fully active, but now it's showing as off.
-                // it's possible that the car has reached the (rare) "Precondition complete" state.
-                // until we have a better way to distinguish that state from a real failure mode (TODO(ejones)),
-                // let's just assume everything is fine and reset our state
-                uint32_t now = now_us();
-                stop_preconditioning(now);
-                precondition_stop_ticks_remaining = 0U;
-                precondition_stop_confirmed = true;
-            }
-        }
-        if (!precondition_requested && !precondition_stop_confirmed && precondition_stop_ticks_remaining == 0U) {
-            if (status == 0x01U) {
-                precondition_stop_confirmed = true;
-            }
-        }
-    }
+    // HACK: disable retries
+    // if (to_push->identifier == 0x2ADU) {
+    //     uint8_t status = to_push->data[1];
+    //     if (precondition_requested && !precondition_starting_confirmed) {
+    //         if (status == 0x05U || status == 0x15U) {
+    //             precondition_starting_confirmed = true;
+    //         }
+    //     }
+    //     if (precondition_requested && !precondition_started_confirmed) {
+    //         if (status == 0x15U) {
+    //             precondition_started_confirmed = true;
+    //         }
+    //     }
+    //     if (precondition_requested && precondition_started_confirmed) {
+    //         if (status == 0x05U) {
+    //             // preconditioning was previously fully active, but now it's only showing as starting.
+    //             // this is a weird situation to be in; let's just reset the current attempt time,
+    //             // and let the retry logic continue as normal if it doesn't resolve itself after a while
+    //             precondition_last_attempt_ts = now_us();
+    //             precondition_started_confirmed = false;
+    //         }
+    //         if (status == 0x01U) {
+    //             // preconditioning was previously fully active, but now it's showing as off.
+    //             // it's possible that the car has reached the (rare) "Precondition complete" state.
+    //             // until we have a better way to distinguish that state from a real failure mode (TODO(ejones)),
+    //             // let's just assume everything is fine and reset our state
+    //             uint32_t now = now_us();
+    //             stop_preconditioning(now);
+    //             precondition_stop_ticks_remaining = 0U;
+    //             precondition_stop_confirmed = true;
+    //         }
+    //     }
+    //     if (!precondition_requested && !precondition_stop_confirmed && precondition_stop_ticks_remaining == 0U) {
+    //         if (status == 0x01U) {
+    //             precondition_stop_confirmed = true;
+    //         }
+    //     }
+    // }
 
     // 0x448 has button presses:
     // 7F 00 00 00 00 00 00 00 -> Idle
@@ -272,8 +277,9 @@ void precondition_tick(void) {
             && precondition_retries >= PRECONDITION_MAX_RETRIES
             && ((!precondition_starting_confirmed && time_since_last_attempt > PRECONDITION_RETRY_US)
                 || (!precondition_started_confirmed && time_since_last_attempt > PRECONDITION_STARTED_TIMEOUT_US))) {
-        stop_preconditioning(now);
-        precondition_retries = PRECONDITION_MAX_RETRIES;  // don't retry the stop; this is a failure case already
+        // HACK: disable retries
+        // stop_preconditioning(now);
+        // precondition_retries = PRECONDITION_MAX_RETRIES;  // don't retry the stop; this is a failure case already
     }
 
     // retry start if not confirmed to be starting yet and it's been long enough
@@ -281,9 +287,10 @@ void precondition_tick(void) {
             && precondition_start_ticks_remaining == 0U
             && precondition_retries < PRECONDITION_MAX_RETRIES
             && time_since_last_attempt > PRECONDITION_RETRY_US) {
-        precondition_last_attempt_ts = now;
-        precondition_start_ticks_remaining = PRECONDITION_START_TICKS;
-        precondition_retries++;
+        // HACK: disable retries
+        // precondition_last_attempt_ts = now;
+        // precondition_start_ticks_remaining = PRECONDITION_START_TICKS;
+        // precondition_retries++;
     }
 
     // retry start if not confirmed to be started yet and it's been long enough (i.e. we got 2AD 05 but not 15 after a long time)
@@ -291,9 +298,11 @@ void precondition_tick(void) {
             && precondition_start_ticks_remaining == 0U
             && precondition_retries < PRECONDITION_MAX_RETRIES
             && time_since_last_attempt > PRECONDITION_STARTED_TIMEOUT_US) {
-        precondition_last_attempt_ts = now;
-        precondition_start_ticks_remaining = PRECONDITION_START_TICKS;
-        precondition_retries++;
+        // HACK: disable retries
+        precondition_started_confirmed = true;
+        // precondition_last_attempt_ts = now;
+        // precondition_start_ticks_remaining = PRECONDITION_START_TICKS;
+        // precondition_retries++;
     }
 
     // retry stop if not confirmed
@@ -301,9 +310,10 @@ void precondition_tick(void) {
             && precondition_stop_ticks_remaining == 0U
             && precondition_retries < PRECONDITION_MAX_RETRIES
             && time_since_last_attempt > PRECONDITION_RETRY_US) {
-        precondition_last_attempt_ts = now;
-        precondition_stop_ticks_remaining = PRECONDITION_STOP_TICKS;
-        precondition_retries++;
+        // HACK: disable retries
+        // precondition_last_attempt_ts = now;
+        // precondition_stop_ticks_remaining = PRECONDITION_STOP_TICKS;
+        // precondition_retries++;
     }
 
     // send initial burst of start messages
