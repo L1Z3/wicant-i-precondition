@@ -57,6 +57,12 @@ static bool precondition_started_confirmed = false;
 static bool precondition_stop_confirmed = true;
 // track previous state of star button for edge detection
 static bool star_button_prev = false;
+// is the status frame available? false if on unknown platform, true if we at any point receive a known status frame
+static bool status_frame_available = false;
+
+// 0x2AD on Ioniq 5, 0x0A82AA03 on Ioniq 6
+#define IS_STATUS_FRAME(frame_id) \
+    ((frame_id) == 0x2ADU || (frame_id) == 0x0A82AA03U)
 
 #define PRECONDITION_DEBOUNCE_US 1000000U  // 1 second
 #define PRECONDITION_START_PHASE1_TICKS 3U // 4003 message
@@ -137,14 +143,15 @@ fwd_result_t precondition_fwd_hook(twai_message_t *to_send) {
         uint32_t now = now_us();
         uint32_t time_since_last_attempt = ts_elapsed(now, precondition_last_attempt_ts);
         if (to_send->identifier == 0x4E8U) {
+            // i'm sorry for the nested ternary operators. i don't feel like fixing it right now
             set_0x4e8_distance_flag(
                 to_send,
                 SECONDS_UNTIL_START(time_since_last_attempt),
                 // display retry count in tenths digit
-                precondition_retries % 10,
-                precondition_retries == 0 ? DIST_UNIT_YD : DIST_UNIT_KM,
+                status_frame_available ? (precondition_retries % 10) : 0,
+                status_frame_available ? (precondition_retries == 0 ? DIST_UNIT_YD : DIST_UNIT_KM) : DIST_UNIT_M,
                 // switch to destination flag after we get 05 for 2AD
-                precondition_starting_confirmed ? FLAG_DESTINATION : FLAG_BLUE_1
+                status_frame_available ? (precondition_starting_confirmed ? FLAG_DESTINATION : FLAG_BLUE_1) : FLAG_BLUE_4
             );
             return FWD_MODIFIED;
         }
@@ -156,7 +163,10 @@ fwd_result_t precondition_fwd_hook(twai_message_t *to_send) {
     }
 
     // we are currently trying to stop preconditioning and want to display the retry status.
-    if (!precondition_requested && !precondition_stop_confirmed && precondition_retries < PRECONDITION_MAX_RETRIES) {
+    if (!precondition_requested 
+            && status_frame_available 
+            && !precondition_stop_confirmed 
+            && precondition_retries < PRECONDITION_MAX_RETRIES) {
         uint32_t now = now_us();
         uint32_t time_since_last_attempt = ts_elapsed(now, precondition_last_attempt_ts);
         if (to_send->identifier == 0x4E8U) {
@@ -200,9 +210,12 @@ static void stop_preconditioning(uint32_t now) {
 }
 
 void precondition_can_rx_hook(twai_message_t *to_push) {
-    // 0x2AD status frame: second byte indicates precondition state
+    // 0x2AD/0x0A82AA03 status frame: second byte indicates precondition state
     //   0x01 = off/idle, 0x05 = starting, 0x15 = fully running
-    if (to_push->identifier == 0x2ADU) {
+    if (IS_STATUS_FRAME(to_push->identifier)) {
+        // we now know we have the status frame on the current car, so we should use it
+        status_frame_available = true;
+
         uint8_t status = to_push->data[1];
         if (precondition_requested && !precondition_starting_confirmed) {
             if (status == 0x05U || status == 0x15U) {
@@ -266,44 +279,50 @@ void precondition_tick(void) {
     uint32_t now = now_us();
     uint32_t time_since_last_attempt = ts_elapsed(now, precondition_last_attempt_ts);
 
-    // give up and send one stop attempt if start retries exhausted
-    if (precondition_requested
-            && precondition_start_ticks_remaining == 0U
-            && precondition_retries >= PRECONDITION_MAX_RETRIES
-            && ((!precondition_starting_confirmed && time_since_last_attempt > PRECONDITION_RETRY_US)
-                || (!precondition_started_confirmed && time_since_last_attempt > PRECONDITION_STARTED_TIMEOUT_US))) {
-        stop_preconditioning(now);
-        precondition_retries = PRECONDITION_MAX_RETRIES;  // don't retry the stop; this is a failure case already
-    }
+    // we can only do retry logic if we know the status frame
+    if (status_frame_available) {
+        // give up and send one stop attempt if start retries exhausted
+        if (precondition_requested
+                && precondition_start_ticks_remaining == 0U
+                && precondition_retries >= PRECONDITION_MAX_RETRIES
+                && ((!precondition_starting_confirmed && time_since_last_attempt > PRECONDITION_RETRY_US)
+                    || (!precondition_started_confirmed && time_since_last_attempt > PRECONDITION_STARTED_TIMEOUT_US))) {
+            stop_preconditioning(now);
+            precondition_retries = PRECONDITION_MAX_RETRIES;  // don't retry the stop; this is a failure case already
+        }
 
-    // retry start if not confirmed to be starting yet and it's been long enough
-    if (precondition_requested && !precondition_starting_confirmed
-            && precondition_start_ticks_remaining == 0U
-            && precondition_retries < PRECONDITION_MAX_RETRIES
-            && time_since_last_attempt > PRECONDITION_RETRY_US) {
-        precondition_last_attempt_ts = now;
-        precondition_start_ticks_remaining = PRECONDITION_START_TICKS;
-        precondition_retries++;
-    }
+        // retry start if not confirmed to be starting yet and it's been long enough
+        if (precondition_requested && !precondition_starting_confirmed
+                && precondition_start_ticks_remaining == 0U
+                && precondition_retries < PRECONDITION_MAX_RETRIES
+                && time_since_last_attempt > PRECONDITION_RETRY_US) {
+            precondition_last_attempt_ts = now;
+            precondition_start_ticks_remaining = PRECONDITION_START_TICKS;
+            precondition_retries++;
+        }
 
-    // retry start if not confirmed to be started yet and it's been long enough (i.e. we got 2AD 05 but not 15 after a long time)
-    if (precondition_requested && !precondition_started_confirmed
-            && precondition_start_ticks_remaining == 0U
-            && precondition_retries < PRECONDITION_MAX_RETRIES
-            && time_since_last_attempt > PRECONDITION_STARTED_TIMEOUT_US) {
-        precondition_last_attempt_ts = now;
-        precondition_start_ticks_remaining = PRECONDITION_START_TICKS;
-        precondition_retries++;
-    }
+        // retry start if not confirmed to be started yet and it's been long enough (i.e. we got 2AD 05 but not 15 after a long time)
+        if (precondition_requested && !precondition_started_confirmed
+                && precondition_start_ticks_remaining == 0U
+                && precondition_retries < PRECONDITION_MAX_RETRIES
+                && time_since_last_attempt > PRECONDITION_STARTED_TIMEOUT_US) {
+            precondition_last_attempt_ts = now;
+            precondition_start_ticks_remaining = PRECONDITION_START_TICKS;
+            precondition_retries++;
+        }
 
-    // retry stop if not confirmed
-    if (!precondition_requested && !precondition_stop_confirmed
-            && precondition_stop_ticks_remaining == 0U
-            && precondition_retries < PRECONDITION_MAX_RETRIES
-            && time_since_last_attempt > PRECONDITION_RETRY_US) {
-        precondition_last_attempt_ts = now;
-        precondition_stop_ticks_remaining = PRECONDITION_STOP_TICKS;
-        precondition_retries++;
+        // retry stop if not confirmed
+        if (!precondition_requested && !precondition_stop_confirmed
+                && precondition_stop_ticks_remaining == 0U
+                && precondition_retries < PRECONDITION_MAX_RETRIES
+                && time_since_last_attempt > PRECONDITION_RETRY_US) {
+            precondition_last_attempt_ts = now;
+            precondition_stop_ticks_remaining = PRECONDITION_STOP_TICKS;
+            precondition_retries++;
+        }
+    } else if (precondition_requested && time_since_last_attempt > PRECONDITION_STARTED_TIMEOUT_US) {
+        // if we don't have status messages, we still want to stop displaying the UI after 70 seconds
+        precondition_started_confirmed = true;
     }
 
     // send initial burst of start messages
