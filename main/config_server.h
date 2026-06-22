@@ -52,6 +52,13 @@
 #define OBD_ELM327			3
 #define AUTO_PID			4
 
+#define CONTINUOUS			0
+#define ONCE				1
+
+#define SW_STAR				0
+#define AVNK_STAR			1
+#define TUNER_IN			2
+
 typedef enum
 {
 	WIFI_OPEN,
@@ -105,6 +112,8 @@ typedef struct _device_config
 	char mqtt_tx_topic[64];
 	char mqtt_rx_topic[64];
 	char mqtt_status_topic[64];
+        char precon_mode[10];
+        char precon_button[10];
 }device_config_t;
 
 

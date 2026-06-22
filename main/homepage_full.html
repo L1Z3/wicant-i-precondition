@@ -485,6 +485,7 @@
         <button class="tablinks" onclick="openTab(event, 'power_saving_tab')"><b>Power Saving</b></button>
         <button class="tablinks" onclick="openTab(event, 'system_tab')"><b>System</b></button>
         <button class="tablinks" onclick="openTab(event, 'about_tab')"><b>About</b></button>
+        <button class="tablinks" onclick="openTab(event, 'buttons_tab')"><b>Buttons</b></button>
     </div>
 
     <div class="content">
@@ -1261,11 +1262,37 @@
                 <tr>
                     <td>Designed By:</td>
                     <td>
-                        <div id="made_by"><a href="https://www.meatpi.com/"><b>meatpi.com</b></a></div>
+                        <div id="made_by"><a href="https://www.meatpi.com/"><b>meatpi.com</b></a> and <a href="https://www.electroniqbuttons.com/"><b>electroniqbuttons.com</b></a></div>
                     </td>
                 </tr>
             </table>
         </div>
+
+        <div id="buttons_tab" class="tabcontent">
+            <div class="section-title">Buttons</div>
+            <table class="form-table">
+                <tr>
+                    <td>Preconditioning Mode:</td>
+                    <td>
+                        <select id="precon_mode" name="precon_mode" onchange="submit_enable();">
+                            <option value="continuous">Continuous</option>
+                            <option value="once">Once</option>
+                        </select>
+                    </td>
+                </tr>
+                <tr>
+                    <td>Preconditioning Activation Button:</td>
+                    <td>
+                        <select id="precon_button" name="precon_button" onchange="submit_enable();">
+                            <option value="sw_star">Steering Wheel Star Button</option>
+                            <option value="avnk_star">Climate Bar Star</option>
+                            <option value="tuner_in">Tuner</option>
+                        </select>
+                    </td>
+                </tr>
+            </table>
+        </div>
+
         <input id="submit_button" name="submit_button" type="button" onclick="postConfig()" value="Submit Changes" disabled />
     </div>
     
@@ -2708,6 +2735,8 @@ function loadAutoTable(jsonData) {
         }
 		obj["mqtt_status_topic"] = document.getElementById("mqtt_status_topic").value;
 		obj["mqtt_elm327_log"] = document.getElementById("mqtt_elm327_log").value;
+                obj["precon_mode"] = document.getElementById("precon_mode").value;
+                obj["precon_button"] = document.getElementById("precon_button").value;
 		var configJSON = JSON.stringify(obj);
 		const xhttp = new XMLHttpRequest();
 		xhttp.onload = function() {
@@ -3023,6 +3052,8 @@ function loadAutoTable(jsonData) {
 			document.getElementById("mqtt_rx_topic").value = obj.mqtt_rx_topic;
 			document.getElementById("mqtt_status_topic").value = obj.mqtt_status_topic;
 			document.getElementById("mqtt_elm327_log").value = obj.mqtt_elm327_log;
+                	document.getElementById("precon_mode").value = obj.precon_mode;
+                	document.getElementById("precon_button").value = obj.precon_button; 
 			if(obj.batt_alert_time == "1") {
 				document.getElementById("batt_alert_time").selectedIndex = "0";
 			} else if(obj.batt_alert_time == "6") {

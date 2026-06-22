@@ -111,7 +111,7 @@ static char can_datarate_str[11][7] = {
 								"1000K",
 };
 
-const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\",\"webhook_en\":\"enable\",\"sta_ssid\":\"MeatPi\",\"sta_pass\":\"TomatoSauce\",\"sta_security\":\"wpa3\",\"can_datarate\":\"500K\",\"can_mode\":\"normal\",\"port_type\":\"tcp\",\"port\":\"3333\",\"ap_pass\":\"@meatpi#\",\"protocol\":\"savvycan\",\"ble_pass\":\"123456\",\"ble_status\":\"disable\",\"sleep_status\":\"disable\",\"sleep_volt\":\"13.1\",\"wakeup_volt\":\"13.5\",\"batt_alert\":\"disable\",\"batt_alert_ssid\":\"MeatPi\",\"batt_alert_pass\":\"TomatoSauce\",\"batt_alert_volt\":\"11.0\",\"batt_alert_protocol\":\"mqtt\",\"batt_alert_url\":\"mqtt://mqtt.eclipseprojects.io\",\"batt_alert_port\":\"1883\",\"batt_alert_topic\":\"CAR1/voltage\",\"batt_mqtt_user\":\"meatpi\",\"batt_mqtt_pass\":\"meatpi\",\"batt_alert_time\":\"1\",\"mqtt_en\":\"disable\",\"mqtt_elm327_log\":\"disable\",\"mqtt_url\":\"mqtt://127.0.0.1\",\"mqtt_port\":\"1883\",\"mqtt_user\":\"meatpi\",\"mqtt_pass\":\"meatpi\",\"keep_alive\":\"30\",\"mqtt_tx_topic\":\"wican/%s/can/tx\",\"mqtt_rx_topic\":\"wican/%s/can/rx\",\"mqtt_status_topic\":\"wican/%s/can/status\"}";
+const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\",\"webhook_en\":\"enable\",\"sta_ssid\":\"MeatPi\",\"sta_pass\":\"TomatoSauce\",\"sta_security\":\"wpa3\",\"can_datarate\":\"500K\",\"can_mode\":\"normal\",\"port_type\":\"tcp\",\"port\":\"3333\",\"ap_pass\":\"@meatpi#\",\"protocol\":\"savvycan\",\"ble_pass\":\"123456\",\"ble_status\":\"disable\",\"sleep_status\":\"disable\",\"sleep_volt\":\"13.1\",\"wakeup_volt\":\"13.5\",\"batt_alert\":\"disable\",\"batt_alert_ssid\":\"MeatPi\",\"batt_alert_pass\":\"TomatoSauce\",\"batt_alert_volt\":\"11.0\",\"batt_alert_protocol\":\"mqtt\",\"batt_alert_url\":\"mqtt://mqtt.eclipseprojects.io\",\"batt_alert_port\":\"1883\",\"batt_alert_topic\":\"CAR1/voltage\",\"batt_mqtt_user\":\"meatpi\",\"batt_mqtt_pass\":\"meatpi\",\"batt_alert_time\":\"1\",\"mqtt_en\":\"disable\",\"mqtt_elm327_log\":\"disable\",\"mqtt_url\":\"mqtt://127.0.0.1\",\"mqtt_port\":\"1883\",\"mqtt_user\":\"meatpi\",\"mqtt_pass\":\"meatpi\",\"keep_alive\":\"30\",\"mqtt_tx_topic\":\"wican/%s/can/tx\",\"mqtt_rx_topic\":\"wican/%s/can/rx\",\"mqtt_status_topic\":\"wican/%s/can/status\",\"precon_mode\":\"oneshot\",\"precon_button\":\"sw_star\"}";
 static device_config_t device_config;
 TimerHandle_t xrestartTimer;
 
@@ -1905,6 +1905,28 @@ static void config_server_load_cfg(char *cfg)
 	//*****
 
 	//*****
+	key = cJSON_GetObjectItem(root,"precon_mode");
+	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.precon_mode)))
+	{
+		goto config_error;
+	}
+
+	strcpy(device_config.precon_mode, key->valuestring);
+	ESP_LOGE(TAG, "device_config.precon_mode: %s", device_config.precon_mode);
+	//*****
+
+	//*****
+	key = cJSON_GetObjectItem(root,"precon_button");
+	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.precon_button)))
+	{
+		goto config_error;
+	}
+
+	strcpy(device_config.precon_button, key->valuestring);
+	ESP_LOGE(TAG, "device_config.precon_button: %s", device_config.precon_button);
+	//*****
+
+	//*****
 	key = cJSON_GetObjectItem(root,"mqtt_tx_topic");
 	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.mqtt_tx_topic)))
 	{
@@ -2739,3 +2761,32 @@ void config_server_set_ble_config(uint8_t b)
     cJSON_Delete(root);
 }
 
+int8_t config_server_precon_button(void)
+{
+	if(strcmp(device_config.precon_button, "sw_star") == 0)
+	{
+		return SW_STAR;
+	}
+	else if(strcmp(device_config.precon_button, "avnk_star") == 0)
+	{
+		return AVNK_STAR;
+	}
+	else if(strcmp(device_config.protocol, "tuner_in") == 0)
+	{
+		return TUNER_IN;
+	}
+	return SW_STAR;
+}
+
+int8_t config_server_precon_mode(void)
+{
+	if(strcmp(device_config.precon_mode, "once") == 0)
+	{
+		return ONCE;
+	}
+	else if(strcmp(device_config.precon_mode, "continuous") == 0)
+	{
+		return CONTINUOUS;
+	}
+	return ONCE;
+}
