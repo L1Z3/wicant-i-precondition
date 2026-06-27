@@ -56,8 +56,8 @@
 #define ONCE				1
 
 #define SW_STAR				0
-#define AVNK_STAR			1
-#define TUNER_IN			2
+#define TUNER_IN			1
+#define VOL_IN				2
 
 typedef enum
 {
@@ -174,3 +174,5 @@ int8_t config_server_get_ap_auto_disable(void);
 int8_t config_server_get_keep_alive(uint32_t *keep_alive);
 
 char *config_server_get_status_json(bool remove_sensitive_info);
+int8_t config_server_precon_button(void);
+int8_t config_server_precon_mode(void);

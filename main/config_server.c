@@ -2767,13 +2767,13 @@ int8_t config_server_precon_button(void)
 	{
 		return SW_STAR;
 	}
-	else if(strcmp(device_config.precon_button, "vol_in") == 0)
-	{
-		return VOL_IN;
-	}
 	else if(strcmp(device_config.protocol, "tuner_in") == 0)
 	{
 		return TUNER_IN;
+	}
+	else if(strcmp(device_config.precon_button, "vol_in") == 0)
+	{
+		return VOL_IN;
 	}
 	return SW_STAR;
 }
