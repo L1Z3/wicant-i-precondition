@@ -212,30 +212,31 @@ static void stop_preconditioning(uint32_t now) {
 void precondition_can_rx_hook(twai_message_t *to_push) {
     // 0x2AD/0x0A82AA03 status frame: second byte indicates precondition state
     //   0x01 = off/idle, 0x05 = starting, 0x15 = fully running
+    //   EV6: 0x2AD with 0x41 = off/idle, 0x45 = starting, 0x55 = fully running
     if (IS_STATUS_FRAME(to_push->identifier)) {
         // we now know we have the status frame on the current car, so we should use it
         status_frame_available = true;
 
         uint8_t status = to_push->data[1];
         if (precondition_requested && !precondition_starting_confirmed) {
-            if (status == 0x05U || status == 0x15U) {
+            if (status == 0x05U || status == 0x15U || status == 0x45U || status == 0x55U) {
                 precondition_starting_confirmed = true;
             }
         }
         if (precondition_requested && !precondition_started_confirmed) {
-            if (status == 0x15U) {
+            if (status == 0x15U || status == 0x55U) {
                 precondition_started_confirmed = true;
             }
         }
         if (precondition_requested && precondition_started_confirmed) {
-            if (status == 0x05U) {
+            if (status == 0x05U || status == 0x45U) {
                 // preconditioning was previously fully active, but now it's only showing as starting.
                 // this is a weird situation to be in; let's just reset the current attempt time,
                 // and let the retry logic continue as normal if it doesn't resolve itself after a while
                 precondition_last_attempt_ts = now_us();
                 precondition_started_confirmed = false;
             }
-            if (status == 0x01U) {
+            if (status == 0x01U || status == 0x41U) {
                 // preconditioning was previously fully active, but now it's showing as off.
                 // it's possible that the car has reached the (rare) "Precondition complete" state.
                 // until we have a better way to distinguish that state from a real failure mode (TODO(ejones)),
@@ -247,7 +248,7 @@ void precondition_can_rx_hook(twai_message_t *to_push) {
             }
         }
         if (!precondition_requested && !precondition_stop_confirmed && precondition_stop_ticks_remaining == 0U) {
-            if (status == 0x01U) {
+            if (status == 0x01U || status == 0x41U) {
                 precondition_stop_confirmed = true;
             }
         }
