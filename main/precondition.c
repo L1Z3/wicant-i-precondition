@@ -242,8 +242,13 @@ void precondition_can_rx_hook(twai_message_t *to_push) {
                 // until we have a better way to distinguish that state from a real failure mode (TODO(ejones)),
                 // let's just assume everything is fine and reset our state
                 uint32_t now = now_us();
-                stop_preconditioning(now);
-                precondition_stop_ticks_remaining = 0U;
+                // actively request to cancel in the "once" mode
+                if(config_server_precon_mode() == ONCE) {
+                    stop_preconditioning(now);
+                }
+                else {
+                    precondition_stop_ticks_remaining = 0U;
+                }
                 precondition_stop_confirmed = true;
             }
         }
@@ -273,15 +278,15 @@ void precondition_can_rx_hook(twai_message_t *to_push) {
     // #define TUNER_IN				1
     // #define VOL_IN				2
     // listen for activation button press (rising edge only), and toggle preconditioning
-    if (precon_button_type == 0 && to_push->identifier == 0x448U) {
+    if (precon_button_type == SW_STAR && to_push->identifier == 0x448U) {
         bool activation_button_state = (to_push->data[5] == 0x10U);
         button_press_action(to_push, activation_button_state);
     }
-    else if (precon_button_type == 1 && to_push->identifier == 0x651U) {
+    else if (precon_button_type == TUNER_IN && to_push->identifier == 0x651U) {
         bool activation_button_state = (to_push->data[3] == 0x40U);
         button_press_action(to_push, activation_button_state);
     }
-    else if (precon_button_type == 2 && to_push->identifier == 0x651U) {
+    else if (precon_button_type == VOL_IN && to_push->identifier == 0x651U) {
         bool activation_button_state = (to_push->data[1] == 0x43U);
         button_press_action(to_push, activation_button_state);
     }
