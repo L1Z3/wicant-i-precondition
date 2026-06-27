@@ -4,6 +4,7 @@
 #include "esp_timer.h"
 #include "can.h"
 #include "precondition.h"
+#include "config_server.h"
 
 // ********************* 0x4E8 distance/flag display *********************
 
@@ -56,7 +57,7 @@ static bool precondition_started_confirmed = false;
 // has precondition stop been confirmed by the 2AD status frame?
 static bool precondition_stop_confirmed = true;
 // track previous state of star button for edge detection
-static bool star_button_prev = false;
+static bool activation_button_state_prev = false;
 // is the status frame available? false if on unknown platform, true if we at any point receive a known status frame
 static bool status_frame_available = false;
 
@@ -259,19 +260,45 @@ void precondition_can_rx_hook(twai_message_t *to_push) {
     // 67 00 00 00 00 10 00 00 -> Star
     // 31 00 00 00 04 00 00 00 -> Menu
     // 7A 00 04 00 00 00 00 00 -> speak
-    // listen for star button press (rising edge only), and toggle preconditioning
-    if (to_push->identifier == 0x448U) {
-        bool star_button = (to_push->data[5] == 0x10U);
-        if (star_button && !star_button_prev) {
-            uint32_t now = now_us();
-            if (!precondition_requested) {
-                start_preconditioning(now);
-            } else if (ts_elapsed(now, precondition_requested_ts) > PRECONDITION_DEBOUNCE_US) {
-                stop_preconditioning(now);
-            }
-        }
-        star_button_prev = star_button;
+    // 0x651 has more:
+    // no idle signal! rising and falling signals 
+    // broadcast 3x each 25Hz after press.
+    // FF C3 FF 40 00 00 00 00 -> Tuner press (rising)
+    // FF 43 FF C0 00 00 00 00 -> Volume button press (rising) 
+    // Volume button press does throw up a screen on the head unit
+    // Calling config_server_precon_button() with every CAN message 
+    // seems inefficient to me (TRH) but matches Ali's approach
+    int8_t precon_button_type = config_server_precon_button()
+    // #define SW_STAR				0
+    // #define TUNER_IN				1
+    // #define VOL_IN				2
+    // listen for activation button press (rising edge only), and toggle preconditioning
+    if (precon_button_type == 0 && to_push->identifier == 0x448U) {
+        bool activation_button_state = (to_push->data[5] == 0x10U);
+        button_press_action(to_push, activation_button_state);
     }
+    else if (precon_button_type == 1 && to_push->identifier == 0x651U) {
+        bool activation_button_state = (to_push->data[3] == 0x40U);
+        button_press_action(to_push, activation_button_state);
+    }
+    else if (precon_button_type == 2 && to_push->identifier == 0x651U) {
+        bool activation_button_state = (to_push->data[1] == 0x43U);
+        button_press_action(to_push, activation_button_state);
+    }
+
+}
+
+void button_press_action(twai_message_t *to_push, 
+                         bool activation_button_state) {
+    if (activation_button_state && !activation_button_state_prev) {
+        uint32_t now = now_us();
+        if (!precondition_requested) {
+            start_preconditioning(now);
+        } else if (ts_elapsed(now, precondition_requested_ts) > PRECONDITION_DEBOUNCE_US) {
+            stop_preconditioning(now);
+        }
+    }
+    activation_button_state_prev = activation_button_state;
 }
 
 // called every 40ms
