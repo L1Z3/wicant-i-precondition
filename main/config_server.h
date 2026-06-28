@@ -57,9 +57,24 @@
 
 #define BUTTON_DISABLED     -1
 #define SW_STAR				0
-#define TUNER_IN			1
-#define VOL_IN				2
-#define NUM_PRECOND_BUTTONS 3
+#define AVN_STAR			1
+#define AVN_TUNER_IN		2
+#define AVN_VOL_IN			3
+#define SW_MODE				4
+#define SW_SPEAK			5
+#define SW_CALL				6
+#define SW_VOL_IN			7
+#define SW_VOL_UP			8
+#define SW_VOL_DOWN			9
+#define SW_SKIP_UP			10
+#define SW_SKIP_DOWN		11
+#define SW_OK				12
+#define AVNK_MAP			13
+#define AVNK_NAV			14
+#define AVNK_MEDIA			15
+#define AVNK_TUNER_UP		16
+#define AVNK_TUNER_DOWN		17
+#define NUM_PRECOND_BUTTONS 18
 
 typedef enum
 {

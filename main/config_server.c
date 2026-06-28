@@ -2767,13 +2767,73 @@ int8_t config_server_precon_button(void)
 	{
 		return SW_STAR;
 	}
-	else if(strcmp(device_config.precon_button, "tuner_in") == 0)
+	else if(strcmp(device_config.precon_button, "avn_star") == 0)
 	{
-		return TUNER_IN;
+		return AVN_STAR;
 	}
-	else if(strcmp(device_config.precon_button, "vol_in") == 0)
+	else if(strcmp(device_config.precon_button, "avn_tuner_in") == 0)
 	{
-		return VOL_IN;
+		return AVN_TUNER_IN;
+	}
+	else if(strcmp(device_config.precon_button, "avn_vol_in") == 0)
+	{
+		return AVN_VOL_IN;
+	}
+	else if(strcmp(device_config.precon_button, "sw_mode") == 0)
+	{
+		return SW_MODE;
+	}
+	else if(strcmp(device_config.precon_button, "sw_speak") == 0)
+	{
+		return SW_SPEAK;
+	}
+	else if(strcmp(device_config.precon_button, "sw_call") == 0)
+	{
+		return SW_CALL;
+	}
+	else if(strcmp(device_config.precon_button, "sw_vol_in") == 0)
+	{
+		return SW_VOL_IN;
+	}
+	else if(strcmp(device_config.precon_button, "sw_vol_up") == 0)
+	{
+		return SW_VOL_UP;
+	}
+	else if(strcmp(device_config.precon_button, "sw_vol_down") == 0)
+	{
+		return SW_VOL_DOWN;
+	}
+	else if(strcmp(device_config.precon_button, "sw_skip_up") == 0)
+	{
+		return SW_SKIP_UP;
+	}
+	else if(strcmp(device_config.precon_button, "sw_skip_down") == 0)
+	{
+		return SW_SKIP_DOWN;
+	}
+	else if(strcmp(device_config.precon_button, "sw_ok") == 0)
+	{
+		return SW_OK;
+	}
+	else if(strcmp(device_config.precon_button, "avnk_map") == 0)
+	{
+		return AVNK_MAP;
+	}
+	else if(strcmp(device_config.precon_button, "avnk_nav") == 0)
+	{
+		return AVNK_NAV;
+	}
+	else if(strcmp(device_config.precon_button, "avnk_media") == 0)
+	{
+		return AVNK_MEDIA;
+	}
+	else if(strcmp(device_config.precon_button, "avnk_tuner_up") == 0)
+	{
+		return AVNK_TUNER_UP;
+	}
+	else if(strcmp(device_config.precon_button, "avnk_tuner_down") == 0)
+	{
+		return AVNK_TUNER_DOWN;
 	}
 	else if(strcmp(device_config.precon_button, "disabled") == 0)
 	{
