@@ -1289,21 +1289,26 @@
                             <option value="avn_star">Star Button (Climate Bar)</option>
                             <option value="avn_tuner_in">Tuner Press (Climate Bar)</option>
                             <option value="avn_vol_in">Volume Press (Climate Bar)</option>
-                            <option value="sw_mode">Mode (Steering Wheel)</option>
-                            <option value="sw_speak">Speak (Steering Wheel)</option>
-                            <option value="sw_call">Call (Steering Wheel)</option>
-                            <option value="sw_vol_in">Volume Press (Steering Wheel)</option>
-                            <option value="sw_vol_up">Volume Up (Steering Wheel)</option>
-                            <option value="sw_vol_down">Volume Down (Steering Wheel)</option>
-                            <option value="sw_skip_up">Skip Up (Steering Wheel)</option>
-                            <option value="sw_skip_down">Skip Down (Steering Wheel)</option>
-                            <option value="sw_ok">OK (Steering Wheel)</option>
-                            <option value="avnk_map">Map (Climate Bar)</option>
-                            <option value="avnk_nav">Nav (Climate Bar)</option>
-                            <option value="avnk_media">Media (Climate Bar)</option>
-                            <option value="avnk_tuner_up">Tuner Up (Climate Bar)</option>
-                            <option value="avnk_tuner_down">Tuner Down (Climate Bar)</option>
+                            <option class="precon_button_extra" value="sw_mode">Mode (Steering Wheel)</option>
+                            <option class="precon_button_extra" value="sw_speak">Speak (Steering Wheel)</option>
+                            <option class="precon_button_extra" value="sw_call">Call (Steering Wheel)</option>
+                            <option class="precon_button_extra" value="sw_vol_in">Volume Press (Steering Wheel)</option>
+                            <option class="precon_button_extra" value="sw_vol_up">Volume Up (Steering Wheel)</option>
+                            <option class="precon_button_extra" value="sw_vol_down">Volume Down (Steering Wheel)</option>
+                            <option class="precon_button_extra" value="sw_skip_up">Skip Up (Steering Wheel)</option>
+                            <option class="precon_button_extra" value="sw_skip_down">Skip Down (Steering Wheel)</option>
+                            <option class="precon_button_extra" value="sw_ok">OK (Steering Wheel)</option>
+                            <option class="precon_button_extra" value="avnk_map">Map (Climate Bar)</option>
+                            <option class="precon_button_extra" value="avnk_nav">Nav (Climate Bar)</option>
+                            <option class="precon_button_extra" value="avnk_media">Media (Climate Bar)</option>
+                            <option class="precon_button_extra" value="avnk_tuner_up">Tuner Up (Climate Bar)</option>
+                            <option class="precon_button_extra" value="avnk_tuner_down">Tuner Down (Climate Bar)</option>
                         </select>
+                        <br />
+                        <label style="font-weight: normal;">
+                            <input type="checkbox" id="precon_button_show_all" onchange="togglePreconButtonOptions();" />
+                            Show all button options
+                        </label>
                     </td>
                 </tr>
             </table>
@@ -1316,7 +1321,30 @@
     <script>
         document.addEventListener('DOMContentLoaded', (event) => {
             document.getElementById("submit_button").disabled = true;
+
+            syncPreconButtonToggle();
         });
+
+        // If the currently selected button is one of the extra options, show
+        // the full list so the selection stays visible. Called on load and
+        // again after the device config populates the dropdown value.
+        function syncPreconButtonToggle() {
+            const preconSelect = document.getElementById("precon_button");
+            const selectedOption = preconSelect.options[preconSelect.selectedIndex];
+            if (selectedOption && selectedOption.classList.contains("precon_button_extra")) {
+                document.getElementById("precon_button_show_all").checked = true;
+            }
+            togglePreconButtonOptions();
+        }
+
+        // Client-side only: show or hide the extra preconditioning button
+        // options. Does not affect the value submitted to the device.
+        function togglePreconButtonOptions() {
+            const showAll = document.getElementById("precon_button_show_all").checked;
+            document.querySelectorAll(".precon_button_extra").forEach(option => {
+                option.hidden = !showAll;
+            });
+        }
 		let latest_car_models = null;
         function loadCarModels(data) {
             const carModelSelect = document.getElementById("car_model");
@@ -3069,7 +3097,8 @@ function loadAutoTable(jsonData) {
 			document.getElementById("mqtt_status_topic").value = obj.mqtt_status_topic;
 			document.getElementById("mqtt_elm327_log").value = obj.mqtt_elm327_log;
             document.getElementById("precon_mode").value = obj.precon_mode;
-            document.getElementById("precon_button").value = obj.precon_button; 
+            document.getElementById("precon_button").value = obj.precon_button;
+            syncPreconButtonToggle();
 			if(obj.batt_alert_time == "1") {
 				document.getElementById("batt_alert_time").selectedIndex = "0";
 			} else if(obj.batt_alert_time == "6") {
