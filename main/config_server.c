@@ -2767,7 +2767,7 @@ int8_t config_server_precon_button(void)
 	{
 		return SW_STAR;
 	}
-	else if(strcmp(device_config.protocol, "tuner_in") == 0)
+	else if(strcmp(device_config.precon_button, "tuner_in") == 0)
 	{
 		return TUNER_IN;
 	}

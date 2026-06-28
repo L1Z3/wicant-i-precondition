@@ -58,6 +58,7 @@
 #define SW_STAR				0
 #define TUNER_IN			1
 #define VOL_IN				2
+#define NUM_PRECOND_BUTTONS 3
 
 typedef enum
 {
@@ -112,8 +113,8 @@ typedef struct _device_config
 	char mqtt_tx_topic[64];
 	char mqtt_rx_topic[64];
 	char mqtt_status_topic[64];
-        char precon_mode[10];
-        char precon_button[10];
+    char precon_mode[16];
+    char precon_button[16];
 }device_config_t;
 
 

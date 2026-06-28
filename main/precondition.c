@@ -2,9 +2,12 @@
 #include <stdint.h>
 #include <string.h>
 #include "esp_timer.h"
+#include "esp_log.h"
 #include "can.h"
 #include "precondition.h"
 #include "config_server.h"
+
+#define TAG __func__
 
 // ********************* 0x4E8 distance/flag display *********************
 
@@ -50,16 +53,43 @@ static uint8_t precondition_start_ticks_remaining = 0U;
 static uint8_t precondition_stop_ticks_remaining = 0U;
 // number of times we've retried sending precondition messages, used for retry logic
 static uint8_t precondition_retries = 0U;
-// has preconditioning been confirmed to be starting by the 2AD status frame?
+// has preconditioning been confirmed to be starting by the status frame?
 static bool precondition_starting_confirmed = false;
-// has preconditioning been confirmed to be active by the 2AD status frame?
+// has preconditioning been confirmed to be active by the status frame?
 static bool precondition_started_confirmed = false;
-// has precondition stop been confirmed by the 2AD status frame?
+// has precondition stop been confirmed by the status frame?
 static bool precondition_stop_confirmed = true;
-// track previous state of star button for edge detection
+// track previous state of activation button for edge detection
 static bool activation_button_state_prev = false;
 // is the status frame available? false if on unknown platform, true if we at any point receive a known status frame
 static bool status_frame_available = false;
+
+typedef struct {
+    uint32_t frame_id;
+    uint8_t byte_index;
+    uint8_t byte_mask;
+    uint8_t byte_value;
+} precond_button_t;
+
+// 0x448 has some button presses:
+// 7F 00 00 00 00 00 00 00 -> Idle
+// 15 00 00 01 00 00 00 00 -> Mute
+// 67 00 00 00 00 10 00 00 -> Star
+// 31 00 00 00 04 00 00 00 -> Menu
+// 7A 00 04 00 00 00 00 00 -> speak
+// 0x651 has more:
+// no idle signal! rising and falling signals 
+// broadcast 3x each 25Hz after press.
+// FF C3 FF 40 00 00 00 00 -> Tuner press (rising)
+// FF 43 FF C0 00 00 00 00 -> Volume button press (rising) 
+// Volume button press does throw up a screen on the head unit
+const static precond_button_t activation_buttons[NUM_PRECOND_BUTTONS] = {
+    [SW_STAR]  = {0x448, 5, 0xF0, 0x10},
+    [TUNER_IN] = {0x651, 3, 0xF0, 0x40},
+    [VOL_IN]   = {0x651, 1, 0xF0, 0x40},
+};
+_Static_assert(sizeof(activation_buttons) / sizeof(activation_buttons[0])
+               == NUM_PRECOND_BUTTONS, "button table size mismatch");
 
 // 0x2AD on Ioniq 5, 0x0A82AA03 on Ioniq 6
 #define IS_STATUS_FRAME(frame_id) \
@@ -238,18 +268,21 @@ void precondition_can_rx_hook(twai_message_t *to_push) {
             }
             if (status == 0x01U) {
                 // preconditioning was previously fully active, but now it's showing as off.
-                // it's possible that the car has reached the (rare) "Precondition complete" state.
+                // it's possible that the car has reached the "Precondition complete" state.
                 // until we have a better way to distinguish that state from a real failure mode (TODO(ejones)),
                 // let's just assume everything is fine and reset our state
                 uint32_t now = now_us();
-                // actively request to cancel in the "once" mode
-                if(config_server_precon_mode() == ONCE) {
-                    stop_preconditioning(now);
-                }
-                else {
+                stop_preconditioning(now);
+                // if we are in "once" mode, actually attempt to actively stop preconditioning.
+                // this should prevent preconditioning from restarting once the battery falls back below temp.
+                // TODO(ejones): this needs testing
+                if(config_server_precon_mode() != ONCE) {
+                    // TODO(ejones): continuous mode needs more development. for now,
+                    // this just doesn't attempt to stop preconditoning and lets the BMU do what it wants
+                    // once it reaches temp
                     precondition_stop_ticks_remaining = 0U;
+                    precondition_stop_confirmed = true;
                 }
-                precondition_stop_confirmed = true;
             }
         }
         if (!precondition_requested && !precondition_stop_confirmed && precondition_stop_ticks_remaining == 0U) {
@@ -259,49 +292,28 @@ void precondition_can_rx_hook(twai_message_t *to_push) {
         }
     }
 
-    // 0x448 has button presses:
-    // 7F 00 00 00 00 00 00 00 -> Idle
-    // 15 00 00 01 00 00 00 00 -> Mute
-    // 67 00 00 00 00 10 00 00 -> Star
-    // 31 00 00 00 04 00 00 00 -> Menu
-    // 7A 00 04 00 00 00 00 00 -> speak
-    // 0x651 has more:
-    // no idle signal! rising and falling signals 
-    // broadcast 3x each 25Hz after press.
-    // FF C3 FF 40 00 00 00 00 -> Tuner press (rising)
-    // FF 43 FF C0 00 00 00 00 -> Volume button press (rising) 
-    // Volume button press does throw up a screen on the head unit
     // Calling config_server_precon_button() with every CAN message 
     // seems inefficient to me (TRH) but matches Ali's approach
     int8_t precon_button_type = config_server_precon_button();
-    // #define SW_STAR				0
-    // #define TUNER_IN				1
-    // #define VOL_IN				2
+    if (precon_button_type < 0 || precon_button_type >= NUM_PRECOND_BUTTONS) {
+        ESP_LOGE(TAG, "Invalid precondition button type: %d", precon_button_type);
+        return;
+    }
     // listen for activation button press (rising edge only), and toggle preconditioning
-    if (precon_button_type == SW_STAR && to_push->identifier == 0x448U) {
-        bool activation_button_state = (to_push->data[5] == 0x10U);
-        button_press_action(to_push, activation_button_state);
-    } else if (precon_button_type == TUNER_IN && to_push->identifier == 0x651U) {
-        bool activation_button_state = (to_push->data[3] == 0x40U);
-        button_press_action(to_push, activation_button_state);
-    } else if (precon_button_type == VOL_IN && to_push->identifier == 0x651U) {
-        bool activation_button_state = (to_push->data[1] == 0x43U);
-        button_press_action(to_push, activation_button_state);
-    }
-
-}
-
-void button_press_action(twai_message_t *to_push, 
-                         bool activation_button_state) {
-    if (activation_button_state && !activation_button_state_prev) {
-        uint32_t now = now_us();
-        if (!precondition_requested) {
-            start_preconditioning(now);
-        } else if (ts_elapsed(now, precondition_requested_ts) > PRECONDITION_DEBOUNCE_US) {
-            stop_preconditioning(now);
+    precond_button_t button = activation_buttons[precon_button_type];
+    if (to_push->identifier == button.frame_id) {
+        bool button_state = ((to_push->data[button.byte_index] & button.byte_mask) == button.byte_value);
+        if (button_state && !activation_button_state_prev) {
+            uint32_t now = now_us();
+            if (!precondition_requested) {
+                start_preconditioning(now);
+            } else if (ts_elapsed(now, precondition_requested_ts) > PRECONDITION_DEBOUNCE_US) {
+                stop_preconditioning(now);
+            }
         }
+        activation_button_state_prev = button_state;
     }
-    activation_button_state_prev = activation_button_state;
+
 }
 
 // called every 40ms

@@ -2735,8 +2735,8 @@ function loadAutoTable(jsonData) {
         }
 		obj["mqtt_status_topic"] = document.getElementById("mqtt_status_topic").value;
 		obj["mqtt_elm327_log"] = document.getElementById("mqtt_elm327_log").value;
-                obj["precon_mode"] = document.getElementById("precon_mode").value;
-                obj["precon_button"] = document.getElementById("precon_button").value;
+        obj["precon_mode"] = document.getElementById("precon_mode").value;
+        obj["precon_button"] = document.getElementById("precon_button").value;
 		var configJSON = JSON.stringify(obj);
 		const xhttp = new XMLHttpRequest();
 		xhttp.onload = function() {
@@ -3052,8 +3052,8 @@ function loadAutoTable(jsonData) {
 			document.getElementById("mqtt_rx_topic").value = obj.mqtt_rx_topic;
 			document.getElementById("mqtt_status_topic").value = obj.mqtt_status_topic;
 			document.getElementById("mqtt_elm327_log").value = obj.mqtt_elm327_log;
-                	document.getElementById("precon_mode").value = obj.precon_mode;
-                	document.getElementById("precon_button").value = obj.precon_button; 
+            document.getElementById("precon_mode").value = obj.precon_mode;
+            document.getElementById("precon_button").value = obj.precon_button; 
 			if(obj.batt_alert_time == "1") {
 				document.getElementById("batt_alert_time").selectedIndex = "0";
 			} else if(obj.batt_alert_time == "6") {
