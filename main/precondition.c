@@ -255,6 +255,19 @@ static void stop_preconditioning(uint32_t now) {
     precondition_retries = 0U;
 }
 
+// Cache the configured activation button type. A config change restarts the
+// whole firmware, so the value is effectively constant for the lifetime of
+// the process. Read it once on the first CAN message rather than on every frame.
+static int8_t cached_precon_button_type(void) {
+    static int8_t precon_button_type = 0;
+    static bool loaded = false;
+    if (!loaded) {
+        precon_button_type = config_server_precon_button();
+        loaded = true;
+    }
+    return precon_button_type;
+}
+
 void precondition_can_rx_hook(twai_message_t *to_push) {
     // 0x2AD/0x0A82AA03 status frame: second byte indicates precondition state
     //   Ioniq 5/6: 0x01 = off/idle, 0x05 = starting, 0x15 = fully running
@@ -308,9 +321,7 @@ void precondition_can_rx_hook(twai_message_t *to_push) {
         }
     }
 
-    // Calling config_server_precon_button() with every CAN message 
-    // seems inefficient to me (TRH) but matches Ali's approach
-    int8_t precon_button_type = config_server_precon_button();
+    int8_t precon_button_type = cached_precon_button_type();
     if (precon_button_type == BUTTON_DISABLED) {
         // activation button disabled in config; don't listen for any button press
         return;
