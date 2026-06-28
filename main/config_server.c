@@ -2775,6 +2775,10 @@ int8_t config_server_precon_button(void)
 	{
 		return VOL_IN;
 	}
+	else if(strcmp(device_config.precon_button, "disabled") == 0)
+	{
+		return BUTTON_DISABLED;
+	}
 	return SW_STAR;
 }
 

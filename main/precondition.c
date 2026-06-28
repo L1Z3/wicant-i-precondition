@@ -304,6 +304,10 @@ void precondition_can_rx_hook(twai_message_t *to_push) {
     // Calling config_server_precon_button() with every CAN message 
     // seems inefficient to me (TRH) but matches Ali's approach
     int8_t precon_button_type = config_server_precon_button();
+    if (precon_button_type == BUTTON_DISABLED) {
+        // activation button disabled in config; don't listen for any button press
+        return;
+    }
     if (precon_button_type < 0 || precon_button_type >= NUM_PRECOND_BUTTONS) {
         ESP_LOGE(TAG, "Invalid precondition button type: %d", precon_button_type);
         return;

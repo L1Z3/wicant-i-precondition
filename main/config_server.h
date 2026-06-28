@@ -55,6 +55,7 @@
 #define CONTINUOUS			0
 #define ONCE				1
 
+#define BUTTON_DISABLED     -1
 #define SW_STAR				0
 #define TUNER_IN			1
 #define VOL_IN				2
