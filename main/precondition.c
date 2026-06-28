@@ -273,7 +273,7 @@ void precondition_can_rx_hook(twai_message_t *to_push) {
     // Volume button press does throw up a screen on the head unit
     // Calling config_server_precon_button() with every CAN message 
     // seems inefficient to me (TRH) but matches Ali's approach
-    int8_t precon_button_type = config_server_precon_button()
+    int8_t precon_button_type = config_server_precon_button();
     // #define SW_STAR				0
     // #define TUNER_IN				1
     // #define VOL_IN				2
@@ -281,12 +281,10 @@ void precondition_can_rx_hook(twai_message_t *to_push) {
     if (precon_button_type == SW_STAR && to_push->identifier == 0x448U) {
         bool activation_button_state = (to_push->data[5] == 0x10U);
         button_press_action(to_push, activation_button_state);
-    }
-    else if (precon_button_type == TUNER_IN && to_push->identifier == 0x651U) {
+    } else if (precon_button_type == TUNER_IN && to_push->identifier == 0x651U) {
         bool activation_button_state = (to_push->data[3] == 0x40U);
         button_press_action(to_push, activation_button_state);
-    }
-    else if (precon_button_type == VOL_IN && to_push->identifier == 0x651U) {
+    } else if (precon_button_type == VOL_IN && to_push->identifier == 0x651U) {
         bool activation_button_state = (to_push->data[1] == 0x43U);
         button_press_action(to_push, activation_button_state);
     }
