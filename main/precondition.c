@@ -2,8 +2,12 @@
 #include <stdint.h>
 #include <string.h>
 #include "esp_timer.h"
+#include "esp_log.h"
 #include "can.h"
 #include "precondition.h"
+#include "config_server.h"
+
+#define TAG __func__
 
 // ********************* 0x4E8 distance/flag display *********************
 
@@ -49,16 +53,50 @@ static uint8_t precondition_start_ticks_remaining = 0U;
 static uint8_t precondition_stop_ticks_remaining = 0U;
 // number of times we've retried sending precondition messages, used for retry logic
 static uint8_t precondition_retries = 0U;
-// has preconditioning been confirmed to be starting by the 2AD status frame?
+// has preconditioning been confirmed to be starting by the status frame?
 static bool precondition_starting_confirmed = false;
-// has preconditioning been confirmed to be active by the 2AD status frame?
+// has preconditioning been confirmed to be active by the status frame?
 static bool precondition_started_confirmed = false;
-// has precondition stop been confirmed by the 2AD status frame?
+// has precondition stop been confirmed by the status frame?
 static bool precondition_stop_confirmed = true;
-// track previous state of star button for edge detection
-static bool star_button_prev = false;
+// track previous state of activation button for edge detection
+static bool activation_button_state_prev = false;
 // is the status frame available? false if on unknown platform, true if we at any point receive a known status frame
 static bool status_frame_available = false;
+
+typedef struct {
+    uint32_t frame_id;
+    uint8_t byte_index;
+    uint8_t byte_mask;
+    uint8_t byte_value;
+} precond_button_t;
+
+// map of the buttons that can be used to activate preconditioning.
+// note: SW buttons (0x448) have a periodic idle message;
+//       AVN buttons (0x651/0x652) only send on press/release.
+const static precond_button_t activation_buttons[NUM_PRECOND_BUTTONS] = {
+    [SW_STAR]         = {0x448, 5, 0xF0, 0x10},
+    [AVN_STAR]        = {0x652, 1, 0x0F, 0x04},
+    [AVN_TUNER_IN]    = {0x651, 3, 0xF0, 0x40},
+    [AVN_VOL_IN]      = {0x651, 1, 0xF0, 0x40},
+    [SW_MODE]         = {0x448, 2, 0xF0, 0x40},
+    [SW_SPEAK]        = {0x448, 2, 0x0F, 0x01},
+    [SW_CALL]         = {0x448, 2, 0x0F, 0x04},
+    [SW_VOL_IN]       = {0x448, 3, 0x0F, 0x01},
+    [SW_VOL_UP]       = {0x448, 4, 0x0F, 0x01},
+    [SW_VOL_DOWN]     = {0x448, 3, 0xF0, 0x40},
+    [SW_SKIP_UP]      = {0x448, 3, 0xF0, 0x10},
+    [SW_SKIP_DOWN]    = {0x448, 3, 0x0F, 0x04},
+    [SW_OK]           = {0x448, 6, 0xF0, 0x10},
+    [AVNK_MAP]        = {0x652, 0, 0xF0, 0x40},
+    [AVNK_NAV]        = {0x652, 0, 0xF0, 0x10},
+    [AVNK_MEDIA]      = {0x652, 0, 0x0F, 0x01},
+    [AVNK_TUNER_UP]   = {0x652, 3, 0x0F, 0x04},
+    [AVNK_TUNER_DOWN] = {0x652, 3, 0x0F, 0x01},
+    
+};
+_Static_assert(sizeof(activation_buttons) / sizeof(activation_buttons[0])
+               == NUM_PRECOND_BUTTONS, "button table size mismatch");
 
 // 0x2AD on Ioniq 5/EV6, 0x0A82AA03 on Ioniq 6
 #define IS_STATUS_FRAME(frame_id) \
@@ -217,6 +255,19 @@ static void stop_preconditioning(uint32_t now) {
     precondition_retries = 0U;
 }
 
+// Cache the configured activation button type. A config change restarts the
+// whole firmware, so the value is effectively constant for the lifetime of
+// the process. Read it once on the first CAN message rather than on every frame.
+static int8_t cached_precon_button_type(void) {
+    static int8_t precon_button_type = 0;
+    static bool loaded = false;
+    if (!loaded) {
+        precon_button_type = config_server_precon_button();
+        loaded = true;
+    }
+    return precon_button_type;
+}
+
 void precondition_can_rx_hook(twai_message_t *to_push) {
     // 0x2AD/0x0A82AA03 status frame: second byte indicates precondition state
     //   Ioniq 5/6: 0x01 = off/idle, 0x05 = starting, 0x15 = fully running
@@ -246,13 +297,21 @@ void precondition_can_rx_hook(twai_message_t *to_push) {
             }
             if (STATUS_IDLE(status)) {
                 // preconditioning was previously fully active, but now it's showing as off.
-                // it's possible that the car has reached the (rare) "Precondition complete" state.
+                // it's possible that the car has reached the "Precondition complete" state.
                 // until we have a better way to distinguish that state from a real failure mode (TODO(ejones)),
                 // let's just assume everything is fine and reset our state
                 uint32_t now = now_us();
                 stop_preconditioning(now);
-                precondition_stop_ticks_remaining = 0U;
-                precondition_stop_confirmed = true;
+                // if we are in "once" mode, actually attempt to actively stop preconditioning.
+                // this should prevent preconditioning from restarting once the battery falls back below temp.
+                // TODO(ejones): this needs testing
+                if(config_server_precon_mode() != ONCE) {
+                    // TODO(ejones): continuous mode needs more development. for now,
+                    // this just doesn't attempt to stop preconditoning and lets the BMU do what it wants
+                    // once it reaches temp
+                    precondition_stop_ticks_remaining = 0U;
+                    precondition_stop_confirmed = true;
+                }
             }
         }
         if (!precondition_requested && !precondition_stop_confirmed && precondition_stop_ticks_remaining == 0U) {
@@ -262,16 +321,20 @@ void precondition_can_rx_hook(twai_message_t *to_push) {
         }
     }
 
-    // 0x448 has button presses:
-    // 7F 00 00 00 00 00 00 00 -> Idle
-    // 15 00 00 01 00 00 00 00 -> Mute
-    // 67 00 00 00 00 10 00 00 -> Star
-    // 31 00 00 00 04 00 00 00 -> Menu
-    // 7A 00 04 00 00 00 00 00 -> speak
-    // listen for star button press (rising edge only), and toggle preconditioning
-    if (to_push->identifier == 0x448U) {
-        bool star_button = (to_push->data[5] == 0x10U);
-        if (star_button && !star_button_prev) {
+    int8_t precon_button_type = cached_precon_button_type();
+    if (precon_button_type == BUTTON_DISABLED) {
+        // activation button disabled in config; don't listen for any button press
+        return;
+    }
+    if (precon_button_type < 0 || precon_button_type >= NUM_PRECOND_BUTTONS) {
+        ESP_LOGE(TAG, "Invalid precondition button type: %d", precon_button_type);
+        return;
+    }
+    // listen for activation button press (rising edge only), and toggle preconditioning
+    precond_button_t button = activation_buttons[precon_button_type];
+    if (to_push->identifier == button.frame_id) {
+        bool button_state = ((to_push->data[button.byte_index] & button.byte_mask) == button.byte_value);
+        if (button_state && !activation_button_state_prev) {
             uint32_t now = now_us();
             if (!precondition_requested) {
                 start_preconditioning(now);
@@ -279,8 +342,9 @@ void precondition_can_rx_hook(twai_message_t *to_push) {
                 stop_preconditioning(now);
             }
         }
-        star_button_prev = star_button;
+        activation_button_state_prev = button_state;
     }
+
 }
 
 // called every 40ms
