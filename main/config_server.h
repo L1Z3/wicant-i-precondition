@@ -57,9 +57,9 @@
 
 #define BUTTON_DISABLED                -1
 #define SW_STAR				0
-#define I5_AVNK_STAR			1
-#define I5_AVNK_TUNER_IN		2
-#define I5_AVNK_VOL_IN			3
+#define I5_AVN_STAR			1
+#define I5_AVN_TUNER_IN		        2
+#define I5_AVN_VOL_IN			3
 #define SW_MODE				4
 #define SW_SPEAK			5
 #define SW_CALL				6
@@ -69,12 +69,12 @@
 #define SW_SKIP_UP			10
 #define SW_SKIP_DOWN		        11
 #define SW_OK				12
-#define I5_AVNK_MAP			13
-#define I5_AVNK_NAV			14
-#define I5_AVNK_MEDIA			15
-#define I5_AVNK_TUNER_UP		16
-#define I5_AVNK_TUNER_DOWN		17
-#define EV6_AVNK_SETUP                  18
+#define I5_AVN_MAP			13
+#define I5_AVN_NAV			14
+#define I5_AVN_MEDIA			15
+#define I5_AVN_TUNER_UP		        16
+#define I5_AVN_TUNER_DOWN		17
+#define EV6_AVN_SETUP                   18
 #define NUM_PRECOND_BUTTONS             19
 
 typedef enum
@@ -130,6 +130,7 @@ typedef struct _device_config
 	char mqtt_tx_topic[64];
 	char mqtt_rx_topic[64];
 	char mqtt_status_topic[64];
+    char egmp_car_model[6];
     char precon_mode[16];
     char precon_button[16];
 }device_config_t;

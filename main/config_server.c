@@ -2780,17 +2780,17 @@ int8_t config_server_precon_button(void)
 	{
 		return SW_STAR;
 	}
-	else if(strcmp(device_config.precon_button, "i5_avnk_star") == 0)
+	else if(strcmp(device_config.precon_button, "i5_avn_star") == 0)
 	{
-		return I5_AVNK_STAR;
+		return I5_AVN_STAR;
 	}
-	else if(strcmp(device_config.precon_button, "i5_avnk_tuner_in") == 0)
+	else if(strcmp(device_config.precon_button, "i5_avn_tuner_in") == 0)
 	{
-		return I5_AVNK_TUNER_IN;
+		return I5_AVN_TUNER_IN;
 	}
-	else if(strcmp(device_config.precon_button, "i5_avnk_vol_in") == 0)
+	else if(strcmp(device_config.precon_button, "i5_avn_vol_in") == 0)
 	{
-		return I5_AVNK_VOL_IN;
+		return I5_AVN_VOL_IN;
 	}
 	else if(strcmp(device_config.precon_button, "sw_mode") == 0)
 	{
@@ -2808,19 +2808,19 @@ int8_t config_server_precon_button(void)
 	{
 		return SW_VOL_IN;
 	}
-	else if(strcmp(device_config.precon_button, "sw_vol_up") == 0)
+	else if(strcmp(device_config.precon_button, "sw_vol_u") == 0)
 	{
 		return SW_VOL_UP;
 	}
-	else if(strcmp(device_config.precon_button, "sw_vol_down") == 0)
+	else if(strcmp(device_config.precon_button, "sw_vol_d") == 0)
 	{
 		return SW_VOL_DOWN;
 	}
-	else if(strcmp(device_config.precon_button, "sw_skip_up") == 0)
+	else if(strcmp(device_config.precon_button, "sw_skip_u") == 0)
 	{
 		return SW_SKIP_UP;
 	}
-	else if(strcmp(device_config.precon_button, "sw_skip_down") == 0)
+	else if(strcmp(device_config.precon_button, "sw_skip_d") == 0)
 	{
 		return SW_SKIP_DOWN;
 	}
@@ -2828,29 +2828,29 @@ int8_t config_server_precon_button(void)
 	{
 		return SW_OK;
 	}
-	else if(strcmp(device_config.precon_button, "i5_avnk_map") == 0)
+	else if(strcmp(device_config.precon_button, "i5_avn_map") == 0)
 	{
-		return I5_AVNK_MAP;
+		return I5_AVN_MAP;
 	}
-	else if(strcmp(device_config.precon_button, "i5_avnk_nav") == 0)
+	else if(strcmp(device_config.precon_button, "i5_avn_nav") == 0)
 	{
-		return I5_AVNK_NAV;
+		return I5_AVN_NAV;
 	}
-	else if(strcmp(device_config.precon_button, "i5_avnk_media") == 0)
+	else if(strcmp(device_config.precon_button, "i5_avn_media") == 0)
 	{
-		return I5_AVNK_MEDIA;
+		return I5_AVN_MEDIA;
 	}
-	else if(strcmp(device_config.precon_button, "i5_avnk_tuner_up") == 0)
+	else if(strcmp(device_config.precon_button, "i5_avn_tuner_u") == 0)
 	{
-		return I5_AVNK_TUNER_UP;
+		return I5_AVN_TUNER_UP;
 	}
-	else if(strcmp(device_config.precon_button, "i5_avnk_tuner_down") == 0)
+	else if(strcmp(device_config.precon_button, "i5_avn_tuner_d") == 0)
 	{
-		return I5_AVNK_TUNER_DOWN;
+		return I5_AVN_TUNER_DOWN;
 	}
-        else if(strcmp(device_config.precon_button, "ev6_avnk_setup") == 0)
+        else if(strcmp(device_config.precon_button, "ev6_avn_setup") == 0)
         {
-                return EV6_AVNK_SETUP;
+                return EV6_AVN_SETUP;
         }
 	else if(strcmp(device_config.precon_button, "disabled") == 0)
 	{

@@ -75,25 +75,25 @@ typedef struct {
 // note: SW buttons (0x448) have a periodic idle message;
 //       AVN buttons (0x651/0x652) only send on press/release.
 const static precond_button_t activation_buttons[NUM_PRECOND_BUTTONS] = {
-    [SW_STAR]             = {0x448, 5, 0xF0, 0x10},
-    [I5_AVNK_STAR]        = {0x652, 1, 0x0F, 0x04},
-    [I5_AVNK_TUNER_IN]    = {0x651, 3, 0xF0, 0x40},
-    [I5_AVNK_VOL_IN]      = {0x651, 1, 0xF0, 0x40},
-    [SW_MODE]             = {0x448, 2, 0xF0, 0x40},
-    [SW_SPEAK]            = {0x448, 2, 0x0F, 0x01},
-    [SW_CALL]             = {0x448, 2, 0x0F, 0x04},
-    [SW_VOL_IN]           = {0x448, 3, 0x0F, 0x01},
-    [SW_VOL_UP]           = {0x448, 4, 0x0F, 0x01},
-    [SW_VOL_DOWN]         = {0x448, 3, 0xF0, 0x40},
-    [SW_SKIP_UP]          = {0x448, 3, 0xF0, 0x10},
-    [SW_SKIP_DOWN]        = {0x448, 3, 0x0F, 0x04},
-    [SW_OK]               = {0x448, 6, 0xF0, 0x10},
-    [I5_AVNK_MAP]         = {0x652, 0, 0xF0, 0x40},
-    [I5_AVNK_NAV]         = {0x652, 0, 0xF0, 0x10},
-    [I5_AVNK_MEDIA]       = {0x652, 0, 0x0F, 0x01},
-    [I5_AVNK_TUNER_UP ]   = {0x652, 3, 0x0F, 0x04},
-    [I5_AVNK_TUNER_DOWN]  = {0x652, 3, 0x0F, 0x01},
-    [EV6_AVNK_SETUP]      = {0x652, 1, 0x0F, 0x0C}, /* trig. on first message; test */
+    [SW_STAR]            = {0x448, 5, 0xF0, 0x10},
+    [I5_AVN_STAR]        = {0x652, 1, 0x0F, 0x04},
+    [I5_AVN_TUNER_IN]    = {0x651, 3, 0xF0, 0x40},
+    [I5_AVN_VOL_IN]      = {0x651, 1, 0xF0, 0x40},
+    [SW_MODE]            = {0x448, 2, 0xF0, 0x40},
+    [SW_SPEAK]           = {0x448, 2, 0x0F, 0x01},
+    [SW_CALL]            = {0x448, 2, 0x0F, 0x04},
+    [SW_VOL_IN]          = {0x448, 3, 0x0F, 0x01},
+    [SW_VOL_UP]          = {0x448, 4, 0x0F, 0x01},
+    [SW_VOL_DOWN]        = {0x448, 3, 0xF0, 0x40},
+    [SW_SKIP_UP]         = {0x448, 3, 0xF0, 0x10},
+    [SW_SKIP_DOWN]       = {0x448, 3, 0x0F, 0x04},
+    [SW_OK]              = {0x448, 6, 0xF0, 0x10},
+    [I5_AVN_MAP]         = {0x652, 0, 0xF0, 0x40},
+    [I5_AVN_NAV]         = {0x652, 0, 0xF0, 0x10},
+    [I5_AVN_MEDIA]       = {0x652, 0, 0x0F, 0x01},
+    [I5_AVN_TUNER_UP ]   = {0x652, 3, 0x0F, 0x04},
+    [I5_AVN_TUNER_DOWN]  = {0x652, 3, 0x0F, 0x01},
+    [EV6_AVN_SETUP]      = {0x652, 1, 0x0F, 0x0C}, /* trig. on first message; test */
     
 };
 _Static_assert(sizeof(activation_buttons) / sizeof(activation_buttons[0])
