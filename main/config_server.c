@@ -122,7 +122,7 @@ const char device_config_default[] = R"json({
 "can1_datarate":"500K",
 "can1_mode":"normal",
 "can1_en":"enable",
-"can_fwd_mode":"mitm",
+"can_fwd_mode":"auto",
 "port_type":"tcp",
 "port":"3333",
 "ap_pass":"@meatpi#",
@@ -393,11 +393,21 @@ int8_t config_server_get_can1_en(void)
 	return (strcmp(device_config.can1_en, "enable") == 0) ? 1 : 0;
 }
 
-// 1 = MITM mode (bridge/forward frames between the buses), 0 = parallel mode
-// (both buses tap the same wires; no forwarding)
-int8_t config_server_get_fwd_en(void)
+// How the two buses relate: CAN_FWD_MITM bridges frames between them,
+// CAN_FWD_PARALLEL assumes both tap the same wires (no forwarding), and
+// CAN_FWD_AUTO (the default) probes at runtime to pick between the two
+// (see main.c)
+int8_t config_server_get_fwd_mode(void)
 {
-	return (strcmp(device_config.can_fwd_mode, "parallel") == 0) ? 0 : 1;
+	if (strcmp(device_config.can_fwd_mode, "mitm") == 0)
+	{
+		return CAN_FWD_MITM;
+	}
+	if (strcmp(device_config.can_fwd_mode, "parallel") == 0)
+	{
+		return CAN_FWD_PARALLEL;
+	}
+	return CAN_FWD_AUTO;
 }
 
 int8_t config_server_get_port_type(void)
@@ -2182,9 +2192,10 @@ static void config_server_load_cfg(char *cfg)
 
 	//*****
 	key = cJSON_GetObjectItem(root,"can_fwd_mode");
-	if(key == 0 || !cJSON_IsString(key) || strcmp(key->valuestring, "parallel") != 0)
+	if(key == 0 || !cJSON_IsString(key) ||
+	   (strcmp(key->valuestring, "mitm") != 0 && strcmp(key->valuestring, "parallel") != 0))
 	{
-		strcpy(device_config.can_fwd_mode, "mitm");
+		strcpy(device_config.can_fwd_mode, "auto");
 	}
 	else
 	{

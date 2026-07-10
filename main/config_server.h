@@ -43,6 +43,11 @@
 #define CAN_NORMAL			0
 #define CAN_SILENT			1
 
+// can_fwd_mode values (config_server_get_fwd_mode)
+#define CAN_FWD_MITM		0
+#define CAN_FWD_PARALLEL	1
+#define CAN_FWD_AUTO		2
+
 #define UDP_PORT			0
 #define TCP_PORT			1
 
@@ -155,7 +160,7 @@ int8_t config_server_get_can_mode(void);
 int8_t config_server_get_can1_rate(void);
 int8_t config_server_get_can1_mode(void);
 int8_t config_server_get_can1_en(void);
-int8_t config_server_get_fwd_en(void);
+int8_t config_server_get_fwd_mode(void);
 int8_t config_server_get_port_type(void);
 int32_t config_server_get_port(void);
 //void config_server_wifi_connected(bool flag);

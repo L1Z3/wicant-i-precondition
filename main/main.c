@@ -234,19 +234,182 @@ static void can_tx_task(void *pvParameters)
 #define HEAP_CAPS   (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
 #define PRECONDITION_TICK_PERIOD_US 40000
 
+// ---- Auto forward-mode wiring probe (can_fwd_mode == "auto") ----
+// A fixed probe frame is sent on bus 1; if it shows up on bus 0 the two
+// buses tap the same wire (parallel), otherwise they are separate segments
+// (MITM). All probe state is owned by can_rx_task, so no locking -- the same
+// reasoning as precondition_tick() living in that task's loop.
+#define FWD_PROBE_ID			0x7EBU
+#define FWD_PROBE_BURST_LEN		3
+#define FWD_PROBE_GAP_US		20000		// between frames within a burst
+#define FWD_PROBE_PERIOD_US		500000		// between burst starts
+#define FWD_PROBE_TIMEOUT_US	10000000		// no echo for this long -> MITM
+// The very first decision after boot uses this much shorter window, so MITM
+// wiring isn't left unbridged for the full timeout at every boot
+#define FWD_PROBE_BOOT_TIMEOUT_US	100000
+static const uint8_t fwd_probe_data[8] = { 'W', 'i', 'C', 'P', 'R', 'O', 'B', 'E' };
+// When our probe last arrived on bus 0 (esp_timer time)
+static int64_t fwd_probe_last_rx_us;
+// When the first probe went out on bus 1 (0 = none yet); the eval must never
+// declare "no echo" before probes have had a full window to come back
+static int64_t fwd_probe_first_tx_us;
+// When ANY frame first arrived on bus 0 this boot (0 = never). Proof that
+// bus 0 RX works at all: without it, "no echo" can't distinguish separate
+// buses from a broken bus 0, and flipping to MITM on a broken bus 0 would
+// bridge a shared wire the moment it recovers.
+static int64_t fwd_bus0_first_rx_us;
+
+// True if msg is one of our probe frames
+static bool fwd_probe_match(const twai_message_t *msg)
+{
+	return !msg->extd && !msg->rtr &&
+	       msg->identifier == FWD_PROBE_ID &&
+	       msg->data_length_code == sizeof(fwd_probe_data) &&
+	       memcmp(msg->data, fwd_probe_data, sizeof(fwd_probe_data)) == 0;
+}
+
+// Send FWD_PROBE_BURST_LEN probes ~FWD_PROBE_GAP_US apart on bus 1, one
+// burst per FWD_PROBE_PERIOD_US. Called from the can_rx_task loop, which
+// wakes at least every 10 ms, so spacing is approximate (>= nominal).
+static void fwd_probe_tx_tick(void)
+{
+	static int64_t next_tx_us;
+	static uint8_t burst_left;
+
+	// While bus 1 is down every send would fail (and spam can_send's TX-drop
+	// warning); just pause. fwd_probe_eval() holds state during downtime
+	// anyway, and probing resumes on the next tick after re-enable.
+	if (!can_is_enabled(CAN_BUS_1))
+	{
+		return;
+	}
+	if (esp_timer_get_time() < next_tx_us)
+	{
+		return;
+	}
+	if (burst_left == 0)
+	{
+		burst_left = FWD_PROBE_BURST_LEN;
+	}
+
+	twai_message_t probe = {
+		.identifier = FWD_PROBE_ID,
+		.data_length_code = sizeof(fwd_probe_data),
+	};
+	memcpy(probe.data, fwd_probe_data, sizeof(fwd_probe_data));
+	// Timeout 0: a dropped probe is harmless (the burst repeats in 500 ms)
+	// and the datapath must never block on bus 1's TX pool or a dead bus.
+	// Quiet: under MITM bridging load the pool is often momentarily full, so
+	// expected probe drops must stay out of the bus TX-drop stats and their
+	// once-a-second log; they get their own sparse counter here instead.
+	if (can_send_quiet(CAN_BUS_1, &probe, 0) == ESP_OK)
+	{
+		if (fwd_probe_first_tx_us == 0)
+		{
+			fwd_probe_first_tx_us = esp_timer_get_time();
+		}
+	}
+	else
+	{
+		static uint32_t probe_drop_cnt = 0;
+		if ((++probe_drop_cnt % 256U) == 1U)
+		{
+			ESP_LOGW(TAG, "auto fwd: %lu probes dropped (bus 1 TX unavailable)",
+			         (unsigned long)probe_drop_cnt);
+		}
+	}
+
+	burst_left--;
+	next_tx_us = esp_timer_get_time() +
+			(burst_left ? FWD_PROBE_GAP_US
+			            : FWD_PROBE_PERIOD_US - (FWD_PROBE_BURST_LEN - 1) * FWD_PROBE_GAP_US);
+}
+
+// Decide the operational bridge state from the probe evidence. The two
+// directions are gated asymmetrically. An echo is positive proof of a shared
+// wire and is trusted at any time -- bridging a shared wire is itself what
+// destabilizes the buses, so requiring stability before turning the bridge
+// off would deadlock (bridge storms -> bus errors -> "unstable, hold" ->
+// more storms). "No echo", by contrast, is only trustworthy if probes could
+// actually flow for a full window: both buses stable, a probe actually sent,
+// and bus 0 demonstrably able to receive.
+static bool fwd_probe_eval(bool bridge_en)
+{
+	static bool first_decision_made;
+	const int64_t window_us = first_decision_made ? FWD_PROBE_TIMEOUT_US
+	                                              : FWD_PROBE_BOOT_TIMEOUT_US;
+	int64_t now = esp_timer_get_time();
+
+	// The boot decision counts any echo ever received: the boot window is
+	// shorter than the burst period, so a freshness check against it would
+	// read the gap between bursts as silence. After boot, echoes must be
+	// fresh so a rewiring to separate buses is noticed. 0 means "never",
+	// NOT "at boot": it must fail both arms, or for the first window_us of
+	// uptime the freshness arm reads it as a fresh echo at t=0.
+	bool echo_seen = fwd_probe_last_rx_us != 0 &&
+			(!first_decision_made ||
+			 (now - fwd_probe_last_rx_us) < window_us);
+	if (echo_seen)
+	{
+		first_decision_made = true;
+		if (bridge_en)
+		{
+			ESP_LOGW(TAG, "auto fwd: probe echoed on bus 0, buses share a wire -> parallel (bridge off)");
+			return false;
+		}
+		return bridge_en;
+	}
+
+	// No echo: hold the current state unless the silence is meaningful
+	if (can_up_time_us(CAN_BUS_0) < window_us ||
+	    can_up_time_us(CAN_BUS_1) < window_us)
+	{
+		return bridge_en;
+	}
+	if (fwd_probe_first_tx_us == 0 || now - fwd_probe_first_tx_us < window_us)
+	{
+		return bridge_en;	// probes haven't had a full window to echo yet
+	}
+	// Bus 0 must have received something this boot, and probing must have
+	// run a full window since then -- a bus 0 that only just woke up hasn't
+	// given echoes a fair chance either
+	if (fwd_bus0_first_rx_us == 0 || now - fwd_bus0_first_rx_us < window_us)
+	{
+		return bridge_en;
+	}
+
+	first_decision_made = true;
+	if (!bridge_en)
+	{
+		ESP_LOGW(TAG, "auto fwd: no probe echo on bus 0 for %lld ms, buses are separate -> MITM (bridge on)",
+		         window_us / 1000);
+		return true;
+	}
+	return bridge_en;
+}
+
 static void can_rx_task(void *pvParameters)
 {
 //	static uint32_t num_msg = 0;
 	static int64_t time_old = 0;
 	static int64_t precondition_tick_last = 0;
-	// MITM (bridge) vs parallel mode. Read once: a config change restarts
-	// the firmware, and the task is created after the config is loaded.
-	// Single-bus builds have nothing to bridge, so hardcode parallel there.
+	// MITM (bridge) vs parallel vs auto. Config read once: a config change
+	// restarts the firmware, and the task is created after the config is
+	// loaded. Single-bus builds have nothing to bridge or probe, so hardcode
+	// parallel there.
 #if CAN_BUS_COUNT > 1
-	const bool fwd_bridge_en = (config_server_get_fwd_en() != 0);
+	const int8_t fwd_mode = config_server_get_fwd_mode();
 #else
-	const bool fwd_bridge_en = false;
+	const int8_t fwd_mode = CAN_FWD_PARALLEL;
 #endif
+	// Operational bridge state. Fixed for mitm/parallel; auto mode starts at
+	// parallel (bridging buses that turn out to share a wire re-injects every
+	// frame as a duplicate, the worse failure) and follows the probe evidence.
+	bool fwd_bridge_en = (fwd_mode == CAN_FWD_MITM);
+	if (fwd_mode == CAN_FWD_AUTO)
+	{
+		ESP_LOGW(TAG, "auto fwd mode enabled: tentatively parallel (bridge off) unless the wiring probe says otherwise");
+	}
 //	float bvoltage = 0;
 //	time_old = esp_timer_get_time();
 	while(1)
@@ -290,6 +453,12 @@ static void can_rx_task(void *pvParameters)
             precondition_tick();
         }
 
+        if (fwd_mode == CAN_FWD_AUTO)
+        {
+            fwd_probe_tx_tick();
+            fwd_bridge_en = fwd_probe_eval(fwd_bridge_en);
+        }
+
 		// Block up to 10 ms for the first frame (keeps the 40 ms precondition
 		// tick and LED housekeeping above running when idle), then drain the
 		// backlog without waiting. This blocking is what makes prio 7 safe: the
@@ -304,6 +473,21 @@ static void can_rx_task(void *pvParameters)
             // the single-bus protocols (slcan/realdash/elm327/mqtt) see
             // CAN_BUS_0 traffic only.
             precondition_can_rx_hook(&rx_msg, rx_bus);
+            // Our auto-mode probe coming back on bus 0 is the shared-wire
+            // signal: flip to parallel right here rather than on the next
+            // eval tick, since every frame bridged onto a shared wire is a
+            // duplicate. Probe frames are also excluded from the forward
+            // path below so an echo can't re-amplify through the bridge.
+            if (fwd_mode == CAN_FWD_AUTO && rx_bus == CAN_BUS_0 && fwd_bus0_first_rx_us == 0)
+            {
+                fwd_bus0_first_rx_us = esp_timer_get_time();
+            }
+            bool is_auto_probe = (fwd_mode == CAN_FWD_AUTO) && fwd_probe_match(&rx_msg);
+            if (is_auto_probe && rx_bus == CAN_BUS_0)
+            {
+                fwd_probe_last_rx_us = esp_timer_get_time();
+                fwd_bridge_en = fwd_probe_eval(fwd_bridge_en);
+            }
             {
                 twai_message_t fwd_msg = rx_msg;
                 can_bus_t fwd_bus;
@@ -338,6 +522,7 @@ static void can_rx_task(void *pvParameters)
                     fwd_wanted = (fwd_result == FWD_MODIFIED);
                     fwd_wait = 1;
                 }
+                fwd_wanted = fwd_wanted && !is_auto_probe;
                 if (fwd_wanted && can_send(fwd_bus, &fwd_msg, fwd_wait) != ESP_OK)
                 {
                     if (fwd_bridge_en && fwd_wait != 0)

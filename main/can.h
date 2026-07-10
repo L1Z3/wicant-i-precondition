@@ -61,9 +61,14 @@ void can_set_filter(can_bus_t bus, uint32_t f);
 void can_set_mask(can_bus_t bus, uint32_t m);
 void can_set_bitrate(can_bus_t bus, uint8_t rate);
 esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_wait);
+// As can_send, but drops are neither counted in the bus TX-drop stats nor
+// logged -- for expendable periodic traffic whose caller does its own
+// accounting (e.g. the auto forward-mode wiring probe)
+esp_err_t can_send_quiet(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_wait);
 esp_err_t can_receive(twai_message_t *message, can_bus_t *bus, TickType_t ticks_to_wait);
 uint8_t can_is_silent(can_bus_t bus);
 bool can_is_enabled(can_bus_t bus);
+int64_t can_up_time_us(can_bus_t bus);
 bool can_any_enabled(void);
 uint8_t can_get_bitrate(can_bus_t bus);
 void can_flush_rx(void);

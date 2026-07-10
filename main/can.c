@@ -114,6 +114,12 @@ static int64_t rx_drop_log_us[CAN_BUS_COUNT];
 static uint32_t tx_drop_count[CAN_BUS_COUNT];
 static int64_t tx_drop_log_us[CAN_BUS_COUNT];
 
+// esp_timer time each bus last came up, for can_up_time_us(). Spinlocked
+// because int64 loads/stores aren't atomic here and readers run in other
+// tasks than the can_enable() caller.
+static portMUX_TYPE up_since_mux = portMUX_INITIALIZER_UNLOCKED;
+static int64_t can_up_since_us[CAN_BUS_COUNT];
+
 // Bus-off recovery: neither driver recovers on its own, so a state-change
 // callback (ISR) flags the bus and wakes a task that recreates the node.
 // Full recreate rather than twai_node_recover(): the frame in flight at
@@ -498,6 +504,9 @@ void can_enable(can_bus_t bus)
 	// lost. TODO(ejones): maybe eventually we can split into one rx queue per bus?
 	xQueueReset(can_rx_queue);
 
+	portENTER_CRITICAL(&up_since_mux);
+	can_up_since_us[bus] = esp_timer_get_time();
+	portEXIT_CRITICAL(&up_since_mux);
 	can_cfg[bus].bus_state = ON_BUS;
 #ifdef CAN_STDBY_GPIO_NUM
 	if (bus == CAN_BUS_0)
@@ -721,7 +730,9 @@ esp_err_t can_receive(twai_message_t *message, can_bus_t *bus, TickType_t ticks_
 // Queue a frame for transmission. Fire-and-forget: the message is copied
 // into a pool slot the driver transmits from later, so ticks_to_wait is
 // spent waiting for a free slot--not for the frame to reach the wire.
-esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_wait)
+// quiet = don't count or log drops (for expendable periodic traffic whose
+// callers do their own accounting, e.g. the auto-mode wiring probe).
+static esp_err_t can_send_impl(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_wait, bool quiet)
 {
 	if (bus >= CAN_BUS_COUNT || s_can_event_group == NULL)
 	{
@@ -733,13 +744,16 @@ esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_w
 	// authoritative re-check happens under node_lock below
 	if (!(xEventGroupGetBits(s_can_event_group) & CAN_ENABLE_BIT(bus)))
 	{
-		tx_drop_count[bus]++;
-		int64_t now = esp_timer_get_time();
-		if (now - tx_drop_log_us[bus] > 1000000)
+		if (!quiet)
 		{
-			tx_drop_log_us[bus] = now;
-			ESP_LOGW(TAG, "bus %d: down (disabled), %lu frames dropped total",
-					 bus, tx_drop_count[bus]);
+			tx_drop_count[bus]++;
+			int64_t now = esp_timer_get_time();
+			if (now - tx_drop_log_us[bus] > 1000000)
+			{
+				tx_drop_log_us[bus] = now;
+				ESP_LOGW(TAG, "bus %d: down (disabled), %lu frames dropped total",
+						 bus, tx_drop_count[bus]);
+			}
 		}
 		return ESP_ERR_INVALID_STATE;
 	}
@@ -749,12 +763,15 @@ esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_w
 	// full TX queue could stall can_disable() indefinitely.
 	if (xSemaphoreTake(tx_slot_sem[bus], ticks_to_wait) != pdTRUE)
 	{
-		tx_drop_count[bus]++;
-		int64_t now = esp_timer_get_time();
-		if (now - tx_drop_log_us[bus] > 1000000)
+		if (!quiet)
 		{
-			tx_drop_log_us[bus] = now;
-			ESP_LOGW(TAG, "bus %d: TX queue full, %lu frames dropped total", bus, tx_drop_count[bus]);
+			tx_drop_count[bus]++;
+			int64_t now = esp_timer_get_time();
+			if (now - tx_drop_log_us[bus] > 1000000)
+			{
+				tx_drop_log_us[bus] = now;
+				ESP_LOGW(TAG, "bus %d: TX queue full, %lu frames dropped total", bus, tx_drop_count[bus]);
+			}
 		}
 		return ESP_ERR_TIMEOUT;
 	}
@@ -832,6 +849,16 @@ esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_w
 	return err;
 }
 
+esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_wait)
+{
+	return can_send_impl(bus, message, ticks_to_wait, false);
+}
+
+esp_err_t can_send_quiet(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_wait)
+{
+	return can_send_impl(bus, message, ticks_to_wait, true);
+}
+
 bool can_is_enabled(can_bus_t bus)
 {
 	if (bus >= CAN_BUS_COUNT)
@@ -839,6 +866,22 @@ bool can_is_enabled(can_bus_t bus)
 		return false;
 	}
 	return can_cfg[bus].bus_state == ON_BUS;
+}
+
+// Continuous time the bus has been up, in microseconds; 0 while it is down.
+// Every downtime (explicit disable or a bus-off recovery recreate) restarts
+// the clock, so callers can require a stable bus before trusting bus-level
+// observations (see the auto forward-mode probe in main.c).
+int64_t can_up_time_us(can_bus_t bus)
+{
+	if (bus >= CAN_BUS_COUNT || can_cfg[bus].bus_state != ON_BUS)
+	{
+		return 0;
+	}
+	portENTER_CRITICAL(&up_since_mux);
+	int64_t since = can_up_since_us[bus];
+	portEXIT_CRITICAL(&up_since_mux);
+	return esp_timer_get_time() - since;
 }
 
 // True if any bus is up--one atomic read instead of a per-bus loop
