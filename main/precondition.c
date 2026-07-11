@@ -69,17 +69,17 @@ typedef struct {
     uint8_t byte_index;
     uint8_t byte_mask;
     uint8_t byte_value;
-} precond_button_t;
+} message_payload_t;
 
 typedef struct {
     const size_t len;
-    const precond_button_t **multimessage;
+    const message_payload_t **multimessage;
 } multimessage_button_t;
 
 // map of the buttons that can be used to activate preconditioning.
 // note: SW buttons (0x448) have a periodic idle message;
 //       AVN buttons (0x651/0x652) only send on press/release.
-const static precond_button_t activation_buttons[NUM_PRECOND_BUTTONS] = {
+const static message_payload_t activation_messages[NUM_PRECON_BUTTONS] = {
     [SW_STAR]            = {0x448, 5, 0xF0, 0x10},
     [I5_AVN_STAR]        = {0x652, 1, 0x0F, 0x04},
     [I5_AVN_TUNER_IN]    = {0x651, 3, 0xF0, 0x40},
@@ -102,22 +102,22 @@ const static precond_button_t activation_buttons[NUM_PRECOND_BUTTONS] = {
     
 };
 
-const static precond_button_t *sw_star_long_sequence[4] = {
-    &activation_buttons[SW_STAR], 
-    &activation_buttons[SW_STAR], 
-    &activation_buttons[SW_STAR], 
-    &activation_buttons[SW_STAR],
+const static message_payload_t *sw_star_long_sequence[4] = {
+    &activation_messages[SW_STAR], 
+    &activation_messages[SW_STAR], 
+    &activation_messages[SW_STAR], 
+    &activation_messages[SW_STAR],
 };
 
 const static multimessage_button_t activation_multibuttons[NUM_MULTI_BUTTONS] = {
-    [SW_STAR_LONG % NUM_PRECOND_BUTTONS] = {
+    [SW_STAR_LONG % NUM_PRECON_BUTTONS] = {
         .len = 4,
         .multimessage = sw_star_long_sequence,
     },
 };
 
-_Static_assert(sizeof(activation_buttons) / sizeof(activation_buttons[0])
-               == NUM_PRECOND_BUTTONS, "button table size mismatch");
+_Static_assert(sizeof(activation_messages) / sizeof(activation_messages[0])
+               == NUM_PRECON_BUTTONS, "button table size mismatch");
 
 // 0x2AD on Ioniq 5/EV6, 0x0A82AA03 on Ioniq 6
 #define IS_STATUS_FRAME(frame_id) \
@@ -348,17 +348,23 @@ void precondition_can_rx_hook(twai_message_t *to_push) {
         // activation button disabled in config; don't listen for any button press
         return;
     }
-    if (precon_button_type < 0 || precon_button_type >= NUM_PRECOND_BUTTONS + NUM_MULTI_BUTTONS) {
+    if (precon_button_type < 0 || precon_button_type >= NUM_PRECON_BUTTONS + NUM_MULTI_BUTTONS) {
         ESP_LOGE(TAG, "Invalid precondition button type: %d", precon_button_type);
         return;
     }
-    /* NUM_PRECOND_BUTTONS could be renamed if we stick with this scheme */
-    if (precon_button_type >= NUM_PRECOND_BUTTONS && precon_button_type < NUM_PRECOND_BUTTONS + NUM_MULTI_BUTTONS) {
-        size_t len = activation_multibuttons[precon_button_type % NUM_PRECOND_BUTTONS].len;
-        precond_button_t current_message = *(activation_multibuttons[precon_button_type % NUM_PRECOND_BUTTONS].multimessage[multimessage_counter]);
+    /* NUM_PRECON_BUTTONS could be renamed if we stick with this scheme */
+    if (precon_button_type >= NUM_PRECON_BUTTONS && precon_button_type < NUM_PRECON_BUTTONS + NUM_MULTI_BUTTONS) {
+        size_t len = activation_multibuttons[precon_button_type % NUM_PRECON_BUTTONS].len;
+        message_payload_t current_message = *(activation_multibuttons[precon_button_type % NUM_PRECON_BUTTONS].multimessage[multimessage_counter]);
         if (multimessage_counter < len && to_push->identifier == current_message.frame_id) {
             bool button_state = ((to_push->data[current_message.byte_index] &  current_message.byte_mask) == current_message.byte_value);
             if (button_state) {
+                /* This counter logic should work for both buttons with rising 
+                 * and falling edges, and buttons on constantly broadcast frames.
+                 * The logic will not work for messages that have a single value
+                 * only and nothing else sent on the same frame without the addition
+                 * of a timeout. It will also not work for complicated sequences 
+                 * that might include delays between button presses without a timeout */
                 multimessage_counter++;
                 if(multimessage_counter == len) {
                     /* expected sequence received */
@@ -379,9 +385,9 @@ void precondition_can_rx_hook(twai_message_t *to_push) {
                 multimessage_counter = 0;
             }
         }
-    } else if (precon_button_type < NUM_PRECOND_BUTTONS) {
+    } else if (precon_button_type < NUM_PRECON_BUTTONS) {
         // listen for activation button press (rising edge only), and toggle preconditioning
-        precond_button_t button = activation_buttons[precon_button_type];
+        message_payload_t button = activation_messages[precon_button_type];
         if (to_push->identifier == button.frame_id) {
             bool button_state = ((to_push->data[button.byte_index] & button.byte_mask) == button.byte_value);
             if (button_state && !activation_button_state_prev) {

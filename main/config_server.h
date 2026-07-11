@@ -75,7 +75,7 @@
 #define I5_AVN_TUNER_UP		        16
 #define I5_AVN_TUNER_DOWN		17
 #define EV6_AVN_SETUP                   18
-#define NUM_PRECOND_BUTTONS             19
+#define NUM_PRECON_BUTTONS              19
 #define SW_STAR_LONG			19
 #define NUM_MULTI_BUTTONS               1
 
