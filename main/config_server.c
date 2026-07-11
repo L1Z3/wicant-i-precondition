@@ -2780,6 +2780,10 @@ int8_t config_server_precon_button(void)
 	{
 		return SW_STAR;
 	}
+	if(strcmp(device_config.precon_button, "sw_star_long") == 0)
+	{
+		return SW_STAR_LONG;
+	}
 	else if(strcmp(device_config.precon_button, "i5_avn_star") == 0)
 	{
 		return I5_AVN_STAR;

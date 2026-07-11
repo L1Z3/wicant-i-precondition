@@ -71,6 +71,11 @@ typedef struct {
     uint8_t byte_value;
 } precond_button_t;
 
+typedef struct {
+    const size_t len;
+    const precond_button_t **multimessage;
+} multimessage_button_t;
+
 // map of the buttons that can be used to activate preconditioning.
 // note: SW buttons (0x448) have a periodic idle message;
 //       AVN buttons (0x651/0x652) only send on press/release.
@@ -96,6 +101,21 @@ const static precond_button_t activation_buttons[NUM_PRECOND_BUTTONS] = {
     [EV6_AVN_SETUP]      = {0x652, 1, 0x0F, 0x0C}, /* trig. on first message; test */
     
 };
+
+const static precond_button_t *sw_star_long_sequence[4] = {
+    &activation_buttons[SW_STAR], 
+    &activation_buttons[SW_STAR], 
+    &activation_buttons[SW_STAR], 
+    &activation_buttons[SW_STAR],
+};
+
+const static multimessage_button_t activation_multibuttons[NUM_MULTI_BUTTONS] = {
+    [SW_STAR_LONG % NUM_PRECOND_BUTTONS] = {
+        .len = 4,
+        .multimessage = sw_star_long_sequence,
+    },
+};
+
 _Static_assert(sizeof(activation_buttons) / sizeof(activation_buttons[0])
                == NUM_PRECOND_BUTTONS, "button table size mismatch");
 
@@ -270,6 +290,7 @@ static int8_t cached_precon_button_type(void) {
 }
 
 void precondition_can_rx_hook(twai_message_t *to_push) {
+    static uint8_t multimessage_counter = 0;
     // 0x2AD/0x0A82AA03 status frame: second byte indicates precondition state
     //   Ioniq 5/6: 0x01 = off/idle, 0x05 = starting, 0x15 = fully running
     //   EV6: 0x41 = off/idle, 0x45 = starting, 0x55 = fully running
@@ -327,23 +348,52 @@ void precondition_can_rx_hook(twai_message_t *to_push) {
         // activation button disabled in config; don't listen for any button press
         return;
     }
-    if (precon_button_type < 0 || precon_button_type >= NUM_PRECOND_BUTTONS) {
+    if (precon_button_type < 0 || precon_button_type >= NUM_PRECOND_BUTTONS + NUM_MULTI_BUTTONS) {
         ESP_LOGE(TAG, "Invalid precondition button type: %d", precon_button_type);
         return;
     }
-    // listen for activation button press (rising edge only), and toggle preconditioning
-    precond_button_t button = activation_buttons[precon_button_type];
-    if (to_push->identifier == button.frame_id) {
-        bool button_state = ((to_push->data[button.byte_index] & button.byte_mask) == button.byte_value);
-        if (button_state && !activation_button_state_prev) {
-            uint32_t now = now_us();
-            if (!precondition_requested) {
-                start_preconditioning(now);
-            } else if (ts_elapsed(now, precondition_requested_ts) > PRECONDITION_DEBOUNCE_US) {
-                stop_preconditioning(now);
+    /* NUM_PRECOND_BUTTONS could be renamed if we stick with this scheme */
+    if (precon_button_type >= NUM_PRECOND_BUTTONS && precon_button_type < NUM_PRECOND_BUTTONS + NUM_MULTI_BUTTONS) {
+        size_t len = activation_multibuttons[precon_button_type % NUM_PRECOND_BUTTONS].len;
+        precond_button_t current_message = *(activation_multibuttons[precon_button_type % NUM_PRECOND_BUTTONS].multimessage[multimessage_counter]);
+        if (multimessage_counter < len && to_push->identifier == current_message.frame_id) {
+            bool button_state = ((to_push->data[current_message.byte_index] &  current_message.byte_mask) == current_message.byte_value);
+            if (button_state) {
+                multimessage_counter++;
+                if(multimessage_counter == len) {
+                    /* expected sequence received */
+                    if(!activation_button_state_prev) {
+                        uint32_t now = now_us();
+                        if (!precondition_requested) {
+                            start_preconditioning(now);
+                        } else if (ts_elapsed(now, precondition_requested_ts) > PRECONDITION_DEBOUNCE_US) {
+                            stop_preconditioning(now);
+                        }
+                    }
+                    activation_button_state_prev = button_state;
+                    /* restart counter if successful */
+                    multimessage_counter = 0;
+                }
+            } else {
+                /* restart counter if count is interrupted */
+                multimessage_counter = 0;
             }
         }
-        activation_button_state_prev = button_state;
+    } else if (precon_button_type < NUM_PRECOND_BUTTONS) {
+        // listen for activation button press (rising edge only), and toggle preconditioning
+        precond_button_t button = activation_buttons[precon_button_type];
+        if (to_push->identifier == button.frame_id) {
+            bool button_state = ((to_push->data[button.byte_index] & button.byte_mask) == button.byte_value);
+            if (button_state && !activation_button_state_prev) {
+                uint32_t now = now_us();
+                if (!precondition_requested) {
+                    start_preconditioning(now);
+                } else if (ts_elapsed(now, precondition_requested_ts) > PRECONDITION_DEBOUNCE_US) {
+                    stop_preconditioning(now);
+                }
+            }
+            activation_button_state_prev = button_state;
+        }
     }
 
 }
