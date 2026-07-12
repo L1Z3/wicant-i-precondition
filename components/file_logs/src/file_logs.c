@@ -54,6 +54,9 @@ static volatile uint32_t s_flush_cycles = 0;
 // Active readers of the log files, guarded by s_file_mutex; rotation is
 // deferred while nonzero (littlefs rename/unlink fail on files with open FDs)
 static int s_readers = 0;
+// Bumped whenever the on-flash stream is rewritten (rotation, deletion) so
+// incremental /logs readers know their byte offsets are stale
+static uint32_t s_generation = 0;
 
 static void ring_write(const char *data, size_t len)
 {
@@ -194,6 +197,19 @@ bool file_logs_is_ram_only(void)
     return s_ram_only;
 }
 
+uint32_t file_logs_generation(void)
+{
+    return s_generation;
+}
+
+uint64_t file_logs_ram_total(void)
+{
+    portENTER_CRITICAL(&s_lock);
+    uint64_t total = s_total_in;
+    portEXIT_CRITICAL(&s_lock);
+    return total;
+}
+
 size_t file_logs_ram_read(uint64_t *pos, char *dst, size_t dst_size)
 {
     portENTER_CRITICAL(&s_lock);
@@ -288,6 +304,7 @@ static void log_file_rotate_if_needed(void)
         // Rename failed: truncate in place rather than growing without bound
         unlink(FILE_LOGS_CUR_PATH);
     }
+    s_generation++;
 }
 
 // Must be called with s_file_mutex held. Copies ring contents out in chunks
@@ -448,6 +465,7 @@ bool file_logs_delete(void)
         // Not started: nothing holds the files open
         unlink(FILE_LOGS_CUR_PATH);
         unlink(FILE_LOGS_OLD_PATH);
+        s_generation++;
         return true;
     }
     if (xSemaphoreTake(s_file_mutex, pdMS_TO_TICKS(5000)) != pdTRUE)
@@ -467,6 +485,7 @@ bool file_logs_delete(void)
         // Missing files are fine, ignore unlink errors
         unlink(FILE_LOGS_CUR_PATH);
         unlink(FILE_LOGS_OLD_PATH);
+        s_generation++;
         ok = true;
     }
     xSemaphoreGive(s_file_mutex);
@@ -530,6 +549,8 @@ void file_logs_start(void) {}
 void file_logs_set_max_total(uint32_t total_bytes) { (void)total_bytes; }
 void file_logs_ram_only(void) {}
 bool file_logs_is_ram_only(void) { return false; }
+uint32_t file_logs_generation(void) { return 0; }
+uint64_t file_logs_ram_total(void) { return 0; }
 size_t file_logs_ram_read(uint64_t *pos, char *dst, size_t dst_size)
 {
     (void)pos;

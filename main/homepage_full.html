@@ -472,6 +472,132 @@
                 border-radius: 4px;
             }
         }
+
+        .log-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin-bottom: 0.75rem;
+            flex-wrap: wrap;
+        }
+
+        .log-toolbar .log-status {
+            margin-left: auto;
+            font-size: 0.85rem;
+            font-weight: 500;
+            color: var(--gray-600);
+        }
+
+        .log-toolbar .log-status::before {
+            content: "\25CF";
+            margin-right: 0.35rem;
+            color: var(--gray-400);
+        }
+
+        .log-toolbar .log-status.live::before {
+            color: #4ade80;
+        }
+
+        .log-toolbar .log-status.error::before {
+            color: #ef4444;
+        }
+
+        .log-test-button {
+            padding: 0.4rem 0.9rem;
+            font-size: 0.85rem;
+            border-left: 4px solid transparent;
+        }
+
+        #test_log_info { border-left-color: #98c379; }
+        #test_log_warn { border-left-color: #e5c07b; }
+        #test_log_error { border-left-color: #e06c75; }
+        #download_logs_button { border-left-color: #61afef; }
+
+        .log-viewer-wrap {
+            position: relative;
+        }
+
+        .log-viewer {
+            position: relative;
+            box-sizing: border-box;
+            background-color: #16181d;
+            color: #abb2bf;
+            border: 1px solid #2c313a;
+            border-radius: 8px;
+            padding: 0.75rem 1rem;
+            height: 420px;
+            overflow-y: scroll;
+            overflow-x: hidden;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+            font-size: 0.8rem;
+            line-height: 1.45;
+            white-space: pre-wrap;
+            overflow-wrap: break-word;
+            box-shadow: inset 0 2px 6px rgba(0,0,0,0.4);
+        }
+
+        .log-float-controls {
+            position: absolute;
+            top: 0.6rem;
+            right: 1.5rem;
+            display: flex;
+            gap: 0.4rem;
+        }
+
+        .log-float-controls button {
+            width: auto;
+            padding: 0.3rem 0.7rem;
+            font-size: 0.8rem;
+            background-color: rgba(59, 64, 72, 0.85);
+            border: 1px solid #4b5263;
+            color: #abb2bf;
+            border-radius: 6px;
+            font-family: inherit;
+        }
+
+        .log-float-controls button:hover {
+            background-color: #4b5263;
+        }
+
+        .log-viewer-wrap.log-fullscreen {
+            position: fixed;
+            inset: 0;
+            z-index: 1000;
+            background-color: #16181d;
+        }
+
+        .log-viewer-wrap.log-fullscreen .log-viewer {
+            height: 100%;
+            border: none;
+            border-radius: 0;
+        }
+
+        .log-viewer::-webkit-scrollbar {
+            width: 10px;
+        }
+
+        .log-viewer::-webkit-scrollbar-track {
+            background: #16181d;
+        }
+
+        .log-viewer::-webkit-scrollbar-thumb {
+            background: #3b4048;
+            border-radius: 5px;
+        }
+
+        #log_lines:empty::before {
+            content: "(no log output yet)";
+            color: #5c6370;
+            font-style: italic;
+        }
+
+        .log-line-E { color: #e06c75; }
+        .log-line-W { color: #e5c07b; }
+        .log-line-I { color: #98c379; }
+        .log-line-M {
+            color: #61afef;
+            font-weight: 600;
+        }
     </style>
 </head>
 
@@ -1421,6 +1547,33 @@
                     </td>
                 </tr>
             </table>
+            <div id="logging_submit_slot"></div>
+            <div class="divider"></div>
+            <div class="section-title">Live Log</div>
+            <div class="log-toolbar">
+                <input id="download_logs_button" class="log-test-button" type="button" onclick="downloadLogs()" value="Download" />
+                <span id="log_status" class="log-status">idle</span>
+            </div>
+            <div id="log_viewer_wrap" class="log-viewer-wrap">
+                <div id="log_viewer" class="log-viewer"><div id="log_lines"></div></div>
+                <div class="log-float-controls">
+                    <button type="button" id="log_prev_boot" onclick="jumpBoot(-1)" title="Jump to previous boot (k)">&#9650; boot</button>
+                    <button type="button" id="log_next_boot" onclick="jumpBoot(1)" title="Jump to next boot (j)">&#9660; boot</button>
+                    <button type="button" id="log_jump_bottom" onclick="jumpLogBottom()" title="Jump to bottom (e)">&#8615; end</button>
+                    <button type="button" id="log_fullscreen_button" onclick="toggleLogFullscreen()" title="Fullscreen (f)">&#x26F6;</button>
+                </div>
+            </div>
+            <div class="log-toolbar" style="margin-top: 0.75rem; margin-bottom: 0;">
+                <input id="test_log_info" class="log-test-button" type="button" onclick="sendTestLog('info')" value="Test Info" />
+                <input id="test_log_warn" class="log-test-button" type="button" onclick="sendTestLog('warn')" value="Test Warning" />
+                <input id="test_log_error" class="log-test-button" type="button" onclick="sendTestLog('error')" value="Test Error" />
+                <label style="font-weight: normal; font-size: 0.85rem;">
+                    Test buttons log a message at that level (bypassing the configured log level).
+                </label>
+                <span style="margin-left: auto; font-size: 0.8rem; color: var(--gray-500);">
+                    Keys: <b>j</b>/<b>k</b> boot down/up &middot; <b>e</b> bottom &middot; <b>f</b> fullscreen
+                </span>
+            </div>
         </div>
 
         <input id="submit_button" name="submit_button" type="button" onclick="postConfig()" value="Submit Changes" disabled />
@@ -1455,23 +1608,255 @@
             });
         }
 
-        function deleteLogsClick() {
+        async function deleteLogsClick() {
             if (!confirm("Delete log files from the device?")) {
                 return;
             }
-            const xhttp = new XMLHttpRequest();
-            xhttp.onload = function() {
-                if (this.status == 200) {
-                    showNotification(this.responseText, "green");
+            // Pause the live-log poller and wait out any in-flight fetch:
+            // the device refuses deletion while a /logs reader has the
+            // files open
+            logPollPaused = true;
+            for (let i = 0; i < 50 && logPollBusy; i++) {
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+            try {
+                const resp = await fetch("/delete_logs", { method: "POST" });
+                if (resp.ok) {
+                    showNotification(await resp.text(), "green");
+                    clearLogViewer();
                 } else {
                     showNotification("Failed to delete log files", "red");
                 }
-            };
-            xhttp.onerror = function() {
+            } catch (e) {
                 showNotification("Failed to delete log files", "red");
-            };
-            xhttp.open("POST", "/delete_logs");
-            xhttp.send();
+            } finally {
+                logPollPaused = false;
+            }
+        }
+
+        // Live log view: polls /logs incrementally while the Logging tab is
+        // visible. The device returns only bytes logged since the cursor it
+        // handed out on the previous response, and X-Log-Reset means the
+        // stream was rewritten (rotation/deletion/reboot) so start over.
+        let logCursor = null;
+        let logPollBusy = false;
+        let logPollPaused = false;
+        let logPartialLine = "";
+        const LOG_VIEWER_MAX_LINES = 3000;
+
+        function loggingTabVisible() {
+            return document.getElementById("logging_tab").style.display === "block";
+        }
+
+        function setLogStatus(text, cls) {
+            const status = document.getElementById("log_status");
+            status.textContent = text;
+            status.className = "log-status" + (cls ? " " + cls : "");
+        }
+
+        function clearLogViewer() {
+            document.getElementById("log_lines").innerHTML = "";
+            logPartialLine = "";
+        }
+
+        function appendLogText(text) {
+            if (!text) {
+                return;
+            }
+            const viewer = document.getElementById("log_viewer");
+            const lines = document.getElementById("log_lines");
+            // Only auto-scroll if the user is already at the bottom, so
+            // scrolling back through history isn't yanked away
+            const stick = viewer.scrollTop + viewer.clientHeight >= viewer.scrollHeight - 40;
+
+            // Render whole lines only; a trailing fragment waits for the
+            // rest to arrive on a later poll
+            logPartialLine += text;
+            const parts = logPartialLine.split("\n");
+            logPartialLine = parts.pop();
+
+            const frag = document.createDocumentFragment();
+            for (let line of parts) {
+                line = line.replace(/\r$/, "");
+                if (line.length === 0) {
+                    continue;
+                }
+                const div = document.createElement("div");
+                div.textContent = line;
+                if (/^[EWI] \(/.test(line)) {
+                    div.className = "log-line-" + line.charAt(0);
+                } else if (line.startsWith("====")) {
+                    div.className = "log-line-M";
+                }
+                frag.appendChild(div);
+            }
+            if (frag.childElementCount === 0) {
+                return;
+            }
+            lines.appendChild(frag);
+            while (lines.childElementCount > LOG_VIEWER_MAX_LINES) {
+                lines.removeChild(lines.firstElementChild);
+            }
+            if (stick) {
+                viewer.scrollTop = viewer.scrollHeight;
+            }
+        }
+
+        async function pollLogs() {
+            if (logPollBusy || logPollPaused || document.hidden || !loggingTabVisible()) {
+                return;
+            }
+            logPollBusy = true;
+            try {
+                const url = logCursor === null ? "/logs" : "/logs?after=" + logCursor;
+                const resp = await fetch(url, { cache: "no-store" });
+                if (!resp.ok) {
+                    throw new Error("HTTP " + resp.status);
+                }
+                const text = await resp.text();
+                if (logCursor === null || resp.headers.get("X-Log-Reset") === "1") {
+                    clearLogViewer();
+                }
+                logCursor = resp.headers.get("X-Log-Cursor");
+                appendLogText(text);
+                setLogStatus("live", "live");
+            } catch (e) {
+                setLogStatus("connection lost", "error");
+            } finally {
+                logPollBusy = false;
+            }
+        }
+        setInterval(pollLogs, 2000);
+
+        // Scrolls the viewer to the previous (dir -1) or next (dir 1) boot
+        // marker line relative to the current scroll position. Past the
+        // outermost marker (or with no markers at all) it clamps to the top
+        // or bottom of the log.
+        function jumpBoot(dir) {
+            const viewer = document.getElementById("log_viewer");
+            const markers = [...viewer.querySelectorAll(".log-line-M")]
+                .filter(d => d.textContent.includes("boot"));
+            let target = null;
+            if (dir < 0) {
+                for (const m of markers) {
+                    if (m.offsetTop < viewer.scrollTop - 5) {
+                        target = m;
+                    } else {
+                        break;
+                    }
+                }
+                viewer.scrollTop = target ? Math.max(0, target.offsetTop - 6) : 0;
+            } else {
+                for (const m of markers) {
+                    // Threshold must exceed the 6px landing offset below,
+                    // or "next" re-targets the marker we're sitting on
+                    if (m.offsetTop > viewer.scrollTop + 8) {
+                        target = m;
+                        break;
+                    }
+                }
+                viewer.scrollTop = target ? Math.max(0, target.offsetTop - 6) : viewer.scrollHeight;
+            }
+        }
+
+        // Also re-engages the auto-follow, which only sticks while the
+        // viewer is scrolled to the bottom
+        function jumpLogBottom() {
+            const viewer = document.getElementById("log_viewer");
+            viewer.scrollTop = viewer.scrollHeight;
+        }
+
+        let logPageScrollY = 0;
+        function toggleLogFullscreen() {
+            const wrap = document.getElementById("log_viewer_wrap");
+            const viewer = document.getElementById("log_viewer");
+            const btn = document.getElementById("log_fullscreen_button");
+            const atBottom = viewer.scrollTop + viewer.clientHeight >= viewer.scrollHeight - 40;
+            // Read before toggling the class: pulling the wrapper out of the
+            // flow shortens the page and clamps its scroll position, which
+            // is also why it's restored on exit
+            const pageY = window.scrollY;
+            const on = wrap.classList.toggle("log-fullscreen");
+            btn.innerHTML = on ? "&#10005;" : "&#x26F6;";
+            btn.title = on ? "Exit fullscreen (Esc or f)" : "Fullscreen (f)";
+            document.body.style.overflow = on ? "hidden" : "";
+            if (on) {
+                logPageScrollY = pageY;
+            } else {
+                window.scrollTo(0, logPageScrollY);
+            }
+            // The resize breaks the bottom-stick; restore it if it was on
+            if (atBottom) {
+                viewer.scrollTop = viewer.scrollHeight;
+            }
+        }
+
+        document.addEventListener("keydown", e => {
+            const wrap = document.getElementById("log_viewer_wrap");
+            if (e.key === "Escape" && wrap.classList.contains("log-fullscreen")) {
+                toggleLogFullscreen();
+                return;
+            }
+            // Log-view shortcuts: only while the Logging tab is shown, with
+            // no modifiers, and not while a text-entry control has focus
+            if (!loggingTabVisible() || e.ctrlKey || e.altKey || e.metaKey) {
+                return;
+            }
+            const t = e.target;
+            if (t && (t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable ||
+                      (t.tagName === "INPUT" && !["button", "checkbox", "radio", "range"].includes(t.type)))) {
+                return;
+            }
+            switch (e.key) {
+                case "k": jumpBoot(-1); break;
+                case "j": jumpBoot(1); break;
+                case "e": jumpLogBottom(); break;
+                case "f": toggleLogFullscreen(); break;
+                default: return;
+            }
+            e.preventDefault();
+        });
+
+        async function downloadLogs() {
+            const btn = document.getElementById("download_logs_button");
+            btn.disabled = true;
+            try {
+                // Plain /logs (no cursor) returns the full history
+                const resp = await fetch("/logs", { cache: "no-store" });
+                if (!resp.ok) {
+                    throw new Error("HTTP " + resp.status);
+                }
+                const blob = await resp.blob();
+                const now = new Date();
+                const pad = n => String(n).padStart(2, "0");
+                const name = "wican-" + now.getFullYear() + pad(now.getMonth() + 1) + pad(now.getDate()) +
+                             "-" + pad(now.getHours()) + pad(now.getMinutes()) + pad(now.getSeconds()) + ".log";
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = url;
+                a.download = name;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                // Deferred so the revoke can't race the download starting
+                setTimeout(() => URL.revokeObjectURL(url), 10000);
+            } catch (e) {
+                showNotification("Failed to download logs", "red");
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        function sendTestLog(level) {
+            // No immediate poll afterwards on purpose: the message showing
+            // up on its own is what demonstrates the live view
+            fetch("/test_log?level=" + level, { method: "POST" }).then(resp => {
+                if (!resp.ok) {
+                    showNotification("Failed to send test log message", "red");
+                }
+            }).catch(() => {
+                showNotification("Failed to send test log message", "red");
+            });
         }
 		let latest_car_models = null;
         function loadCarModels(data) {
@@ -2474,6 +2859,17 @@ function loadAutoTable(jsonData) {
 		}
 		document.getElementById(tabName).style.display = "block";
 		evt.currentTarget.className += " active";
+		// The shared submit button normally sits below the visible tab; on
+		// the Logging tab pull it up above the Live Log so it stays next to
+		// the config options instead of below the log scrollback
+		const submitBtn = document.getElementById("submit_button");
+		if (tabName === "logging_tab") {
+			document.getElementById("logging_submit_slot").appendChild(submitBtn);
+			// Fetch right away instead of waiting for the next poll tick
+			pollLogs();
+		} else if (submitBtn.parentElement.id === "logging_submit_slot") {
+			document.querySelector(".content").appendChild(submitBtn);
+		}
 	}
 
 	function sta_enable() {}

@@ -759,41 +759,111 @@ static esp_err_t logo_handler(httpd_req_t *req)
 }
 
 // Streams the rotated log followed by the current log as one plain-text
-// response, so GET /logs always returns the full history oldest-first
+// response, so GET /logs returns the full history oldest-first. Pass
+// ?after=<X-Log-Cursor value from the previous response> to fetch only what
+// was logged since: the cursor is "<generation>:<file offset>:<ram offset>",
+// and every response carries X-Log-Cursor for the next call. When a cursor
+// no longer identifies a point in the stream (rotation, deletion, reboot)
+// the response restarts from the beginning and sets X-Log-Reset: 1.
 static esp_err_t logs_handler(httpd_req_t *req)
 {
 	static const char *log_paths[] = {FILE_LOGS_OLD_PATH, FILE_LOGS_CUR_PATH};
 	char chunk[1024];
+	bool have_cursor = false;
+	uint32_t c_gen = 0;
+	uint64_t c_file = 0;
+	uint64_t c_ram = 0;
+
+	// Worst-case cursor is 10+20+20 digits plus two separators
+	char query[80];
+	char after[64];
+	if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+	    httpd_query_key_value(query, "after", after, sizeof(after)) == ESP_OK)
+	{
+		unsigned long g;
+		unsigned long long f, r;
+		if (sscanf(after, "%lu:%llu:%llu", &g, &f, &r) == 3)
+		{
+			have_cursor = true;
+			c_gen = (uint32_t)g;
+			c_file = f;
+			c_ram = r;
+		}
+	}
 
 	file_logs_flush();
-	httpd_resp_set_type(req, "text/plain");
 
 	// Defers rotation while we hold the files open: littlefs cannot
-	// rename/unlink a file with an open FD
+	// rename/unlink a file with an open FD. Also pins the generation and
+	// makes the files append-only for the duration of this response.
 	bool read_guarded = file_logs_read_begin();
 
+	// Snapshot the stream bounds up front and never send past them, so the
+	// X-Log-Cursor header (sent before the body) stays accurate even if more
+	// data arrives while we stream
+	uint32_t gen = file_logs_generation();
+	uint64_t file_size[2];
+	uint64_t files_total = 0;
 	for (int i = 0; i < 2; i++)
 	{
-		FILE *f = fopen(log_paths[i], "r");
-		if (f == NULL)
+		struct stat st;
+		file_size[i] = (stat(log_paths[i], &st) == 0) ? (uint64_t)st.st_size : 0;
+		files_total += file_size[i];
+	}
+	bool ram_only = file_logs_is_ram_only();
+	uint64_t ram_total = ram_only ? file_logs_ram_total() : 0;
+
+	// A cursor from a different generation or pointing past the current end
+	// (deletion, reboot) is stale: restart the stream and tell the client
+	bool reset = have_cursor && (c_gen != gen || c_file > files_total || c_ram > ram_total);
+	if (reset || !have_cursor)
+	{
+		c_file = 0;
+		c_ram = 0;
+	}
+
+	char cursor_hdr[64];
+	snprintf(cursor_hdr, sizeof(cursor_hdr), "%lu:%llu:%llu",
+	         (unsigned long)gen, (unsigned long long)files_total,
+	         (unsigned long long)ram_total);
+	httpd_resp_set_type(req, "text/plain");
+	httpd_resp_set_hdr(req, "X-Log-Cursor", cursor_hdr);
+	if (reset)
+	{
+		httpd_resp_set_hdr(req, "X-Log-Reset", "1");
+	}
+
+	bool ok = true;
+	uint64_t base = 0;
+	for (int i = 0; ok && i < 2; i++)
+	{
+		uint64_t file_end = base + file_size[i];
+		if (c_file < file_end)
 		{
-			continue;
-		}
-		size_t n;
-		while ((n = fread(chunk, 1, sizeof(chunk), f)) > 0)
-		{
-			if (httpd_resp_send_chunk(req, chunk, n) != ESP_OK)
+			FILE *f = fopen(log_paths[i], "r");
+			if (f != NULL)
 			{
-				fclose(f);
-				if (read_guarded)
+				fseek(f, (long)(c_file - base), SEEK_SET);
+				uint64_t remaining = file_end - c_file;
+				while (ok && remaining > 0)
 				{
-					file_logs_read_end();
+					size_t want = remaining < sizeof(chunk) ? (size_t)remaining : sizeof(chunk);
+					size_t n = fread(chunk, 1, want, f);
+					if (n == 0)
+					{
+						break;
+					}
+					ok = httpd_resp_send_chunk(req, chunk, n) == ESP_OK;
+					remaining -= n;
 				}
-				httpd_resp_send_chunk(req, NULL, 0);
-				return ESP_FAIL;
+				fclose(f);
 			}
 		}
-		fclose(f);
+		base = file_end;
+		if (c_file < base)
+		{
+			c_file = base;
+		}
 	}
 
 	if (read_guarded)
@@ -803,33 +873,32 @@ static esp_err_t logs_handler(httpd_req_t *req)
 
 	// With log to file disabled nothing drains the ring, so append its
 	// contents after any files left over from when logging was enabled
-	if (file_logs_is_ram_only())
+	if (ok && ram_only)
 	{
 		static const char ram_header[] = "\n==== in-RAM log (log to file disabled) ====\n";
-		uint64_t pos = 0;
-		size_t n;
-		bool header_sent = false;
-		while ((n = file_logs_ram_read(&pos, chunk, sizeof(chunk))) > 0)
+		if (!have_cursor && c_ram < ram_total)
 		{
-			if (!header_sent)
+			// Separator only on full fetches; incremental readers see one
+			// continuous stream
+			ok = httpd_resp_send_chunk(req, ram_header, sizeof(ram_header) - 1) == ESP_OK;
+		}
+		while (ok && c_ram < ram_total)
+		{
+			uint64_t remaining = ram_total - c_ram;
+			size_t want = remaining < sizeof(chunk) ? (size_t)remaining : sizeof(chunk);
+			// c_ram may snap forward past evicted bytes; the loop bound
+			// stays correct since it only ever moves toward ram_total
+			size_t n = file_logs_ram_read(&c_ram, chunk, want);
+			if (n == 0)
 			{
-				header_sent = true;
-				if (httpd_resp_send_chunk(req, ram_header, sizeof(ram_header) - 1) != ESP_OK)
-				{
-					httpd_resp_send_chunk(req, NULL, 0);
-					return ESP_FAIL;
-				}
+				break;
 			}
-			if (httpd_resp_send_chunk(req, chunk, n) != ESP_OK)
-			{
-				httpd_resp_send_chunk(req, NULL, 0);
-				return ESP_FAIL;
-			}
+			ok = httpd_resp_send_chunk(req, chunk, n) == ESP_OK;
 		}
 	}
 
 	httpd_resp_send_chunk(req, NULL, 0);
-	return ESP_OK;
+	return ok ? ESP_OK : ESP_FAIL;
 }
 
 static esp_err_t delete_logs_handler(httpd_req_t *req)
@@ -840,6 +909,44 @@ static esp_err_t delete_logs_handler(httpd_req_t *req)
 		return ESP_FAIL;
 	}
 	httpd_resp_sendstr(req, "Log files deleted");
+	return ESP_OK;
+}
+
+// Emits one log line at the requested level so the web UI's live log view
+// can demonstrate itself. The tag's level is forced to Info first: the test
+// buttons must produce output even when the configured post-boot level
+// would filter that severity.
+static esp_err_t test_log_handler(httpd_req_t *req)
+{
+	static const char *test_tag = "LOG_TEST";
+	char query[32] = {0};
+	char level[8] = {0};
+
+	if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK)
+	{
+		httpd_query_key_value(query, "level", level, sizeof(level));
+	}
+
+	esp_log_level_set(test_tag, ESP_LOG_INFO);
+	if (strcmp(level, "error") == 0)
+	{
+		ESP_LOGE(test_tag, "test error message from the web UI");
+	}
+	else if (strcmp(level, "warn") == 0)
+	{
+		ESP_LOGW(test_tag, "test warning message from the web UI");
+	}
+	else if (strcmp(level, "info") == 0)
+	{
+		ESP_LOGI(test_tag, "test info message from the web UI");
+	}
+	else
+	{
+		httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "level must be info, warn or error");
+		return ESP_FAIL;
+	}
+
+	httpd_resp_sendstr(req, "Logged");
 	return ESP_OK;
 }
 
@@ -1753,6 +1860,12 @@ static const httpd_uri_t delete_logs_uri = {
     .handler   = delete_logs_handler,
     .user_ctx  = NULL
 };
+static const httpd_uri_t test_log_uri = {
+    .uri       = "/test_log",
+    .method    = HTTP_POST,
+    .handler   = test_log_handler,
+    .user_ctx  = NULL
+};
 static const httpd_uri_t ws = {
         .uri        = "/ws",
         .method     = HTTP_GET,
@@ -2646,6 +2759,7 @@ static httpd_handle_t config_server_init(void)
         httpd_register_uri_handler(server, &logo_uri);
         httpd_register_uri_handler(server, &logs_uri);
         httpd_register_uri_handler(server, &delete_logs_uri);
+        httpd_register_uri_handler(server, &test_log_uri);
         httpd_register_uri_handler(server, &ws);
         httpd_register_uri_handler(server, &file_upload);
 		httpd_register_uri_handler(server, &system_reboot);
@@ -2687,6 +2801,7 @@ void config_server_restart(void)
         httpd_register_uri_handler(server, &logo_uri);
         httpd_register_uri_handler(server, &logs_uri);
         httpd_register_uri_handler(server, &delete_logs_uri);
+        httpd_register_uri_handler(server, &test_log_uri);
         httpd_register_uri_handler(server, &ws);
         httpd_register_uri_handler(server, &file_upload);
 		httpd_register_uri_handler(server, &system_reboot);

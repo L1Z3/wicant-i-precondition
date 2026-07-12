@@ -39,6 +39,16 @@ void file_logs_ram_only(void);
 // True after file_logs_ram_only() put the component in RAM-only mode.
 bool file_logs_is_ram_only(void);
 
+// Counter bumped whenever the on-flash log stream is rewritten (rotation or
+// deletion). Incremental readers keying byte offsets into the concatenated
+// old+current files must restart from 0 when it changes; offsets are
+// otherwise stable since the files are append-only.
+uint32_t file_logs_generation(void);
+
+// Total bytes ever accepted into the RAM ring: the exclusive upper bound of
+// the absolute stream positions file_logs_ram_read() operates on.
+uint64_t file_logs_ram_total(void);
+
 // Copies up to dst_size bytes of the in-RAM log into dst, returning the
 // number of bytes copied (0 when caught up). *pos is an absolute stream
 // offset maintained by this function: start at 0 and pass the same variable
