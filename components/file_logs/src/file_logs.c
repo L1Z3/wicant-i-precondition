@@ -43,6 +43,9 @@ static uint32_t s_open_fails = 0;
 // Bumped after every completed drain (data on flash, fsync done) so
 // file_logs_flush() callers can tell when their request went through
 static volatile uint32_t s_flush_cycles = 0;
+// Active readers of the log files, guarded by s_file_mutex; rotation is
+// deferred while nonzero (littlefs rename/unlink fail on files with open FDs)
+static int s_readers = 0;
 
 static void ring_write(const char *data, size_t len)
 {
@@ -198,6 +201,11 @@ static void log_file_rotate_if_needed(void)
 {
     if (!s_file || s_file_size < FILE_LOGS_MAX_FILE_SIZE)
     {
+        return;
+    }
+    if (s_readers > 0)
+    {
+        // A reader is streaming the files; retry on a later drain cycle
         return;
     }
     fclose(s_file);
@@ -362,6 +370,38 @@ void file_logs_start(void)
     }
 }
 
+bool file_logs_read_begin(void)
+{
+    if (!s_file_mutex)
+    {
+        // Not started yet: no rotation to race with
+        return true;
+    }
+    if (xSemaphoreTake(s_file_mutex, pdMS_TO_TICKS(5000)) != pdTRUE)
+    {
+        return false;
+    }
+    s_readers++;
+    xSemaphoreGive(s_file_mutex);
+    return true;
+}
+
+void file_logs_read_end(void)
+{
+    if (!s_file_mutex)
+    {
+        return;
+    }
+    if (xSemaphoreTake(s_file_mutex, portMAX_DELAY) == pdTRUE)
+    {
+        if (s_readers > 0)
+        {
+            s_readers--;
+        }
+        xSemaphoreGive(s_file_mutex);
+    }
+}
+
 void file_logs_get_stats(uint32_t *buffered, uint32_t *dropped, uint32_t *written)
 {
     portENTER_CRITICAL(&s_lock);
@@ -385,6 +425,8 @@ void file_logs_get_stats(uint32_t *buffered, uint32_t *dropped, uint32_t *writte
 void file_logs_early_init(void) {}
 void file_logs_start(void) {}
 void file_logs_flush(void) {}
+bool file_logs_read_begin(void) { return true; }
+void file_logs_read_end(void) {}
 void file_logs_get_stats(uint32_t *buffered, uint32_t *dropped, uint32_t *written)
 {
     if (buffered) *buffered = 0;

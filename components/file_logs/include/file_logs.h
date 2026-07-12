@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -24,6 +25,13 @@ void file_logs_start(void);
 // Synchronous best-effort flush of whatever is buffered; call right before
 // esp_restart() so the tail of the log survives the reboot.
 void file_logs_flush(void);
+
+// Readers of the log files (e.g. the /logs HTTP handler) must bracket their
+// open..close with these: rotation is deferred while any reader is active,
+// since littlefs cannot rename/unlink a file that has an open FD. read_begin
+// returns false on timeout; only call read_end if it returned true.
+bool file_logs_read_begin(void);
+void file_logs_read_end(void);
 
 // Counters for troubleshooting: bytes currently buffered, bytes dropped on a
 // full ring, bytes written to the filesystem since boot.
