@@ -481,6 +481,7 @@
         <button class="tablinks" onclick="openTab(event, 'status_view')" id="defaultOpen"><b>Status</b></button>
         <button class="tablinks" onclick="openTab(event, 'wifi_settings')"><b>Settings</b></button>
         <button class="tablinks" onclick="openTab(event, 'buttons_tab')"><b>Buttons</b></button>
+        <button class="tablinks" onclick="openTab(event, 'logging_tab')"><b>Logging</b></button>
         <button class="tablinks" onclick="openTab(event, 'automate')"><b>Automate</b></button>
         <button class="tablinks" onclick="openTab(event, 'monitor')"><b>Monitor</b></button>
         <button class="tablinks" onclick="openTab(event, 'power_saving_tab')"><b>Power Saving</b></button>
@@ -1371,6 +1372,56 @@
             </table>
         </div>
 
+        <div id="logging_tab" class="tabcontent">
+            <div class="section-title">Logging</div>
+            <table class="form-table">
+                <tr>
+                    <td>Log to File:</td>
+                    <td>
+                        <select id="log_to_file" name="log_to_file" onchange="submit_enable();">
+                            <option value="enable">Enable</option>
+                            <option value="disable">Disable</option>
+                        </select>
+                        <br />
+                        <label style="font-weight: normal;">
+                            Note: logging to file may reduce the lifespan of the onboard storage.
+                        </label>
+                    </td>
+                </tr>
+                <tr>
+                    <td>Log Level:</td>
+                    <td>
+                        <select id="log_level" name="log_level" onchange="submit_enable();">
+                            <option value="none">None</option>
+                            <option value="error">Error</option>
+                            <option value="warn">Warning</option>
+                            <option value="info">Info</option>
+                        </select>
+                        <br />
+                        <label style="font-weight: normal;">
+                            Applies after boot; boot messages always log at Info.
+                        </label>
+                    </td>
+                </tr>
+                <tr>
+                    <td>Max Log Storage (KB):</td>
+                    <td>
+                        <input type="number" id="log_size" name="log_size" min="16" onchange="submit_enable();" />
+                        <br />
+                        <label style="font-weight: normal;" id="log_size_note">
+                            Total for both rotation files.
+                        </label>
+                    </td>
+                </tr>
+                <tr>
+                    <td>Log Files:</td>
+                    <td>
+                        <input id="delete_logs_button" name="delete_logs_button" type="button" onclick="deleteLogsClick()" value="Delete Log Files" />
+                    </td>
+                </tr>
+            </table>
+        </div>
+
         <input id="submit_button" name="submit_button" type="button" onclick="postConfig()" value="Submit Changes" disabled />
     </div>
     
@@ -1401,6 +1452,25 @@
             document.querySelectorAll(".precon_button_extra").forEach(option => {
                 option.hidden = !showAll;
             });
+        }
+
+        function deleteLogsClick() {
+            if (!confirm("Delete log files from the device?")) {
+                return;
+            }
+            const xhttp = new XMLHttpRequest();
+            xhttp.onload = function() {
+                if (this.status == 200) {
+                    showNotification(this.responseText, "green");
+                } else {
+                    showNotification("Failed to delete log files", "red");
+                }
+            };
+            xhttp.onerror = function() {
+                showNotification("Failed to delete log files", "red");
+            };
+            xhttp.open("POST", "/delete_logs");
+            xhttp.send();
         }
 		let latest_car_models = null;
         function loadCarModels(data) {
@@ -2543,6 +2613,23 @@ function loadAutoTable(jsonData) {
 					document.getElementById("can_fwd_mode").value = obj.can_fwd_mode;
 				}
 			}
+			// Logging settings: log_size comes from /check_status rather than
+			// /load_config so the device-side defaulted/clamped value is shown,
+			// and the max depends on the hardware's storage partition size
+			if (obj.log_size_kb) {
+				document.getElementById("log_size").value = obj.log_size_kb;
+			}
+			if (obj.log_size_max_kb) {
+				document.getElementById("log_size").max = obj.log_size_max_kb;
+				let note = "Max " + obj.log_size_max_kb + " KB.";
+				if (obj.log_used_kb !== undefined) {
+					note += " Logs currently use " + obj.log_used_kb + " KB.";
+				}
+				if (obj.fs_free_kb !== undefined) {
+					note += " Storage free: " + obj.fs_free_kb + " of " + obj.fs_total_kb + " KB.";
+				}
+				document.getElementById("log_size_note").innerHTML = note;
+			}
 			if(obj.port_type == "tcp") {
 				document.getElementById("port_type_status").innerHTML = "TCP";
 			} else if(obj.port_type == "udp") {
@@ -2861,6 +2948,9 @@ function loadAutoTable(jsonData) {
         obj["precon_mode"] = document.getElementById("precon_mode").value;
         obj["precon_button"] = document.getElementById("precon_button").value;
         obj["precon_press"] = document.getElementById("precon_press").value;
+        obj["log_to_file"] = document.getElementById("log_to_file").value;
+        obj["log_level"] = document.getElementById("log_level").value;
+        obj["log_size"] = document.getElementById("log_size").value;
 		var configJSON = JSON.stringify(obj);
 		const xhttp = new XMLHttpRequest();
 		xhttp.onload = function() {
@@ -3181,6 +3271,10 @@ function loadAutoTable(jsonData) {
             // config saved by older firmware has no precon_press key
             document.getElementById("precon_press").value = obj.precon_press || "short";
             syncPreconButtonToggle();
+            // logging keys are also missing from older configs; log_size is
+            // populated from /check_status instead (hardware-dependent default)
+            document.getElementById("log_to_file").value = obj.log_to_file || "enable";
+            document.getElementById("log_level").value = obj.log_level || "warn";
 			if(obj.batt_alert_time == "1") {
 				document.getElementById("batt_alert_time").selectedIndex = "0";
 			} else if(obj.batt_alert_time == "6") {

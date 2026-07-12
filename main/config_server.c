@@ -157,8 +157,17 @@ const char device_config_default[] = R"json({
 "mqtt_status_topic":"wican/%s/can/status",
 "precon_mode":"once",
 "precon_button":"sw_star",
-"precon_press":"short"
+"precon_press":"short",
+"log_to_file":"enable",
+"log_level":"warn"
 })json";
+
+// Total flash budget for the two log rotation files, in KB. The default
+// tracks the per-hardware cap in file_logs_config.h; log_size is absent from
+// device_config_default so the parse default applies on both variants.
+#define LOG_SIZE_DEFAULT_KB ((FILE_LOGS_MAX_FILE_SIZE * 2) / 1024)
+#define LOG_SIZE_MIN_KB     16
+#define LOG_SIZE_MAX_KB     ((HW_STORAGE_PARTITION_SIZE * 3 / 4) / 1024)
 static device_config_t device_config;
 TimerHandle_t xrestartTimer;
 
@@ -795,6 +804,17 @@ static esp_err_t logs_handler(httpd_req_t *req)
 	return ESP_OK;
 }
 
+static esp_err_t delete_logs_handler(httpd_req_t *req)
+{
+	if (!file_logs_delete())
+	{
+		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Log files busy, try again");
+		return ESP_FAIL;
+	}
+	httpd_resp_sendstr(req, "Log files deleted");
+	return ESP_OK;
+}
+
 static esp_err_t store_auto_data_handler(httpd_req_t *req)
 {
     if (!req)
@@ -1071,6 +1091,32 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 		time_t now;
 		time(&now);
 		cJSON_AddNumberToObject(root, "timestamp", (double)now);
+	}
+
+	// Log-to-file settings: effective (defaulted/clamped) values plus the
+	// storage numbers the Logging UI needs for its size limit and free-space note
+	cJSON_AddNumberToObject(root, "log_size_kb", atoi(device_config.log_size));
+	cJSON_AddNumberToObject(root, "log_size_max_kb", LOG_SIZE_MAX_KB);
+	{
+		struct stat st;
+		size_t log_used = 0;
+		if (stat(FILE_LOGS_CUR_PATH, &st) == 0)
+		{
+			log_used += st.st_size;
+		}
+		if (stat(FILE_LOGS_OLD_PATH, &st) == 0)
+		{
+			log_used += st.st_size;
+		}
+		cJSON_AddNumberToObject(root, "log_used_kb", log_used / 1024);
+	}
+	{
+		size_t fs_total = 0, fs_used = 0;
+		if (filesystem_get_usage(&fs_total, &fs_used) == ESP_OK)
+		{
+			cJSON_AddNumberToObject(root, "fs_total_kb", fs_total / 1024);
+			cJSON_AddNumberToObject(root, "fs_free_kb", (fs_total - fs_used) / 1024);
+		}
 	}
 
 	char *resp_str = cJSON_PrintUnformatted(root);
@@ -1673,6 +1719,12 @@ static const httpd_uri_t logs_uri = {
     .handler   = logs_handler,
     .user_ctx  = NULL
 };
+static const httpd_uri_t delete_logs_uri = {
+    .uri       = "/delete_logs",
+    .method    = HTTP_POST,
+    .handler   = delete_logs_handler,
+    .user_ctx  = NULL
+};
 static const httpd_uri_t ws = {
         .uri        = "/ws",
         .method     = HTTP_GET,
@@ -2259,6 +2311,60 @@ static void config_server_load_cfg(char *cfg)
 	//*****
 
 	//*****
+	key = cJSON_GetObjectItem(root,"log_to_file");
+	if(key == 0 || !cJSON_IsString(key) ||
+	   (strcmp(key->valuestring, "enable") != 0 && strcmp(key->valuestring, "disable") != 0))
+	{
+		strcpy(device_config.log_to_file, "enable");
+	}
+	else
+	{
+		strlcpy(device_config.log_to_file, key->valuestring, sizeof(device_config.log_to_file));
+	}
+	ESP_LOGI(TAG, "device_config.log_to_file: %s", device_config.log_to_file);
+	//*****
+
+	//*****
+	key = cJSON_GetObjectItem(root,"log_level");
+	if(key == 0 || !cJSON_IsString(key) ||
+	   (strcmp(key->valuestring, "none") != 0 && strcmp(key->valuestring, "error") != 0 &&
+	    strcmp(key->valuestring, "warn") != 0 && strcmp(key->valuestring, "info") != 0))
+	{
+		strcpy(device_config.log_level, "warn");
+	}
+	else
+	{
+		strlcpy(device_config.log_level, key->valuestring, sizeof(device_config.log_level));
+	}
+	ESP_LOGI(TAG, "device_config.log_level: %s", device_config.log_level);
+	//*****
+
+	//*****
+	key = cJSON_GetObjectItem(root,"log_size");
+	{
+		uint32_t log_size_kb = 0;
+		if(key != 0 && cJSON_IsString(key))
+		{
+			log_size_kb = (uint32_t)atoi(key->valuestring);
+		}
+		if(log_size_kb == 0)
+		{
+			log_size_kb = LOG_SIZE_DEFAULT_KB;
+		}
+		if(log_size_kb < LOG_SIZE_MIN_KB)
+		{
+			log_size_kb = LOG_SIZE_MIN_KB;
+		}
+		if(log_size_kb > LOG_SIZE_MAX_KB)
+		{
+			log_size_kb = LOG_SIZE_MAX_KB;
+		}
+		snprintf(device_config.log_size, sizeof(device_config.log_size), "%lu", (unsigned long)log_size_kb);
+	}
+	ESP_LOGI(TAG, "device_config.log_size: %s KB", device_config.log_size);
+	//*****
+
+	//*****
 	key = cJSON_GetObjectItem(root,"sta_security");
 	if(key == 0)
 	{
@@ -2511,6 +2617,7 @@ static httpd_handle_t config_server_init(void)
         httpd_register_uri_handler(server, &load_config_uri);
         httpd_register_uri_handler(server, &logo_uri);
         httpd_register_uri_handler(server, &logs_uri);
+        httpd_register_uri_handler(server, &delete_logs_uri);
         httpd_register_uri_handler(server, &ws);
         httpd_register_uri_handler(server, &file_upload);
 		httpd_register_uri_handler(server, &system_reboot);
@@ -2551,6 +2658,7 @@ void config_server_restart(void)
         httpd_register_uri_handler(server, &load_config_uri);
         httpd_register_uri_handler(server, &logo_uri);
         httpd_register_uri_handler(server, &logs_uri);
+        httpd_register_uri_handler(server, &delete_logs_uri);
         httpd_register_uri_handler(server, &ws);
         httpd_register_uri_handler(server, &file_upload);
 		httpd_register_uri_handler(server, &system_reboot);
@@ -3097,4 +3205,36 @@ int8_t config_server_precon_press(void)
 		return PRESS_LONG;
 	}
 	return PRESS_SHORT;
+}
+
+int8_t config_server_get_log_to_file(void)
+{
+	return strcmp(device_config.log_to_file, "disable") != 0;
+}
+
+esp_log_level_t config_server_get_log_level(void)
+{
+	if(strcmp(device_config.log_level, "none") == 0)
+	{
+		return ESP_LOG_NONE;
+	}
+	else if(strcmp(device_config.log_level, "error") == 0)
+	{
+		return ESP_LOG_ERROR;
+	}
+	else if(strcmp(device_config.log_level, "info") == 0)
+	{
+		return ESP_LOG_INFO;
+	}
+	return ESP_LOG_WARN;
+}
+
+uint32_t config_server_get_log_size(void)
+{
+	uint32_t kb = (uint32_t)atoi(device_config.log_size);
+	if(kb == 0)
+	{
+		kb = LOG_SIZE_DEFAULT_KB;
+	}
+	return kb * 1024;
 }

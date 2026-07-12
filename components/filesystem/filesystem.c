@@ -190,6 +190,19 @@ void filesystem_delete_all(void)
     }
 }
 
+esp_err_t filesystem_get_usage(size_t *total, size_t *used)
+{
+    if (!initialized)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    #ifdef USE_FATFS
+    return ESP_ERR_NOT_SUPPORTED;
+    #else
+    return esp_littlefs_info("storage", total, used);
+    #endif
+}
+
 void filesystem_init(void)
 {
     if (initialized) 

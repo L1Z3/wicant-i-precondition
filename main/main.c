@@ -710,8 +710,17 @@ void app_main(void)
             derived_mac_addr[3], derived_mac_addr[4], derived_mac_addr[5]);
 	
 	config_server_start(&xmsg_ws_tx_queue, &xMsg_Rx_Queue, CONNECTED_LED_GPIO_NUM, (char*)&uid[0]);
-	// config_server_start mounted the filesystem, logs can go to flash now
-	file_logs_start();
+	// config_server_start mounted the filesystem and loaded the config, so
+	// logging to flash can start now (or be torn down if configured off)
+	if(config_server_get_log_to_file())
+	{
+		file_logs_set_max_total(config_server_get_log_size());
+		file_logs_start();
+	}
+	else
+	{
+		file_logs_disable();
+	}
 	slcan_init(&send_to_host);
 
 	int8_t can_datarate = config_server_get_can_rate();
@@ -917,8 +926,9 @@ void app_main(void)
 	// pdTRUE, /* BIT_0 should be cleared before returning. */
 	// pdFALSE, /* Don't wait for both bits, either bit will do. */
 	// portMAX_DELAY);/* Wait forever. */  
-	// esp_log_level_set("*", ESP_LOG_NONE);
-	esp_log_level_set("*", ESP_LOG_WARN);
+	// Boot always logs at the compiled-in default level; from here on the
+	// configured post-boot level applies (default warn)
+	esp_log_level_set("*", config_server_get_log_level());
 	// esp_log_level_set("autopid_parser", ESP_LOG_ERROR);
 	// esp_log_level_set("autopid_task", ESP_LOG_ERROR);
 	// esp_log_level_set("elm327_process_cmd", ESP_LOG_ERROR);

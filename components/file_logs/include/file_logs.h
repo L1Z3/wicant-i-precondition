@@ -22,9 +22,24 @@ void file_logs_early_init(void);
 // background flush task.
 void file_logs_start(void);
 
+// Sets the total on-flash log budget (both rotation files combined, so each
+// file is capped at half). Values too small to be useful are ignored. Call
+// before file_logs_start(); defaults to FILE_LOGS_MAX_FILE_SIZE * 2.
+void file_logs_set_max_total(uint32_t total_bytes);
+
+// Uninstalls the log hook and frees the ring buffer. Meant for the
+// logging-disabled config, called instead of file_logs_start(); everything
+// captured since early init is discarded, existing log files are untouched.
+void file_logs_disable(void);
+
 // Synchronous best-effort flush of whatever is buffered; call right before
 // esp_restart() so the tail of the log survives the reboot.
 void file_logs_flush(void);
+
+// Deletes both log files from the filesystem (buffered-but-unflushed lines
+// survive and start a fresh file on the next flush). Returns false if the
+// files are busy: a /logs reader is streaming them or the file mutex timed out.
+bool file_logs_delete(void);
 
 // Readers of the log files (e.g. the /logs HTTP handler) must bracket their
 // open..close with these: rotation is deferred while any reader is active,

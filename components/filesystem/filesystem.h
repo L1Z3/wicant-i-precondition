@@ -20,7 +20,9 @@
 #pragma once
 
 #include "esp_err.h"
+#include <stddef.h>
 
 void filesystem_init(void);
 void filesystem_delete_config_files(void);
 void filesystem_delete_all(void); // delete all files and folders under FS_MOUNT_POINT
+esp_err_t filesystem_get_usage(size_t *total, size_t *used); // bytes on the storage partition

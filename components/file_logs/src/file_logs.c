@@ -40,6 +40,8 @@ static long s_file_size = 0;
 static uint32_t s_written = 0;
 static uint32_t s_dropped_reported = 0;
 static uint32_t s_open_fails = 0;
+// Per-file rotation cap; configurable at runtime via file_logs_set_max_total
+static long s_max_file_size = FILE_LOGS_MAX_FILE_SIZE;
 // Bumped after every completed drain (data on flash, fsync done) so
 // file_logs_flush() callers can tell when their request went through
 static volatile uint32_t s_flush_cycles = 0;
@@ -151,6 +153,36 @@ void file_logs_early_init(void)
     s_orig_vprintf = esp_log_set_vprintf(file_logs_vprintf);
 }
 
+void file_logs_set_max_total(uint32_t total_bytes)
+{
+    // Two rotation files share the budget; refuse caps too small for even a
+    // few flush cycles worth of logs
+    if (total_bytes / 2 >= 8 * 1024)
+    {
+        s_max_file_size = (long)(total_bytes / 2);
+    }
+}
+
+void file_logs_disable(void)
+{
+    if (s_orig_vprintf)
+    {
+        esp_log_set_vprintf(s_orig_vprintf);
+        s_orig_vprintf = NULL;
+    }
+    // Take the ring away under the lock so a logger racing in ring_write
+    // can't touch freed memory; it will see s_buf == NULL and drop the line
+    portENTER_CRITICAL(&s_lock);
+    char *buf = s_buf;
+    s_buf = NULL;
+    s_buf_size = 0;
+    s_head = 0;
+    s_tail = 0;
+    s_used = 0;
+    portEXIT_CRITICAL(&s_lock);
+    free(buf);
+}
+
 static const char *reset_reason_str(esp_reset_reason_t r)
 {
     switch (r)
@@ -199,7 +231,7 @@ static bool log_file_open(void)
 // Must be called with s_file_mutex held
 static void log_file_rotate_if_needed(void)
 {
-    if (!s_file || s_file_size < FILE_LOGS_MAX_FILE_SIZE)
+    if (!s_file || s_file_size < s_max_file_size)
     {
         return;
     }
@@ -370,6 +402,38 @@ void file_logs_start(void)
     }
 }
 
+bool file_logs_delete(void)
+{
+    if (!s_file_mutex)
+    {
+        // Not started: nothing holds the files open
+        unlink(FILE_LOGS_CUR_PATH);
+        unlink(FILE_LOGS_OLD_PATH);
+        return true;
+    }
+    if (xSemaphoreTake(s_file_mutex, pdMS_TO_TICKS(5000)) != pdTRUE)
+    {
+        return false;
+    }
+    bool ok = false;
+    if (s_readers == 0)
+    {
+        // Close our append FD first: littlefs cannot unlink an open file
+        if (s_file)
+        {
+            fclose(s_file);
+            s_file = NULL;
+            s_file_size = 0;
+        }
+        // Missing files are fine, ignore unlink errors
+        unlink(FILE_LOGS_CUR_PATH);
+        unlink(FILE_LOGS_OLD_PATH);
+        ok = true;
+    }
+    xSemaphoreGive(s_file_mutex);
+    return ok;
+}
+
 bool file_logs_read_begin(void)
 {
     if (!s_file_mutex)
@@ -424,6 +488,9 @@ void file_logs_get_stats(uint32_t *buffered, uint32_t *dropped, uint32_t *writte
 
 void file_logs_early_init(void) {}
 void file_logs_start(void) {}
+void file_logs_set_max_total(uint32_t total_bytes) { (void)total_bytes; }
+void file_logs_disable(void) {}
+bool file_logs_delete(void) { return true; }
 void file_logs_flush(void) {}
 bool file_logs_read_begin(void) { return true; }
 void file_logs_read_end(void) {}
