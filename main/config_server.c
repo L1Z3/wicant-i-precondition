@@ -74,6 +74,8 @@
 #include "wc_mdns.h"
 #include "hw_config.h"
 #include "ha_webhooks.h"
+#include "file_logs.h"
+#include "file_logs_config.h"
 
 #define WIFI_CONNECTED_BIT			BIT0
 #define WS_CONNECTED_BIT			BIT1
@@ -745,6 +747,40 @@ static esp_err_t logo_handler(httpd_req_t *req)
 	httpd_resp_set_type(req, "image/svg+xml");
     httpd_resp_send(req, (const char*)resp_str, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
+}
+
+// Streams the rotated log followed by the current log as one plain-text
+// response, so GET /logs always returns the full history oldest-first
+static esp_err_t logs_handler(httpd_req_t *req)
+{
+	static const char *log_paths[] = {FILE_LOGS_OLD_PATH, FILE_LOGS_CUR_PATH};
+	char chunk[1024];
+
+	file_logs_flush();
+	httpd_resp_set_type(req, "text/plain");
+
+	for (int i = 0; i < 2; i++)
+	{
+		FILE *f = fopen(log_paths[i], "r");
+		if (f == NULL)
+		{
+			continue;
+		}
+		size_t n;
+		while ((n = fread(chunk, 1, sizeof(chunk), f)) > 0)
+		{
+			if (httpd_resp_send_chunk(req, chunk, n) != ESP_OK)
+			{
+				fclose(f);
+				httpd_resp_send_chunk(req, NULL, 0);
+				return ESP_FAIL;
+			}
+		}
+		fclose(f);
+	}
+
+	httpd_resp_send_chunk(req, NULL, 0);
+	return ESP_OK;
 }
 
 static esp_err_t store_auto_data_handler(httpd_req_t *req)
@@ -1619,6 +1655,12 @@ static const httpd_uri_t logo_uri = {
      * context to demonstrate it's usage */
     .user_ctx  = NULL
 };
+static const httpd_uri_t logs_uri = {
+    .uri       = "/logs",
+    .method    = HTTP_GET,
+    .handler   = logs_handler,
+    .user_ctx  = NULL
+};
 static const httpd_uri_t ws = {
         .uri        = "/ws",
         .method     = HTTP_GET,
@@ -2287,6 +2329,7 @@ config_error:
 		fprintf(f, device_config_default, (char*)device_id, (char*)device_id, (char*)device_id);
 		fclose(f);
 		vTaskDelay(3000 / portTICK_PERIOD_MS);
+		file_logs_flush();
 		esp_restart();
     }
 	cJSON_Delete(root);
@@ -2328,6 +2371,7 @@ void config_server_get_sta_ip(char* ip)
 void vrestartTimerCallback( TimerHandle_t xTimer )
 {
 //	vTaskDelay(1000 / portTICK_PERIOD_MS);
+	file_logs_flush();
 	esp_restart();
 }
 
@@ -2454,6 +2498,7 @@ static httpd_handle_t config_server_init(void)
         httpd_register_uri_handler(server, &check_status_uri);
         httpd_register_uri_handler(server, &load_config_uri);
         httpd_register_uri_handler(server, &logo_uri);
+        httpd_register_uri_handler(server, &logs_uri);
         httpd_register_uri_handler(server, &ws);
         httpd_register_uri_handler(server, &file_upload);
 		httpd_register_uri_handler(server, &system_reboot);
@@ -2493,6 +2538,7 @@ void config_server_restart(void)
         httpd_register_uri_handler(server, &check_status_uri);
         httpd_register_uri_handler(server, &load_config_uri);
         httpd_register_uri_handler(server, &logo_uri);
+        httpd_register_uri_handler(server, &logs_uri);
         httpd_register_uri_handler(server, &ws);
         httpd_register_uri_handler(server, &file_upload);
 		httpd_register_uri_handler(server, &system_reboot);

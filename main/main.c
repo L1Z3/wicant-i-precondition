@@ -57,6 +57,7 @@
 #include "precondition.h"
 #include "debug_logs.h"
 #include "debug_logs_config.h"
+#include "file_logs.h"
 
 #define TAG 		__func__
 
@@ -660,6 +661,9 @@ static void can_rx_task(void *pvParameters)
 
 void app_main(void)
 {
+	// Hook esp_log before anything else logs; lines are buffered in RAM
+	// until file_logs_start() can write them out post filesystem mount
+	file_logs_early_init();
 	dev_status_init();
 	dev_status_set_bits(DEV_AWAKE_BIT);
     ESP_ERROR_CHECK(nvs_flash_init());
@@ -706,6 +710,8 @@ void app_main(void)
             derived_mac_addr[3], derived_mac_addr[4], derived_mac_addr[5]);
 	
 	config_server_start(&xmsg_ws_tx_queue, &xMsg_Rx_Queue, CONNECTED_LED_GPIO_NUM, (char*)&uid[0]);
+	// config_server_start mounted the filesystem, logs can go to flash now
+	file_logs_start();
 	slcan_init(&send_to_host);
 
 	int8_t can_datarate = config_server_get_can_rate();

@@ -72,6 +72,9 @@
 #define PWR_LED_ON                   0
 #define PWR_LED_OFF                  1
 
+// "storage" littlefs partition size, per wican_partitions_table_16mb.csv
+#define HW_STORAGE_PARTITION_SIZE    (2 * 1024 * 1024)
+
 // VBAT sense: R1=62K, R2=6.2K divider (x11) to ADC1 ch3
 #define VBAT_ADC_CHANNEL             ADC_CHANNEL_3
 #define VBAT_ADC_ATTEN               ADC_ATTEN_DB_6
@@ -102,6 +105,9 @@
 #define LED_OFF                     1
 #define PWR_LED_ON                  1
 #define PWR_LED_OFF                 0
+
+// "storage" littlefs partition size, per wican_partitions_table.csv
+#define HW_STORAGE_PARTITION_SIZE   (300 * 1024)
 
 // VBAT sense (mV*116)/(16*1000) plus +0.2V fudge */
 #define VBAT_ADC_CHANNEL            ADC_CHANNEL_4
