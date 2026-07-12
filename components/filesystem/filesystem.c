@@ -245,7 +245,9 @@ void filesystem_init(void)
     }
     else
     {
-            ESP_LOGI(TAG, "Partition size: total: %d, used: %d", total, used);
+            ESP_LOGI(TAG, "Partition: used %u/%u KB, free %u KB",
+                     (unsigned)(used / 1024), (unsigned)(total / 1024),
+                     (unsigned)((total - used) / 1024));
     }
     initialized = 1;
     #endif

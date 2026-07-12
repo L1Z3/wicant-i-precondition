@@ -50,7 +50,9 @@
 // Rotation limit for wican.log: past this size it is renamed to
 // wican.old.log, so logs occupy at most twice this on the storage partition.
 // Sized off the board's storage partition, which also holds the config
-// files: roomy on 1M+ partitions, conservative on small ones (V300: 300K).
+// files. Small-partition (V300, 300K) budget, from measured peak usage:
+// ~16K configs + ~24K for a big car_data.json profile + 2x96K logs leaves
+// ~68K free worst case.
 #ifndef FILE_LOGS_MAX_FILE_SIZE
 #ifndef HW_STORAGE_PARTITION_SIZE
 #error "HW_STORAGE_PARTITION_SIZE not defined; expected from hw_config.h"
@@ -58,6 +60,6 @@
 #if HW_STORAGE_PARTITION_SIZE >= (1024 * 1024)
 #define FILE_LOGS_MAX_FILE_SIZE (512 * 1024)
 #else
-#define FILE_LOGS_MAX_FILE_SIZE (32 * 1024)
+#define FILE_LOGS_MAX_FILE_SIZE (96 * 1024)
 #endif
 #endif
