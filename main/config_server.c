@@ -800,6 +800,34 @@ static esp_err_t logs_handler(httpd_req_t *req)
 	{
 		file_logs_read_end();
 	}
+
+	// With log to file disabled nothing drains the ring, so append its
+	// contents after any files left over from when logging was enabled
+	if (file_logs_is_ram_only())
+	{
+		static const char ram_header[] = "\n==== in-RAM log (log to file disabled) ====\n";
+		uint64_t pos = 0;
+		size_t n;
+		bool header_sent = false;
+		while ((n = file_logs_ram_read(&pos, chunk, sizeof(chunk))) > 0)
+		{
+			if (!header_sent)
+			{
+				header_sent = true;
+				if (httpd_resp_send_chunk(req, ram_header, sizeof(ram_header) - 1) != ESP_OK)
+				{
+					httpd_resp_send_chunk(req, NULL, 0);
+					return ESP_FAIL;
+				}
+			}
+			if (httpd_resp_send_chunk(req, chunk, n) != ESP_OK)
+			{
+				httpd_resp_send_chunk(req, NULL, 0);
+				return ESP_FAIL;
+			}
+		}
+	}
+
 	httpd_resp_send_chunk(req, NULL, 0);
 	return ESP_OK;
 }

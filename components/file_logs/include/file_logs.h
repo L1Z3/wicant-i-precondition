@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -10,9 +11,10 @@ extern "C" {
 // Captures the ESP_LOG stream to the filesystem. A vprintf hook copies every
 // formatted log line into a RAM ring buffer; a background task later drains
 // the ring to FILE_LOGS_CUR_PATH, rotating to FILE_LOGS_OLD_PATH. UART log
-// output is unaffected. Lines that arrive while the ring is full are dropped
-// (drop-newest, so early-boot logs survive) and accounted for with a marker
-// line in the file.
+// output is unaffected. In file mode, lines that arrive while the ring is
+// full are dropped (drop-newest, so early-boot logs survive) and accounted
+// for with a marker line in the file; in RAM-only mode the ring wraps,
+// evicting the oldest bytes instead.
 
 // Call as early as possible (first thing in app_main): allocates the ring
 // and hooks esp_log so everything from that point on is captured.
@@ -27,10 +29,22 @@ void file_logs_start(void);
 // before file_logs_start(); defaults to FILE_LOGS_MAX_FILE_SIZE * 2.
 void file_logs_set_max_total(uint32_t total_bytes);
 
-// Uninstalls the log hook and frees the ring buffer. Meant for the
-// logging-disabled config, called instead of file_logs_start(); everything
-// captured since early init is discarded, existing log files are untouched.
-void file_logs_disable(void);
+// Switches to RAM-only logging. Meant for the log-to-file-disabled config,
+// called instead of file_logs_start(): the hook and ring stay active but no
+// flush task runs, and the ring becomes a circular in-RAM log (oldest bytes
+// evicted once full) readable via file_logs_ram_read. Existing log files are
+// untouched.
+void file_logs_ram_only(void);
+
+// True after file_logs_ram_only() put the component in RAM-only mode.
+bool file_logs_is_ram_only(void);
+
+// Copies up to dst_size bytes of the in-RAM log into dst, returning the
+// number of bytes copied (0 when caught up). *pos is an absolute stream
+// offset maintained by this function: start at 0 and pass the same variable
+// on every call; positions already evicted from the ring snap forward to the
+// oldest data still available.
+size_t file_logs_ram_read(uint64_t *pos, char *dst, size_t dst_size);
 
 // Synchronous best-effort flush of whatever is buffered; call right before
 // esp_restart() so the tail of the log survives the reboot.

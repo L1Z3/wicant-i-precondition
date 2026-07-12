@@ -719,7 +719,9 @@ void app_main(void)
 	}
 	else
 	{
-		file_logs_disable();
+		// No flash writes, but keep capturing to the RAM ring so /logs
+		// still shows the recent log
+		file_logs_ram_only();
 	}
 	slcan_init(&send_to_host);
 

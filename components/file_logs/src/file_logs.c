@@ -30,6 +30,12 @@ static size_t s_head = 0;
 static size_t s_tail = 0;
 static size_t s_used = 0;
 static uint32_t s_dropped = 0;
+// Total bytes ever accepted into the ring; with s_used it gives readers an
+// absolute stream position that survives eviction (see file_logs_ram_read)
+static uint64_t s_total_in = 0;
+// RAM-only mode (log to file disabled): no flush task ever drains the ring,
+// so ring_write evicts oldest bytes instead of dropping the new line
+static bool s_ram_only = false;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static TaskHandle_t s_flush_task = NULL;
@@ -52,11 +58,23 @@ static int s_readers = 0;
 static void ring_write(const char *data, size_t len)
 {
     portENTER_CRITICAL(&s_lock);
-    if (!s_buf || len > s_buf_size - s_used)
+    if (!s_buf || len > s_buf_size)
     {
         s_dropped += len;
         portEXIT_CRITICAL(&s_lock);
         return;
+    }
+    if (len > s_buf_size - s_used)
+    {
+        if (!s_ram_only)
+        {
+            s_dropped += len;
+            portEXIT_CRITICAL(&s_lock);
+            return;
+        }
+        size_t evict = len - (s_buf_size - s_used);
+        s_tail = (s_tail + evict) % s_buf_size;
+        s_used -= evict;
     }
     size_t first = s_buf_size - s_head;
     if (first > len)
@@ -67,6 +85,7 @@ static void ring_write(const char *data, size_t len)
     memcpy(s_buf, data + first, len - first);
     s_head = (s_head + len) % s_buf_size;
     s_used += len;
+    s_total_in += len;
     size_t used = s_used;
     portEXIT_CRITICAL(&s_lock);
 
@@ -163,24 +182,44 @@ void file_logs_set_max_total(uint32_t total_bytes)
     }
 }
 
-void file_logs_disable(void)
+void file_logs_ram_only(void)
 {
-    if (s_orig_vprintf)
-    {
-        esp_log_set_vprintf(s_orig_vprintf);
-        s_orig_vprintf = NULL;
-    }
-    // Take the ring away under the lock so a logger racing in ring_write
-    // can't touch freed memory; it will see s_buf == NULL and drop the line
     portENTER_CRITICAL(&s_lock);
-    char *buf = s_buf;
-    s_buf = NULL;
-    s_buf_size = 0;
-    s_head = 0;
-    s_tail = 0;
-    s_used = 0;
+    s_ram_only = true;
     portEXIT_CRITICAL(&s_lock);
-    free(buf);
+}
+
+bool file_logs_is_ram_only(void)
+{
+    return s_ram_only;
+}
+
+size_t file_logs_ram_read(uint64_t *pos, char *dst, size_t dst_size)
+{
+    portENTER_CRITICAL(&s_lock);
+    if (!s_buf)
+    {
+        portEXIT_CRITICAL(&s_lock);
+        return 0;
+    }
+    uint64_t earliest = s_total_in - s_used;
+    if (*pos < earliest)
+    {
+        *pos = earliest;
+    }
+    size_t avail = (size_t)(s_total_in - *pos);
+    size_t len = avail < dst_size ? avail : dst_size;
+    size_t start = (s_tail + (size_t)(*pos - earliest)) % s_buf_size;
+    size_t first = s_buf_size - start;
+    if (first > len)
+    {
+        first = len;
+    }
+    memcpy(dst, s_buf + start, first);
+    memcpy(dst + first, s_buf, len - first);
+    portEXIT_CRITICAL(&s_lock);
+    *pos += len;
+    return len;
 }
 
 static const char *reset_reason_str(esp_reset_reason_t r)
@@ -489,7 +528,15 @@ void file_logs_get_stats(uint32_t *buffered, uint32_t *dropped, uint32_t *writte
 void file_logs_early_init(void) {}
 void file_logs_start(void) {}
 void file_logs_set_max_total(uint32_t total_bytes) { (void)total_bytes; }
-void file_logs_disable(void) {}
+void file_logs_ram_only(void) {}
+bool file_logs_is_ram_only(void) { return false; }
+size_t file_logs_ram_read(uint64_t *pos, char *dst, size_t dst_size)
+{
+    (void)pos;
+    (void)dst;
+    (void)dst_size;
+    return 0;
+}
 bool file_logs_delete(void) { return true; }
 void file_logs_flush(void) {}
 bool file_logs_read_begin(void) { return true; }
