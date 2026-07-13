@@ -796,7 +796,12 @@ static esp_err_t logs_handler(httpd_req_t *req)
 	// Defers rotation while we hold the files open: littlefs cannot
 	// rename/unlink a file with an open FD. Also pins the generation and
 	// makes the files append-only for the duration of this response.
-	bool read_guarded = file_logs_read_begin();
+	if (!file_logs_read_begin())
+	{
+		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+		                    "Log files busy, try again");
+		return ESP_FAIL;
+	}
 
 	// Snapshot the stream bounds up front and never send past them, so the
 	// X-Log-Cursor header (sent before the body) stays accurate even if more
@@ -866,10 +871,7 @@ static esp_err_t logs_handler(httpd_req_t *req)
 		}
 	}
 
-	if (read_guarded)
-	{
-		file_logs_read_end();
-	}
+	file_logs_read_end();
 
 	// With log to file disabled nothing drains the ring, so append its
 	// contents after any files left over from when logging was enabled

@@ -8,6 +8,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -46,6 +47,7 @@ static long s_file_size = 0;
 static uint32_t s_written = 0;
 static uint32_t s_dropped_reported = 0;
 static uint32_t s_open_fails = 0;
+static uint32_t s_write_fails = 0;
 // Per-file rotation cap; configurable at runtime via file_logs_set_max_total
 static long s_max_file_size = FILE_LOGS_MAX_FILE_SIZE;
 // Bumped after every completed drain (data on flash, fsync done) so
@@ -286,7 +288,21 @@ static bool log_file_open(void)
 // Must be called with s_file_mutex held
 static void log_file_rotate_if_needed(void)
 {
-    if (!s_file || s_file_size < s_max_file_size)
+    long size = s_file_size;
+    if (!s_file)
+    {
+        // A failed drain closes the stream and zeroes s_file_size, but the
+        // file on flash may still be over the cap. Rotation is what frees
+        // space when the filesystem is full, so size it via stat instead of
+        // skipping the check.
+        struct stat st;
+        if (stat(FILE_LOGS_CUR_PATH, &st) != 0)
+        {
+            return;
+        }
+        size = (long)st.st_size;
+    }
+    if (size < s_max_file_size)
     {
         return;
     }
@@ -295,9 +311,12 @@ static void log_file_rotate_if_needed(void)
         // A reader is streaming the files; retry on a later drain cycle
         return;
     }
-    fclose(s_file);
-    s_file = NULL;
-    s_file_size = 0;
+    if (s_file)
+    {
+        fclose(s_file);
+        s_file = NULL;
+        s_file_size = 0;
+    }
     unlink(FILE_LOGS_OLD_PATH);
     if (rename(FILE_LOGS_CUR_PATH, FILE_LOGS_OLD_PATH) != 0)
     {
@@ -318,6 +337,7 @@ static void drain_to_file(void)
 
     char chunk[512];
     size_t total_written = 0;
+    bool write_failed = false;
     for (;;)
     {
         portENTER_CRITICAL(&s_lock);
@@ -341,33 +361,65 @@ static void drain_to_file(void)
         {
             break;
         }
-        if (fwrite(chunk, 1, len, s_file) != len)
+        size_t written = fwrite(chunk, 1, len, s_file);
+        total_written += written;
+        if (written != len)
         {
-            // Filesystem full or write error: drop this chunk and back off
-            // until the next cycle
+            // The chunk has already left the ring, so its unwritten tail is
+            // lost. Close the stream below so a transient error does not
+            // poison every subsequent flush.
+            portENTER_CRITICAL(&s_lock);
+            s_dropped += len - written;
+            portEXIT_CRITICAL(&s_lock);
+            write_failed = true;
             break;
         }
-        total_written += len;
     }
 
     uint32_t dropped = s_dropped;
-    if (dropped != s_dropped_reported)
+    bool report_pending = false;
+    if (!write_failed && dropped != s_dropped_reported)
     {
-        int n = fprintf(s_file, "[file_logs] dropped %lu bytes (ring full)\n",
+        int n = fprintf(s_file, "[file_logs] dropped %lu bytes (ring full or write error)\n",
                         (unsigned long)(dropped - s_dropped_reported));
-        s_dropped_reported = dropped;
         if (n > 0)
         {
+            report_pending = true;
             total_written += (size_t)n;
         }
     }
 
     if (total_written > 0)
     {
-        fflush(s_file);
-        fsync(fileno(s_file));
-        s_file_size += total_written;
-        s_written += total_written;
+        if (fflush(s_file) != 0 || fsync(fileno(s_file)) != 0)
+        {
+            write_failed = true;
+        }
+        if (!write_failed)
+        {
+            s_file_size += total_written;
+            s_written += total_written;
+            // Only mark the drops reported once the report line is on flash;
+            // a failed flush retries it (possibly duplicated) next cycle
+            if (report_pending)
+            {
+                s_dropped_reported = dropped;
+            }
+        }
+    }
+    if (write_failed)
+    {
+        // Reopening on the next cycle clears the stdio error state and also
+        // recalculates the actual file size after a partial write.
+        fclose(s_file);
+        s_file = NULL;
+        s_file_size = 0;
+        s_write_fails++;
+        if (s_write_fails < 4 || (s_write_fails & 0x3F) == 0)
+        {
+            printf("[file_logs] write failed (attempt %lu); will reopen on next flush\n",
+                   (unsigned long)s_write_fails);
+        }
     }
     log_file_rotate_if_needed();
     s_flush_cycles++;
