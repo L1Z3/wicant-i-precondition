@@ -884,6 +884,26 @@ int64_t can_up_time_us(can_bus_t bus)
 	return esp_timer_get_time() - since;
 }
 
+// Whether the currently stored legacy acceptance filter admits a standard
+// identifier. The node filter uses a bare 11-bit ID and a 1 = "must match"
+// mask, while the legacy SJA1000 representation stores those fields in bits
+// [31:21] and uses 1 = "don't care" in its mask.
+bool can_accepts_std_id(can_bus_t bus, uint32_t identifier)
+{
+	if (bus >= CAN_BUS_COUNT || identifier > 0x7FFU)
+	{
+		return false;
+	}
+	if (can_cfg[bus].mask == 0xFFFFFFFF)
+	{
+		return true;
+	}
+
+	uint32_t filter_id = (can_cfg[bus].filter >> 21) & 0x7FFU;
+	uint32_t match_mask = ((~can_cfg[bus].mask) >> 21) & 0x7FFU;
+	return ((identifier ^ filter_id) & match_mask) == 0;
+}
+
 // True if any bus is up--one atomic read instead of a per-bus loop
 bool can_any_enabled(void)
 {

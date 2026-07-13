@@ -69,6 +69,7 @@ esp_err_t can_receive(twai_message_t *message, can_bus_t *bus, TickType_t ticks_
 uint8_t can_is_silent(can_bus_t bus);
 bool can_is_enabled(can_bus_t bus);
 int64_t can_up_time_us(can_bus_t bus);
+bool can_accepts_std_id(can_bus_t bus, uint32_t identifier);
 bool can_any_enabled(void);
 uint8_t can_get_bitrate(can_bus_t bus);
 void can_flush_rx(void);

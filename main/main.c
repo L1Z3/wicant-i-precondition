@@ -243,6 +243,7 @@ static void can_tx_task(void *pvParameters)
 #define FWD_PROBE_BURST_LEN		3
 #define FWD_PROBE_GAP_US		20000		// between frames within a burst
 #define FWD_PROBE_PERIOD_US		500000		// between burst starts
+#define FWD_PROBE_TX_STALE_US	1000000		// max gap in successful probe sends
 #define FWD_PROBE_TIMEOUT_US	10000000		// no echo for this long -> MITM
 // The very first decision after boot uses this much shorter window, so MITM
 // wiring isn't left unbridged for the full timeout at every boot
@@ -250,9 +251,11 @@ static void can_tx_task(void *pvParameters)
 static const uint8_t fwd_probe_data[8] = { 'W', 'i', 'C', 'P', 'R', 'O', 'B', 'E' };
 // When our probe last arrived on bus 0 (esp_timer time)
 static int64_t fwd_probe_last_rx_us;
-// When the first probe went out on bus 1 (0 = none yet); the eval must never
-// declare "no echo" before probes have had a full window to come back
-static int64_t fwd_probe_first_tx_us;
+// Bounds of the current continuous period in which probes have successfully
+// been queued. A long gap resets the start, so old TX success can never make a
+// later interval of TX starvation look like meaningful "no echo" evidence.
+static int64_t fwd_probe_tx_window_start_us;
+static int64_t fwd_probe_last_tx_us;
 // When ANY frame first arrived on bus 0 this boot (0 = never). Proof that
 // bus 0 RX works at all: without it, "no echo" can't distinguish separate
 // buses from a broken bus 0, and flipping to MITM on a broken bus 0 would
@@ -304,10 +307,13 @@ static void fwd_probe_tx_tick(void)
 	// once-a-second log; they get their own sparse counter here instead.
 	if (can_send_quiet(CAN_BUS_1, &probe, 0) == ESP_OK)
 	{
-		if (fwd_probe_first_tx_us == 0)
+		int64_t now = esp_timer_get_time();
+		if (fwd_probe_last_tx_us == 0 ||
+		    now - fwd_probe_last_tx_us > FWD_PROBE_TX_STALE_US)
 		{
-			fwd_probe_first_tx_us = esp_timer_get_time();
+			fwd_probe_tx_window_start_us = now;
 		}
+		fwd_probe_last_tx_us = now;
 	}
 	else
 	{
@@ -361,14 +367,32 @@ static bool fwd_probe_eval(bool bridge_en)
 	}
 
 	// No echo: hold the current state unless the silence is meaningful
+	// A bus-0 hardware filter that rejects the probe makes silence ambiguous.
+	// Force the safe parallel state rather than risk bridging a shared wire.
+	static bool filter_warning_logged;
+	if (!can_accepts_std_id(CAN_BUS_0, FWD_PROBE_ID))
+	{
+		if (!filter_warning_logged || bridge_en)
+		{
+			ESP_LOGW(TAG, "auto fwd: bus 0 filter rejects probe id 0x%03X -> parallel (bridge off)",
+			         FWD_PROBE_ID);
+			filter_warning_logged = true;
+		}
+		return false;
+	}
+	filter_warning_logged = false;
+
 	if (can_up_time_us(CAN_BUS_0) < window_us ||
 	    can_up_time_us(CAN_BUS_1) < window_us)
 	{
 		return bridge_en;
 	}
-	if (fwd_probe_first_tx_us == 0 || now - fwd_probe_first_tx_us < window_us)
+	if (fwd_probe_tx_window_start_us == 0 ||
+	    now - fwd_probe_tx_window_start_us < window_us ||
+	    fwd_probe_last_tx_us == 0 ||
+	    now - fwd_probe_last_tx_us > FWD_PROBE_TX_STALE_US)
 	{
-		return bridge_en;	// probes haven't had a full window to echo yet
+		return bridge_en;	// probes haven't flowed continuously for a full window
 	}
 	// Bus 0 must have received something this boot, and probing must have
 	// run a full window since then -- a bus 0 that only just woke up hasn't
@@ -904,4 +928,3 @@ void app_main(void)
 	// debug_logs_init(dbg_net_ready);
 	// DEBUG_LOGI("INIT", "debug_logs initialized (UDP %s:%d) waiting for WiFi", DEBUG_LOGS_UDP_DEST_IP, DEBUG_LOGS_UDP_PORT);`
 }
-
