@@ -38,4 +38,9 @@ typedef struct {
 
 bool precondition_get_battery_soc(precondition_soc_t *out);
 
+// Is the car currently in READY? Tracks the 0x038 power-status edge the same
+// way the state machine does; false until a 0x038 frame is seen. The negation
+// is the persistent state behind the EV_CAR_NOT_READY event.
+bool car_in_ready(void);
+
 #endif

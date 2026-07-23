@@ -47,6 +47,25 @@
 // is not working on the custom WiCAN rev 1.
 // As such, CAN_STDBY_GPIO_NUM is not defined here. 
 
+// Indicates whether the hardware has a second voltage divider
+// to read a second power pin.
+#define HW_HAS_PWR2                 1
+// GPIO5 (ADC1 ch4) reads the voltage on harness "PWR_12V_7"
+// which is MODULE5 power, i.e. hot in on or start
+// V_CAR_ON sense: R1=62K, R2=6.2K divider (x11) to ADC1 ch4
+// V_CAR_ON = VBAT or 0 in steady state
+#define V_CAR_ON_ADC_CHANNEL        ADC_CHANNEL_4
+// These are not used as they're identical to VBAT_* from here
+// #define V_CAR_ON_ADC_ATTEN               ADC_ATTEN_DB_6
+// #define V_CAR_ON_DIVIDER_R1_OHM          62000
+// #define V_CAR_ON_DIVIDER_R2_OHM          6200
+// // volts = pin_mV * NUM / (DEN * 1000)
+// #define V_CAR_ON_SCALE_NUM               (V_CAR_ON_DIVIDER_R1_OHM + V_CAR_ON_DIVIDER_R2_OHM)
+// #define V_CAR_ON_SCALE_DEN               V_CAR_ON_DIVIDER_R2_OHM
+// // TODO(ejones): 0.0 is a guess. V300 uses an empirical +0.2V fudge; we should
+// // calibrate this based on ground truth measurements from another device
+// #define V_CAR_ON_READ_OFFSET_V           0.0f
+
 // -- Bus 1: MCP2515 (SPI2) -> SN65HVD233 #2 -- //
 
 #define HW_HAS_MCP2515               1
@@ -89,6 +108,8 @@
 #define TX_GPIO_NUM             	0
 #define RX_GPIO_NUM             	3
 #define CAN_STDBY_GPIO_NUM			6
+
+#define HW_HAS_PWR2                  0
 
 #define HW_HAS_MCP2515              0
 #define CAN_BUS_COUNT               1

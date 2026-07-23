@@ -58,6 +58,7 @@
 #include "hw_config.h"
 #include "math.h"
 #include "dev_status.h"
+#include "precondition.h"
 
 #define TAG 			  __func__
 
@@ -73,13 +74,41 @@
 #define PUB_SUCCESS_BIT     		BIT1
 
 static adc_channel_t voltage_adc_ch = VBAT_ADC_CHANNEL;
-static bool calibrated = false;
+#if HW_HAS_PWR2
+static adc_channel_t v_car_on_adc_ch = V_CAR_ON_ADC_CHANNEL;
+#endif
 static EventGroupHandle_t s_mqtt_event_group = NULL;
 static float sleep_voltage = 13.1f;
 static uint8_t enable_sleep = 0;
 static QueueHandle_t voltage_queue = NULL;
+static QueueHandle_t on_voltage_queue = NULL;
 adc_oneshot_unit_handle_t adc_handle;
 static adc_cali_handle_t adc1_cali_chan0_handle = NULL;
+#if HW_HAS_PWR2
+static adc_cali_handle_t adc1_cali_chan1_handle = NULL;
+#endif
+
+// Car-off sleep reads the car-on sense pin (V_CAR_ON) when the hardware has
+// it. Without that pin there's no electrical way to tell "car off" from "flat
+// battery", so the fallback gates sleep on the CAN-derived car-not-ready state
+// (0x038 power status) instead: only sleep once the car is confirmed off. The
+// gate only applies in car-off sleep mode; low-voltage sleep keeps its
+// original voltage-only behavior.
+static bool car_off_gate_ok(void) {
+#if HW_HAS_PWR2
+    // The car-on pin already distinguishes car-on from car-off (12V vs 0V),
+    // so there is nothing extra to gate on: the voltage comparison alone
+    // decides. This is why CAR_ON_VOLTAGE is a fixed 5V threshold.
+    return true;
+#else
+    // No car-on pin: require the car to be confirmed not-ready (the negation
+    // of EV_CAR_NOT_READY) before sleeping. car_in_ready() is tracked in
+    // precondition.c from 0x038 power-status edges and stays false until a
+    // 0x038 frame has been seen. Once asleep the CAN buses are disabled, so
+    // this value can no longer change; see sleep_mode_init for the wake path.
+    return (enable_sleep != 2) || !car_in_ready();  // EV_CAR_NOT_READY
+#endif
+}
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
@@ -179,7 +208,7 @@ static void mqtt_init(void)
     }
 }
 
-static void calibration_init(void)
+static void calibration_init(adc_cali_handle_t *cali_handle, adc_channel_t adc_ch)
 {
     esp_err_t ret = ESP_FAIL;
 
@@ -187,18 +216,20 @@ static void calibration_init(void)
     ESP_LOGI(TAG, "calibration scheme version is %s", "Curve Fitting");
     adc_cali_curve_fitting_config_t cali_config = {
         .unit_id = ADC_UNIT,
-		.chan = voltage_adc_ch,
+		.chan = adc_ch,
         .atten = ADC_ATTEN,
         .bitwidth = ADC_BIT_WIDTH,
     };
-    ret = adc_cali_create_scheme_curve_fitting(&cali_config, &adc1_cali_chan0_handle);
+    ret = adc_cali_create_scheme_curve_fitting(&cali_config, cali_handle);
     if (ret == ESP_OK) {
-        calibrated = true;
+        ESP_LOGI(TAG, "Calibration Success");
+    } else {
+        ESP_LOGW(TAG, "Calibration Failed");
     }
 #endif
 
 #if ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
-    if (!calibrated) 
+    if (ret != ESP_OK) 
 	{
         ESP_LOGI(TAG, "calibration scheme version is %s", "Line Fitting");
         adc_cali_line_fitting_config_t cali_config = 
@@ -207,20 +238,15 @@ static void calibration_init(void)
             .atten = ADC_ATTEN,
             .bitwidth = ADC_BIT_WIDTH,
         };
-        ret = adc_cali_create_scheme_line_fitting(&cali_config, &cali_handle);
+        ret = adc_cali_create_scheme_line_fitting(&cali_config, cali_handle);
         if (ret == ESP_OK) 
 		{
-            calibrated = true;
+            ESP_LOGI(TAG, "Calibration Success");
+        } else {
+            ESP_LOGW(TAG, "Calibration Failed");
         }
     }
 #endif
-
-    if (calibrated) 
-	{
-        ESP_LOGI(TAG, "Calibration Success");
-    } else {
-        ESP_LOGW(TAG, "Calibration Failed");
-    }
 }
 
 void oneshot_adc_init(void)
@@ -232,7 +258,7 @@ void oneshot_adc_init(void)
     };
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &adc_handle));
 
-    // Configure ADC channel
+    // Configure ADC channels
     adc_oneshot_chan_cfg_t config = {
         .atten = ADC_ATTEN,
         .bitwidth = ADC_BIT_WIDTH,
@@ -241,10 +267,18 @@ void oneshot_adc_init(void)
 
     ESP_LOGI(TAG, "ADC channel: %d, Attenuation: %d", voltage_adc_ch, ADC_ATTEN);
 
-    calibration_init();
+    calibration_init(&adc1_cali_chan0_handle, voltage_adc_ch);
+
+#if HW_HAS_PWR2
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, v_car_on_adc_ch, &config));
+
+    ESP_LOGI(TAG, "ADC channel: %d, Attenuation: %d", v_car_on_adc_ch, ADC_ATTEN);
+
+    calibration_init(&adc1_cali_chan1_handle, v_car_on_adc_ch);
+#endif
 }
 
-esp_err_t read_ss_adc_voltage(float *voltage_out)
+esp_err_t read_ss_adc_voltage(float *voltage_out, adc_channel_t adc_ch)
 {
     if (voltage_out == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -257,19 +291,27 @@ esp_err_t read_ss_adc_voltage(float *voltage_out)
     uint32_t max_raw = 0;
     int sum_voltage = 0;
 
+    adc_cali_handle_t cali_handle = adc1_cali_chan0_handle;
+#if HW_HAS_PWR2
+    if (adc_ch == v_car_on_adc_ch)
+    {
+        cali_handle = adc1_cali_chan1_handle;
+    }
+#endif
+
     // Take multiple readings
     for (int i = 0; i < NUM_SAMPLES; i++)
 	{
         int raw_value;
-        esp_err_t ret = adc_oneshot_read(adc_handle, voltage_adc_ch, &raw_value);
+        esp_err_t ret = adc_oneshot_read(adc_handle, adc_ch, &raw_value);
         
         if (ret == ESP_OK && raw_value < 4096) {
             int voltage = 0;
             
             // Convert raw to voltage using calibration
-            if (calibrated)
+            if (cali_handle != NULL)
 			{
-                ESP_ERROR_CHECK(adc_cali_raw_to_voltage(adc1_cali_chan0_handle, raw_value, &voltage));
+                ESP_ERROR_CHECK(adc_cali_raw_to_voltage(cali_handle, raw_value, &voltage));
             }
 			else
 			{
@@ -287,7 +329,7 @@ esp_err_t read_ss_adc_voltage(float *voltage_out)
             if (valid_samples <= 5)
 			{
                 ESP_LOGI(TAG, "Sample[%d]: Chan=%d, Raw=%d, Voltage=%dmV", 
-                        (int)valid_samples, voltage_adc_ch, raw_value, voltage);
+                        (int)valid_samples, adc_ch, raw_value, voltage);
             }
             
             // Small delay between readings
@@ -307,7 +349,7 @@ esp_err_t read_ss_adc_voltage(float *voltage_out)
         
         ESP_LOGI(TAG, "Summary: Raw=%d (min=%lu, max=%lu, avg of %lu), Voltage=%.2f V [%s]", 
                  avg_raw, min_raw, max_raw, valid_samples, *voltage_out,
-                 calibrated ? "CALIBRATED" : "UNCALIBRATED");
+                 cali_handle != NULL ? "CALIBRATED" : "UNCALIBRATED");
                  
         return ESP_OK;
     }
@@ -350,8 +392,12 @@ static void adc_task(void *pvParameters)
     while(1)
     {
 		float battery_voltage;
+#if HW_HAS_PWR2
+        float on_voltage;
+#endif
+        float sleep_test_voltage;
 
-    	ret = read_ss_adc_voltage(&battery_voltage);
+    	ret = read_ss_adc_voltage(&battery_voltage, voltage_adc_ch);
 		if(ret != ESP_OK)
 		{
 			ESP_LOGE(TAG, "read_ss_adc_voltage error");
@@ -359,18 +405,43 @@ static void adc_task(void *pvParameters)
 			continue;
 		}
     	
+#if HW_HAS_PWR2
+    	ret = read_ss_adc_voltage(&on_voltage, v_car_on_adc_ch);
+		if(ret != ESP_OK)
+		{
+			ESP_LOGE(TAG, "read_ss_adc_voltage error");
+			vTaskDelay(pdMS_TO_TICKS(1000));
+			continue;
+		}
+    	xQueueOverwrite( on_voltage_queue, &on_voltage );
+#endif
+    	
     	battery_voltage += VBAT_READ_OFFSET_V;
 
     	xQueueOverwrite( voltage_queue, &battery_voltage );
-    	if(enable_sleep == 1)
+        if(enable_sleep == 1) {
+            // in this case, use the actual battery voltage
+            sleep_test_voltage = battery_voltage;
+        } else if(enable_sleep == 2) {
+            // in this case, use the hot-when-on voltage
+            // it will be compared against CAR_ON_VOLTAGE
+#if HW_HAS_PWR2
+            sleep_test_voltage = on_voltage;
+#else
+            // fallback: no car-on sense pin, so compare the battery voltage
+            // against the setpoint, gated by the car-not-ready signal below
+            sleep_test_voltage = battery_voltage;
+#endif
+        }
+    	if(enable_sleep == 1 || enable_sleep == 2)
     	{
 			switch(sleep_state)
 			{
 				case RUN_STATE:
 				{
-					if(battery_voltage < sleep_voltage)
+					if(sleep_test_voltage < sleep_voltage && car_off_gate_ok())
 					{
-						ESP_LOGI(TAG, "low voltage: %f", battery_voltage);
+						ESP_LOGI(TAG, "low voltage: %f", sleep_test_voltage);
 						sleep_detect_time = esp_timer_get_time();
 						sleep_state++;
 					}
@@ -378,17 +449,14 @@ static void adc_task(void *pvParameters)
 				}
 				case SLEEP_DETECTED:
 				{
-					if(battery_voltage > sleep_voltage)
+					if(sleep_test_voltage > sleep_voltage || !car_off_gate_ok())
 					{
-						ESP_LOGI(TAG, "high voltage: %f", battery_voltage);
+						ESP_LOGI(TAG, "high voltage: %f", sleep_test_voltage);
 						sleep_state = RUN_STATE;
 					}
-
-					if((esp_timer_get_time() - sleep_detect_time) > sleep_time)
+					else if((esp_timer_get_time() - sleep_detect_time) > sleep_time)
 					{
 						sleep_state = SLEEP_STATE;
-	//    	    		wifi_network_deinit();
-	//    	    		ble_disable();
 					}
 
 					break;
@@ -396,15 +464,18 @@ static void adc_task(void *pvParameters)
 				case SLEEP_STATE:
 				{
 					ESP_LOGI(TAG, "Go to sleep");
-					if(battery_voltage > sleep_voltage)
+					if(sleep_test_voltage > sleep_voltage || !car_off_gate_ok())
 					{
 						wakeup_detect_time = esp_timer_get_time();
-						ESP_LOGI(TAG, "wake up, voltage: %f", battery_voltage);
+						ESP_LOGI(TAG, "wake up, voltage: %f", sleep_test_voltage);
 						sleep_state = WAKEUP_STATE;
 					}
 
 					if(config_server_get_battery_alert_config())
 					{
+						// Always alert on the actual battery voltage; in car-off
+						// mode sleep_test_voltage is the hot-when-on pin, which is
+						// 0V whenever the car is off and would false-alert.
 						if(battery_voltage < alert_voltage)
 						{
 							ESP_LOGW(TAG, "battery alert!");
@@ -451,7 +522,7 @@ static void adc_task(void *pvParameters)
 				}
 				case WAKEUP_STATE:
 				{
-					if(battery_voltage > sleep_voltage)
+					if(sleep_test_voltage > sleep_voltage || !car_off_gate_ok())
 					{
 						if((esp_timer_get_time() - wakeup_detect_time) > WAKEUP_TIME_DELAY)
 						{
@@ -460,10 +531,12 @@ static void adc_task(void *pvParameters)
 
 						}
 					}
-					else if(battery_voltage < sleep_voltage)
+					else
 					{
-                        dev_status_clear_bits(DEV_AWAKE_BIT);
-                        dev_status_set_bits(DEV_SLEEP_BIT);
+						// gate is ok here (failure is handled above); at or
+						// below the setpoint again, so go back to sleep
+						dev_status_clear_bits(DEV_AWAKE_BIT);
+						dev_status_set_bits(DEV_SLEEP_BIT);
 						sleep_state = SLEEP_STATE;
 					}
 					break;
@@ -474,6 +547,8 @@ static void adc_task(void *pvParameters)
 			if(sleep_state == SLEEP_STATE)
 			{
 				ESP_LOGW(TAG, "sleeping");
+                                // todo (trh): add config option to leave
+                                // can busses up in sleep.
 				for(int bus = 0; bus < CAN_BUS_COUNT; bus++)
 				{
 					can_disable(bus);
@@ -505,13 +580,41 @@ int8_t sleep_mode_get_voltage(float *val)
 	return -1;
 }
 
+int8_t sleep_mode_get_on_voltage(float *val)
+{
+	if(on_voltage_queue != NULL)
+	{
+		if(xQueuePeek( on_voltage_queue, val, 0 ))
+		{
+			return 1;
+		}
+		else return -1;
+	}
+	return -1;
+}
+
 int8_t sleep_mode_init(uint8_t enable, float sleep_volt)
 {
 	enable_sleep = enable;
+#if HW_HAS_PWR2
+	// Car-off sleep reads the hot-when-on pin (VBAT when on, 0 when off),
+	// so it must use the fixed CAR_ON_VOLTAGE threshold, not the
+	// configurable battery low-voltage cutoff.
+	sleep_voltage = (enable == 2) ? CAR_ON_VOLTAGE : sleep_volt;
+#else
+	// No car-on pin: car-off sleep compares the 12V battery against this same
+	// setpoint (CAR_ON_VOLTAGE is meant for the 0V/12V sense pin and would
+	// never trip on battery voltage), gated by car_off_gate_ok. The setpoint
+	// also becomes the wake threshold: while asleep the CAN buses are disabled
+	// so car_in_ready() can't update, leaving battery voltage as the only wake
+	// signal. A setpoint above the running-car charging voltage (~14V) would
+	// therefore keep the device asleep indefinitely.
 	sleep_voltage = sleep_volt;
-	ESP_LOGW(TAG, "sleep_volt: %2.2f", sleep_volt);
+#endif
+	ESP_LOGW(TAG, "sleep_volt: %2.2f", sleep_voltage);
 	s_mqtt_event_group = xEventGroupCreate();
 	voltage_queue = xQueueCreate(1, sizeof( float) );
+	on_voltage_queue = xQueueCreate(1, sizeof( float) );
 	xTaskCreate(adc_task, "adc_task", 4096, (void*)AF_INET, 5, NULL);
 
 	return 1;
