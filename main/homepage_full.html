@@ -1133,8 +1133,9 @@
                 <tr>
                     <td>Sleep Mode:</td>
                     <td>
-                        <select name="sleep_status" id="sleep_status" onChange="submit_enable();">
-                            <option value="enable">Enable</option>
+                        <select name="sleep_status" id="sleep_status" onChange="submit_enable();toggleSleepVoltageEnabled();">
+                            <option value="enable">Low-Voltage Sleep</option>
+                            <option value="car_off" disabled>Car-Off Sleep</option>
                             <option value="disable">Disable</option>
                         </select>
                     </td>
@@ -1148,6 +1149,7 @@
                                value="13.2" 
                                min="12.0" 
                                max="15.0" 
+                               data-car-on-voltage="5.0"
                                step="0.1"
                                oninput="document.getElementById('sleep_volt_value').textContent = this.value;submit_enable();">
                         <span id="sleep_volt_value">13.2</span>V
@@ -1384,7 +1386,32 @@
             document.getElementById("submit_button").disabled = true;
 
             syncPreconButtonToggle();
+            toggleSleepVoltageEnabled();
         });
+
+        // Client-side only: disable sleep voltage
+        function toggleSleepVoltageEnabled() {
+            const sleepStatus = document.getElementById("sleep_status").value;
+            if (sleepStatus == 'enable') {
+                document.getElementById("sleep_volt").disabled = false;
+            } else {
+                document.getElementById("sleep_volt").disabled = true;
+            }
+
+            if (sleepStatus == 'car_off') {
+                document.getElementById("sleep_volt").value = document.getElementById("sleep_volt").database.carOnVoltage;
+                document.getElementById("sleep_volt_value").value = document.getElementById("sleep_volt").database.carOnVoltage;
+                document.getElementById("sleep_volt").disabled = true;
+            }
+
+            if (sleepStatus == 'disable') {
+                document.getElementById("sleep_time").disabled = true;
+                document.getElementById("sleep_volt").disabled = true;
+            } else {
+                document.getElementById("sleep_time").disabled = false;
+                document.getElementById("sleep_volt").disabled = false;
+            }
+        }
 
         // If the currently selected button is one of the extra options, show
         // the full list so the selection stays visible. Called on load and
@@ -2558,6 +2585,11 @@ function loadAutoTable(jsonData) {
 					document.getElementById("can_fwd_mode").value = obj.can_fwd_mode;
 				}
 			}
+            // enable car-off sleep if hw has pwr2 pin
+            if(obj.hw_has_pwr2) {
+            	document.querySelector('#sleep_status option[value="car_off"]').disabled = false;
+			    document.getElementById("sleep_volt").database.carOnVoltage = obj.car_on_voltage;
+            }
 			if(obj.port_type == "tcp") {
 				document.getElementById("port_type_status").innerHTML = "TCP";
 			} else if(obj.port_type == "udp") {

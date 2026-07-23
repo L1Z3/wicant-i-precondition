@@ -73,6 +73,9 @@
 #define PUB_SUCCESS_BIT     		BIT1
 
 static adc_channel_t voltage_adc_ch = VBAT_ADC_CHANNEL;
+#if HW_HAS_PWR2
+static adc_channel_t v_car_on_adc_ch = V_CAR_ON_ADC_CHANNEL;
+#endif
 static bool calibrated = false;
 static EventGroupHandle_t s_mqtt_event_group = NULL;
 static float sleep_voltage = 13.1f;
@@ -179,7 +182,7 @@ static void mqtt_init(void)
     }
 }
 
-static void calibration_init(void)
+static void calibration_init(adc_channel_t adc_ch)
 {
     esp_err_t ret = ESP_FAIL;
 
@@ -187,7 +190,7 @@ static void calibration_init(void)
     ESP_LOGI(TAG, "calibration scheme version is %s", "Curve Fitting");
     adc_cali_curve_fitting_config_t cali_config = {
         .unit_id = ADC_UNIT,
-		.chan = voltage_adc_ch,
+		.chan = adc_ch,
         .atten = ADC_ATTEN,
         .bitwidth = ADC_BIT_WIDTH,
     };
@@ -223,7 +226,7 @@ static void calibration_init(void)
     }
 }
 
-void oneshot_adc_init(void)
+void oneshot_adc_init(adc_channel_t adc_ch)
 {
     // Initialize ADC
     adc_oneshot_unit_init_cfg_t init_config = {
@@ -237,14 +240,14 @@ void oneshot_adc_init(void)
         .atten = ADC_ATTEN,
         .bitwidth = ADC_BIT_WIDTH,
     };
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, voltage_adc_ch, &config));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, adc_ch, &config));
 
-    ESP_LOGI(TAG, "ADC channel: %d, Attenuation: %d", voltage_adc_ch, ADC_ATTEN);
+    ESP_LOGI(TAG, "ADC channel: %d, Attenuation: %d", adc_ch, ADC_ATTEN);
 
-    calibration_init();
+    calibration_init(adc_ch);
 }
 
-esp_err_t read_ss_adc_voltage(float *voltage_out)
+esp_err_t read_ss_adc_voltage(float *voltage_out, adc_channel_t adc_ch)
 {
     if (voltage_out == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -261,7 +264,7 @@ esp_err_t read_ss_adc_voltage(float *voltage_out)
     for (int i = 0; i < NUM_SAMPLES; i++)
 	{
         int raw_value;
-        esp_err_t ret = adc_oneshot_read(adc_handle, voltage_adc_ch, &raw_value);
+        esp_err_t ret = adc_oneshot_read(adc_handle, adc_ch, &raw_value);
         
         if (ret == ESP_OK && raw_value < 4096) {
             int voltage = 0;
@@ -287,7 +290,7 @@ esp_err_t read_ss_adc_voltage(float *voltage_out)
             if (valid_samples <= 5)
 			{
                 ESP_LOGI(TAG, "Sample[%d]: Chan=%d, Raw=%d, Voltage=%dmV", 
-                        (int)valid_samples, voltage_adc_ch, raw_value, voltage);
+                        (int)valid_samples, adc_ch, raw_value, voltage);
             }
             
             // Small delay between readings
@@ -339,7 +342,10 @@ static void adc_task(void *pvParameters)
     	alert_voltage = 16.0f;
     }
 
-    oneshot_adc_init();
+    oneshot_adc_init(voltage_adc_ch);
+#if HW_HAS_PWR2
+    oneshot_adc_init(v_car_on_adc_ch);
+#endif
 
 	if(config_server_get_sleep_time((uint32_t*)&sleep_time) == -1)
 	{
@@ -350,8 +356,10 @@ static void adc_task(void *pvParameters)
     while(1)
     {
 		float battery_voltage;
+        float on_voltage;
+        float sleep_test_voltage;
 
-    	ret = read_ss_adc_voltage(&battery_voltage);
+    	ret = read_ss_adc_voltage(&battery_voltage, voltage_adc_ch);
 		if(ret != ESP_OK)
 		{
 			ESP_LOGE(TAG, "read_ss_adc_voltage error");
@@ -359,18 +367,41 @@ static void adc_task(void *pvParameters)
 			continue;
 		}
     	
+#if HW_HAS_PWR2
+    	ret = read_ss_adc_voltage(&on_voltage, v_car_on_adc_ch);
+		if(ret != ESP_OK)
+		{
+			ESP_LOGE(TAG, "read_ss_adc_voltage error");
+			vTaskDelay(pdMS_TO_TICKS(1000));
+			continue;
+		}
+#endif
+    	
     	battery_voltage += VBAT_READ_OFFSET_V;
 
     	xQueueOverwrite( voltage_queue, &battery_voltage );
-    	if(enable_sleep == 1)
+        if(enable_sleep == 1) {
+            // in this case, use the actual battery voltage
+            sleep_test_voltage = battery_voltage;
+        } else if(enable_sleep == 2) {
+            // in this case, use the hot-when-on voltage
+            // it will be compared against CAR_ON_VOLTAGE
+#if HW_HAS_PWR2
+            sleep_test_voltage = on_voltage;
+#else
+            // should not occur
+            sleep_test_voltage = battery_voltage;
+#endif
+        }
+    	if(enable_sleep == 1 || enable_sleep == 2)
     	{
 			switch(sleep_state)
 			{
 				case RUN_STATE:
 				{
-					if(battery_voltage < sleep_voltage)
+					if(sleep_test_voltage < sleep_voltage)
 					{
-						ESP_LOGI(TAG, "low voltage: %f", battery_voltage);
+						ESP_LOGI(TAG, "low voltage: %f", sleep_test_voltage);
 						sleep_detect_time = esp_timer_get_time();
 						sleep_state++;
 					}
@@ -378,9 +409,9 @@ static void adc_task(void *pvParameters)
 				}
 				case SLEEP_DETECTED:
 				{
-					if(battery_voltage > sleep_voltage)
+					if(sleep_test_voltage > sleep_voltage)
 					{
-						ESP_LOGI(TAG, "high voltage: %f", battery_voltage);
+						ESP_LOGI(TAG, "high voltage: %f", sleep_test_voltage);
 						sleep_state = RUN_STATE;
 					}
 
@@ -396,16 +427,16 @@ static void adc_task(void *pvParameters)
 				case SLEEP_STATE:
 				{
 					ESP_LOGI(TAG, "Go to sleep");
-					if(battery_voltage > sleep_voltage)
+					if(sleep_test_voltage > sleep_voltage)
 					{
 						wakeup_detect_time = esp_timer_get_time();
-						ESP_LOGI(TAG, "wake up, voltage: %f", battery_voltage);
+						ESP_LOGI(TAG, "wake up, voltage: %f", sleep_test_voltage);
 						sleep_state = WAKEUP_STATE;
 					}
 
 					if(config_server_get_battery_alert_config())
 					{
-						if(battery_voltage < alert_voltage)
+						if(sleep_test_voltage < alert_voltage)
 						{
 							ESP_LOGW(TAG, "battery alert!");
 							if(((esp_timer_get_time() - pub_time) > alert_time) || (pub_time == 0))
@@ -451,7 +482,7 @@ static void adc_task(void *pvParameters)
 				}
 				case WAKEUP_STATE:
 				{
-					if(battery_voltage > sleep_voltage)
+					if(sleep_test_voltage > sleep_voltage)
 					{
 						if((esp_timer_get_time() - wakeup_detect_time) > WAKEUP_TIME_DELAY)
 						{
@@ -460,7 +491,7 @@ static void adc_task(void *pvParameters)
 
 						}
 					}
-					else if(battery_voltage < sleep_voltage)
+					else if(sleep_test_voltage < sleep_voltage)
 					{
                         dev_status_clear_bits(DEV_AWAKE_BIT);
                         dev_status_set_bits(DEV_SLEEP_BIT);
@@ -474,6 +505,8 @@ static void adc_task(void *pvParameters)
 			if(sleep_state == SLEEP_STATE)
 			{
 				ESP_LOGW(TAG, "sleeping");
+                                // todo (trh): add config option to leave
+                                // can busses up in sleep.
 				for(int bus = 0; bus < CAN_BUS_COUNT; bus++)
 				{
 					can_disable(bus);

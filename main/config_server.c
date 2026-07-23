@@ -951,6 +951,8 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	cJSON_AddStringToObject(root, "git_version", GIT_SHA);
 	cJSON_AddStringToObject(root, "protocol", device_config.protocol);
 
+	cJSON_AddBoolToObject(root, "hw_has_pwr2", (bool)HW_HAS_PWR2);
+	cJSON_AddNumberToObject(root, "car_on_voltage", CAR_ON_VOLTAGE);
 	cJSON_AddStringToObject(root, "sleep_status", device_config.sleep_status);
 	cJSON_AddStringToObject(root, "sleep_volt", device_config.sleep_volt);
 	cJSON_AddStringToObject(root, "sleep_time", device_config.sleep_time);
@@ -2601,6 +2603,10 @@ int8_t config_server_get_sleep_config(void)
 	{
 		return 1;
 	}
+	else if(strcmp(device_config.sleep_status, "car_off") == 0)
+	{
+		return 2;
+	}
 	else if(strcmp(device_config.sleep_status, "disable") == 0)
 	{
 		return 0;
@@ -2619,7 +2625,7 @@ int8_t config_server_get_sleep_volt(float *sleep_volt)
 		return -1;
 	}
 
-	if(*sleep_volt >= 12.0f && *sleep_volt <= 15.0f)
+	if((*sleep_volt >= 12.0f && *sleep_volt <= 15.0f) || *sleep_volt == CAR_ON_VOLTAGE)
 	{
 		return 1;
 	}
