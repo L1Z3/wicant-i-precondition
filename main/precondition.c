@@ -303,8 +303,10 @@ static struct {
     // most recent recognized preconditioning status reported by the car
     precon_status_t precon_status;
     // is the car in READY? tracked from 0x038 edges; stays false on platforms
-    // where that frame is unavailable
-    bool car_in_ready;
+    // where that frame is unavailable. volatile: written from the CAN rx task
+    // and read from the adc sleep task (car_in_ready()); a single byte, so
+    // volatile (no lock) keeps the cross-task read from being cached/hoisted.
+    volatile bool car_in_ready;
 } platform;
 
 static bool precon_status_available(void) {
@@ -1224,4 +1226,8 @@ bool precondition_get_battery_soc(precondition_soc_t *out) {
     }
 
     return xQueuePeek(battery_soc_queue, out, 0) == pdTRUE;
+}
+
+bool car_in_ready(void) {
+    return platform.car_in_ready;
 }
