@@ -7,6 +7,7 @@
 #include "precondition.h"
 #include "config_server.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 
 #define TAG __func__
 
@@ -69,9 +70,7 @@ static bool activation_long_press_fired = false;
 // is the status frame available? false if on unknown platform, true if we at any point receive a known status frame
 static bool status_frame_available = false;
 
-static portMUX_TYPE battery_temperature_mux = portMUX_INITIALIZER_UNLOCKED;
-static precondition_temperature_t battery_temperature = {0};
-static bool battery_temperature_valid = false;
+static QueueHandle_t battery_temperature_queue = NULL;
 
 typedef enum {
     // frame carries the current button state: pressed while (byte & mask) == value
@@ -210,6 +209,11 @@ static int64_t now_us(void) {
 
 static int64_t ts_elapsed(int64_t now, int64_t old) {
     return now - old;
+}
+
+void precondition_init(void) {
+    battery_temperature_queue = xQueueCreate(1, sizeof(precondition_temperature_t));
+    configASSERT(battery_temperature_queue != NULL);
 }
 
 static void send_precondition_start_msg(uint8_t ticks_remaining) {
@@ -424,14 +428,14 @@ void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
     if (IS_BATTERY_FRAME(to_push->identifier)
             && rx_bus == CAR_BUS
             && to_push->data_length_code >= BATTERY_TEMPERATURE_DATA_LENGTH) {
-        taskENTER_CRITICAL(&battery_temperature_mux);
-        battery_temperature.min_c =
-            to_push->data[BATTERY_TEMPERATURE_MIN_INDEX];
-        battery_temperature.max_c =
-            to_push->data[BATTERY_TEMPERATURE_MAX_INDEX];
-        battery_temperature.updated_at_us = esp_timer_get_time();
-        battery_temperature_valid = true;
-        taskEXIT_CRITICAL(&battery_temperature_mux);
+                
+        precondition_temperature_t temperature = {
+            .min_c = to_push->data[BATTERY_TEMPERATURE_MIN_INDEX],
+            .max_c = to_push->data[BATTERY_TEMPERATURE_MAX_INDEX],
+            .updated_at_us = esp_timer_get_time(),
+        };
+        
+        xQueueOverwrite(battery_temperature_queue, &temperature);    
     }
 
     int8_t precon_button_type = cached_precon_button_type();
@@ -539,14 +543,9 @@ void precondition_tick(void) {
 }
 
 bool precondition_get_battery_temperature(precondition_temperature_t *out) {
-    if (out == NULL) {
+    if (out == NULL || battery_temperature_queue == NULL) {
         return false;
     }
 
-    taskENTER_CRITICAL(&battery_temperature_mux);
-    *out = battery_temperature;
-    bool valid = battery_temperature_valid;
-    taskEXIT_CRITICAL(&battery_temperature_mux);
-
-    return valid;
+    return xQueuePeek(battery_temperature_queue, out, 0) == pdTRUE;
 }
