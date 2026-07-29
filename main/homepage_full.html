@@ -1367,6 +1367,10 @@
                         </select>
                     </td>
                 </tr>
+                <tr>
+                    <td>Battery Temperature:</td>
+                    <td><div id="battery_temp_status">Waiting for CAN data</div></td>
+                </tr>
             </table>
         </div>
 
@@ -2546,6 +2550,11 @@ function loadAutoTable(jsonData) {
 				document.getElementById("port_type_status").innerHTML = "TCP";
 			} else if(obj.port_type == "udp") {
 				document.getElementById("port_type_status").innerHTML = "UDP";
+			}
+			if (obj.battery_temp_valid) {
+				document.getElementById("battery_temp_status").textContent = `${obj.battery_temp_min_c}–${obj.battery_temp_max_c} °C`;
+			} else {
+				document.getElementById("battery_temp_status").textContent = "Waiting for CAN data";
 			}
 			document.getElementById("port_status").innerHTML = obj.port;
 			document.getElementById("fw_version").innerHTML = obj.fw_version;

@@ -6,6 +6,7 @@
 #include "can.h"
 #include "precondition.h"
 #include "config_server.h"
+#include "freertos/FreeRTOS.h"
 
 #define TAG __func__
 
@@ -67,6 +68,10 @@ static int64_t activation_press_start_ts = 0U;
 static bool activation_long_press_fired = false;
 // is the status frame available? false if on unknown platform, true if we at any point receive a known status frame
 static bool status_frame_available = false;
+
+static portMUX_TYPE battery_temperature_mux = portMUX_INITIALIZER_UNLOCKED;
+static precondition_temperature_t battery_temperature = {0};
+static bool battery_temperature_valid = false;
 
 typedef enum {
     // frame carries the current button state: pressed while (byte & mask) == value
@@ -180,6 +185,13 @@ static bool activation_is_release(const message_payload_t *msg, const twai_messa
 #define PRECONDITION_RETRY_US 10000000U  // 10 seconds
 #define PRECONDITION_MAX_RETRIES 4U
 #define PRECONDITION_STARTED_TIMEOUT_US 70000000U  // 70 seconds
+
+#define BATTERY_TEMPERATURE_FRAME_ID 0x152U
+#define BATTERY_TEMPERATURE_MIN_INDEX 0U
+#define BATTERY_TEMPERATURE_MAX_INDEX 1U
+#define BATTERY_TEMPERATURE_DATA_LENGTH 2U
+
+#define IS_BATTERY_FRAME(frame_id) ((frame_id) == BATTERY_TEMPERATURE_FRAME_ID)
 
 #define CAR_BUS CAN_BUS_0
 #define HEAD_UNIT_BUS CAN_BUS_1
@@ -409,6 +421,19 @@ void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
         }
     }
 
+    if (IS_BATTERY_FRAME(to_push->identifier)
+            && rx_bus == CAR_BUS
+            && to_push->data_length_code >= BATTERY_TEMPERATURE_DATA_LENGTH) {
+        taskENTER_CRITICAL(&battery_temperature_mux);
+        battery_temperature.min_c =
+            to_push->data[BATTERY_TEMPERATURE_MIN_INDEX];
+        battery_temperature.max_c =
+            to_push->data[BATTERY_TEMPERATURE_MAX_INDEX];
+        battery_temperature.updated_at_us = esp_timer_get_time();
+        battery_temperature_valid = true;
+        taskEXIT_CRITICAL(&battery_temperature_mux);
+    }
+
     int8_t precon_button_type = cached_precon_button_type();
     if (precon_button_type == BUTTON_DISABLED) {
         // activation button disabled in config; don't listen for any button press
@@ -511,4 +536,17 @@ void precondition_tick(void) {
         send_precondition_stop_msg(precondition_stop_ticks_remaining);
         precondition_stop_ticks_remaining--;
     }
+}
+
+bool precondition_get_battery_temperature(precondition_temperature_t *out) {
+    if (out == NULL) {
+        return false;
+    }
+
+    taskENTER_CRITICAL(&battery_temperature_mux);
+    *out = battery_temperature;
+    bool valid = battery_temperature_valid;
+    taskEXIT_CRITICAL(&battery_temperature_mux);
+
+    return valid;
 }
