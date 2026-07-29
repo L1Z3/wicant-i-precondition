@@ -190,7 +190,7 @@ static bool activation_is_release(const message_payload_t *msg, const twai_messa
 #define BATTERY_TEMPERATURE_MAX_INDEX 1U
 #define BATTERY_TEMPERATURE_DATA_LENGTH 2U
 
-#define IS_BATTERY_FRAME(frame_id) ((frame_id) == BATTERY_TEMPERATURE_FRAME_ID)
+#define IS_BATTERY_TEMPERATURE_FRAME(frame_id) ((frame_id) == BATTERY_TEMPERATURE_FRAME_ID)
 
 #define CAR_BUS CAN_BUS_0
 #define HEAD_UNIT_BUS CAN_BUS_1
@@ -425,10 +425,9 @@ void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
         }
     }
 
-    if (IS_BATTERY_FRAME(to_push->identifier)
+    if (IS_BATTERY_TEMPERATURE_FRAME(to_push->identifier)
             && rx_bus == CAR_BUS
             && to_push->data_length_code >= BATTERY_TEMPERATURE_DATA_LENGTH) {
-                
         precondition_temperature_t temperature = {
             .min_c = to_push->data[BATTERY_TEMPERATURE_MIN_INDEX],
             .max_c = to_push->data[BATTERY_TEMPERATURE_MAX_INDEX],
