@@ -212,7 +212,7 @@ static int64_t ts_elapsed(int64_t now, int64_t old) {
 }
 
 void precondition_init(void) {
-    battery_temperature_queue = xQueueCreate(1, sizeof(precondition_temperature_t));
+    battery_temperature_queue = xQueueCreate(1, sizeof(precondition_temperature_t));
     configASSERT(battery_temperature_queue != NULL);
 }
 
@@ -289,9 +289,9 @@ fwd_result_t precondition_fwd_hook(twai_message_t *to_send, can_bus_t fwd_bus) {
     }
 
     // we are currently trying to stop preconditioning and want to display the retry status.
-    if (!precondition_requested 
-            && status_frame_available 
-            && !precondition_stop_confirmed 
+    if (!precondition_requested
+            && status_frame_available
+            && !precondition_stop_confirmed
             && precondition_retries < PRECONDITION_MAX_RETRIES
             && fwd_bus == CAR_BUS) {
         int64_t now = now_us();
@@ -433,8 +433,8 @@ void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
             .max_c = to_push->data[BATTERY_TEMPERATURE_MAX_INDEX],
             .updated_at_us = esp_timer_get_time(),
         };
-        
-        xQueueOverwrite(battery_temperature_queue, &temperature);    
+
+        xQueueOverwrite(battery_temperature_queue, &temperature);
     }
 
     int8_t precon_button_type = cached_precon_button_type();
