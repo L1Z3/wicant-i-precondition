@@ -16,6 +16,7 @@ typedef struct {
     int64_t updated_at_us;
 } precondition_temperature_t;
 
+#define PRECONDITION_BATTERY_TEMPERATURE_SETPOINT  21.0f
 bool precondition_get_battery_temperature(precondition_temperature_t *out);
 
 #endif

@@ -301,6 +301,11 @@ static struct {
 
 static QueueHandle_t battery_temperature_queue = NULL;
 
+// is there a known condition (e.g. high batt temp) blocking preconditioning?
+// bitwise-boolean, with smallest bit equal to batt temp blocking
+// add notes here if other conditions are added
+static uint8_t precondition_blocked = 0U;
+
 // ********************* config caches *********************
 
 // TODO(ejones): deduplicate this code?
@@ -1007,6 +1012,14 @@ static void precondition_global_tick(sm_t *sm) {
         button.long_press_fired = true;
         sm_send_event(sm, EV_TOGGLE);
     }
+
+    // a blocking condition (e.g. high batt temp) while a start request is in
+    // flight: fail fast instead of retrying. MANAGED is excluded because there
+    // the BMU owns the session and will end it itself once the battery reaches temp
+    if (precondition_blocked
+            && sm_in(sm, &S_REQUESTED) && !sm_in(sm, &S_MANAGED)) {
+        sm_transition(sm, &S_STOPPING);
+    }
 }
 
 static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_bus_t rx_bus) {
@@ -1052,6 +1065,12 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
         };
 
         xQueueOverwrite(battery_temperature_queue, &temperature);
+
+        if (temperature.min_c >= PRECONDITION_BATTERY_TEMPERATURE_SETPOINT) {
+            precondition_blocked |= 0b00000001U;
+        } else {
+            precondition_blocked &= 0b11111110U;
+        }
     }
 
     int8_t precon_button_type = cached_precon_button_type();
@@ -1105,13 +1124,9 @@ void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
     sm_rx(&precon_sm, to_push, rx_bus);
 }
 
-// Decide whether to block, modify, or passthrough a message for preconditioning.
-// Modifies packet data in-place when returning FWD_MODIFIED.
-// On single-bus builds only FWD_MODIFIED has an effect (FWD_BLOCK can't pull a
-// frame that's already on the wire); on multi-bus builds the caller bridges,
-// so FWD_BLOCK and FWD_PASSTHROUGH matter too. fwd_bus is the destination bus.
 fwd_result_t precondition_fwd_hook(twai_message_t *to_send, can_bus_t fwd_bus) {
     return sm_fwd(&precon_sm, to_send, fwd_bus);
+}
 }
 
 bool precondition_get_battery_temperature(precondition_temperature_t *out) {
