@@ -432,6 +432,8 @@ static int8_t cached_precon_press_type(void) {
 }
 
 // toggle preconditioning on an activation event, with debounce between start and stop
+// TODO(trh): we should make the precondition_requested and precondition_BMU_managed 
+// state obvious to the user
 static void toggle_preconditioning(void) {
     int64_t now = now_us();
     // if preconditioning is either actively requested or BMU managed, the activation
@@ -636,6 +638,22 @@ void precondition_tick(void) {
         // if we don't have status messages, we still want to stop displaying the UI after 70 seconds
         precondition_started_confirmed = true;
     }
+    
+    if (precondition_requested) {
+        // could possibly be more efficient
+        // alternate design: upon read in precondition_can_rx_hook(), update a 
+        // precondition_blocked state
+        precondition_temperature_t battery_temperature;  
+        if (precondition_get_battery_temperature(battery_temperature)) {
+            if (battery_temperature.min_c > PRECONDITION_BATTERY_TEMPERATURE_SETPOINT) {
+                // too hot to try; fail fast
+                precondition_start_ticks_remaining = 0U;
+                stop_preconditioning(now);
+                // TODO(trh): send clear error message here
+            }
+        }
+    }
+                
 
     // while the BMU is managing preconditioning, periodically re-send the start
     // burst so preconditioning is re-requested if it got dropped
