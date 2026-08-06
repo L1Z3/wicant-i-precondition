@@ -17,8 +17,8 @@ fwd_result_t precondition_fwd_hook(twai_message_t *to_send, can_bus_t fwd_bus);
 void precondition_tick(void);
 
 typedef struct {
-    uint8_t min_c;
-    uint8_t max_c;
+    int8_t min_c;
+    int8_t max_c;
     int64_t updated_at_us;
 } precondition_temperature_t;
 
