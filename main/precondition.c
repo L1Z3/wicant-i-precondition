@@ -46,6 +46,8 @@ static void set_0x4e8_distance_flag(twai_message_t *packet, uint16_t distance_in
 
 // is the user currently requesting preconditioning to be active?
 static bool precondition_requested = false;
+// is the BMU managing preconditioning? 
+static bool precondition_BMU_managed = false;
 // timestamp of when the user requested preconditioning
 static int64_t precondition_requested_ts = 0U;
 // timestamp of last attempt to send precondition message, used for retry logic
@@ -173,6 +175,27 @@ static bool activation_is_release(const message_payload_t *msg, const twai_messa
 #define STATUS_STARTED(status_byte) \
     (((status_byte) & STATUS_MASK) == 0x15U)
 
+#define IS_POWER_STATUS_FRAME(frame_id) \
+    ((frame_id == 0x038U))
+
+// unclear if this is necessary and sufficient
+// #define POWER_STATUS_MASK 0b00000100U
+#define POWER_STATUS_MASK 0x0F
+#define POWER_STATUS_READY(power_status_byte) \
+    (((power_status_byte) & POWER_STATUS_MASK) == 0x04U)
+
+#define IS_CAR_START_FRAME(frame_id) \
+    ((frame_id == 0x039U))
+
+// unclear if this is necessary and sufficient
+// #define CAR_START_MASK 0b00001001U
+#define CAR_START_MASK 0x0F
+#define CAR_STARTING(car_start_byte) \
+    (((car_start_byte) & CAR_START_MASK) == 0x09U)
+
+#define CAR_START_TICKS 4U // 4x 0x09 on frame 0x039
+#define CAR_START_WAIT_US 8000000U  // 8 seconds
+
 #define PRECONDITION_DEBOUNCE_US 1000000U  // 1 second
 #define PRECONDITION_LONG_PRESS_US 1000000U  // short/long press threshold: 1 second
 #define PRECONDITION_START_PHASE1_TICKS 3U // 4003 message
@@ -252,12 +275,12 @@ static void send_precondition_stop_msg(uint8_t ticks_remaining) {
 // so FWD_BLOCK and FWD_PASSTHROUGH matter too. fwd_bus is the destination bus.
 fwd_result_t precondition_fwd_hook(twai_message_t *to_send, can_bus_t fwd_bus) {
     // block 0x0C7 message so that the head unit doesn't turn off preconditioning on us
-    if (precondition_requested && to_send->identifier == 0x0C7U && fwd_bus == CAR_BUS) {
+    if ((precondition_requested || precondition_BMU_managed) && to_send->identifier == 0x0C7U && fwd_bus == CAR_BUS) {
         return FWD_BLOCK;
     }
 
     // MITM 0x4ED message while preconditioning is requested
-    if (precondition_requested && to_send->identifier == 0x4EDU && fwd_bus == CAR_BUS) {
+    if ((precondition_requested || precondition_BMU_managed) && to_send->identifier == 0x4EDU && fwd_bus == CAR_BUS) {
         to_send->data[5] = 0x10U;
         to_send->data[6] = 0xA0U;
         to_send->data[7] = 0x00U;
@@ -318,6 +341,17 @@ fwd_result_t precondition_fwd_hook(twai_message_t *to_send, can_bus_t fwd_bus) {
     return FWD_PASSTHROUGH;
 }
 
+// same caching rationale as cached_precon_button_type
+static int8_t cached_precon_mode(void) {
+    static int8_t precon_mode = 0;
+    static bool loaded = false;
+    if (!loaded) {
+        precon_mode = config_server_precon_mode();
+        loaded = true;
+    }
+    return precon_mode;
+}
+
 static void start_preconditioning(int64_t now) {
     precondition_requested = true;
     precondition_requested_ts = now;
@@ -326,14 +360,32 @@ static void start_preconditioning(int64_t now) {
     precondition_starting_confirmed = false;
     precondition_started_confirmed = false;
     precondition_retries = 0U;
+    if(cached_precon_mode() != ONCE) {
+        precondition_BMU_managed = true;
+    }
+}
+
+static void stop_managing_preconditioning(int64_t now) {
+    precondition_requested = false;
+    precondition_last_attempt_ts = now;
+    // confirm stop so retry logic doesn't run
+    precondition_stop_confirmed = true;
+    precondition_retries = 0U;
+    // this just doesn't attempt to stop preconditoning 
+    // and lets the BMU do what it wants once it reaches temp
+    precondition_stop_ticks_remaining = 0U;
+    // keep track of whether we expect preconditioning 
+    // to spontanouesly restart itself.
+    precondition_BMU_managed = true;
 }
 
 static void stop_preconditioning(int64_t now) {
     precondition_requested = false;
     precondition_last_attempt_ts = now;
-    precondition_stop_ticks_remaining = PRECONDITION_STOP_TICKS;
     precondition_stop_confirmed = false;
     precondition_retries = 0U;
+    precondition_stop_ticks_remaining = PRECONDITION_STOP_TICKS;
+    precondition_BMU_managed = false;
 }
 
 // Cache the configured activation button type. A config change restarts the
@@ -370,7 +422,37 @@ static void toggle_preconditioning(void) {
     }
 }
 
+int32_t ts_car_start(void) {
+    static uint8_t ticks = 0; 
+    static int32_t ts_start = 0;
+    if (ticks == 0) {
+        ts_start = now_us();
+    }
+    ticks++;
+    if ((ticks > CAR_START_TICKS) && (ts_elapsed(now_us(), ts_start) > CAR_START_WAIT_US)) {
+        // this is a new car start
+        ticks = 0;
+        ts_start = now_us();
+    }
+    return ts_start;
+}
+
 void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
+    // cache button mode
+    static bool car_start_signal = false;
+    if (IS_CAR_START_FRAME(to_push->identifier)) {
+        car_start_signal = CAR_STARTING(to_push->data[0]);
+    }
+    static bool car_in_ready = false;
+    if (IS_POWER_STATUS_FRAME(to_push->identifier)) {
+         car_in_ready = POWER_STATUS_READY(to_push->data[0]);
+    }
+    static int32_t ts_start = 0;
+    // moved this here as it's increasingly commonly used
+    int32_t now = now_us();
+    if (car_start_signal) {
+        ts_start = ts_car_start();
+    }
     // 0x2AD/0x0A82AA03 status frame: second byte indicates precondition state
     //   Ioniq 5/6: 0x01 = off/idle, 0x05 = starting, 0x15 = fully running
     //   EV6: 0x41 = off/idle, 0x45 = starting, 0x55 = fully running
@@ -396,7 +478,7 @@ void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
                 // preconditioning was previously fully active, but now it's only showing as starting.
                 // this is a weird situation to be in; let's just reset the current attempt time,
                 // and let the retry logic continue as normal if it doesn't resolve itself after a while
-                precondition_last_attempt_ts = now_us();
+                precondition_last_attempt_ts = now;
                 precondition_started_confirmed = false;
             }
             if (STATUS_IDLE(status)) {
@@ -404,21 +486,16 @@ void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
                 // it's possible that the car has reached the "Precondition complete" state.
                 // until we have a better way to distinguish that state from a real failure mode (TODO(ejones)),
                 // let's just assume everything is fine and reset our state
-                int64_t now = now_us();
-                stop_preconditioning(now);
-                // if we are in "once" mode, actually attempt to actively stop preconditioning.
-                // this should prevent preconditioning from restarting once the battery falls back below temp.
-                // TODO(ejones): this needs testing
-                if(config_server_precon_mode() != ONCE) {
-                    // TODO(ejones): continuous mode needs more development. for now,
-                    // this just doesn't attempt to stop preconditoning and lets the BMU do what it wants
-                    // once it reaches temp
-                    precondition_stop_ticks_remaining = 0U;
-                    precondition_stop_confirmed = true;
+                if(precondition_BMU_managed) {
+                    stop_managing_preconditioning(now);
+                } else {
+                    // if we are in "once" mode, actually attempt to actively stop preconditioning.
+                    // this should prevent preconditioning from restarting once the battery falls back below temp.
+                    stop_preconditioning(now);
                 }
             }
         }
-        if (!precondition_requested && !precondition_stop_confirmed && precondition_stop_ticks_remaining == 0U) {
+        if (!precondition_requested && !precondition_stop_confirmed && !precondition_BMU_managed && precondition_stop_ticks_remaining == 0U) {
             if (STATUS_IDLE(status)) {
                 precondition_stop_confirmed = true;
             }
@@ -437,6 +514,21 @@ void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
         xQueueOverwrite(battery_temperature_queue, &temperature);
     }
 
+    // clean up preconditioning interrupted by car off
+    // does not handle interruptions due to nav in non-MITM
+    // or other unknown interruptions
+    // would be good to reset precondition_BMU_managed if batt temp
+    // falls below 21C, as that's a clear sign the BMU is no longer managing
+    if (precondition_BMU_managed && precondition_requested && !car_in_ready) {
+        stop_managing_preconditioning(now);
+    }
+    // if car is in ready and preconditioning isn't requested, request it
+    // requires manual activation after WiCAN power cycle
+    // HANDLE CAR OFF WITH precondition_requested STILL HIGH
+    if (cached_precon_mode() == PERSISTENT && precondition_BMU_managed && !precondition_requested && car_in_ready && (ts_start > 0) && (ts_elapsed(now, ts_start) < CAR_START_WAIT_US)) {
+        toggle_preconditioning();
+    }
+
     int8_t precon_button_type = cached_precon_button_type();
     if (precon_button_type == BUTTON_DISABLED) {
         // activation button disabled in config; don't listen for any button press
@@ -452,14 +544,14 @@ void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
     const message_payload_t *button = &activation_messages[precon_button_type];
     if (activation_is_press(button, to_push)) {
         if (!activation_button_state_prev) {
-            activation_press_start_ts = now_us();
+            activation_press_start_ts = now;
             activation_long_press_fired = false;
         }
         activation_button_state_prev = true;
     } else if (activation_is_release(button, to_push)) {
         if (activation_button_state_prev
                 && cached_precon_press_type() == PRESS_SHORT
-                && ts_elapsed(now_us(), activation_press_start_ts) < PRECONDITION_LONG_PRESS_US) {
+                && ts_elapsed(now, activation_press_start_ts) < PRECONDITION_LONG_PRESS_US) {
             toggle_preconditioning();
         }
         activation_button_state_prev = false;
@@ -490,7 +582,11 @@ void precondition_tick(void) {
                 && precondition_retries >= PRECONDITION_MAX_RETRIES
                 && ((!precondition_starting_confirmed && time_since_last_attempt > PRECONDITION_RETRY_US)
                     || (!precondition_started_confirmed && time_since_last_attempt > PRECONDITION_STARTED_TIMEOUT_US))) {
-            stop_preconditioning(now);
+            if (precondition_BMU_managed) {
+                stop_managing_preconditioning(now);
+            } else {
+                stop_preconditioning(now);
+            }
             precondition_retries = PRECONDITION_MAX_RETRIES;  // don't retry the stop; this is a failure case already
         }
 
@@ -516,6 +612,7 @@ void precondition_tick(void) {
 
         // retry stop if not confirmed
         if (!precondition_requested && !precondition_stop_confirmed
+                && !precondition_BMU_managed
                 && precondition_stop_ticks_remaining == 0U
                 && precondition_retries < PRECONDITION_MAX_RETRIES
                 && time_since_last_attempt > PRECONDITION_RETRY_US) {
