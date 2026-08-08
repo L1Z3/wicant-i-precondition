@@ -76,13 +76,16 @@ static adc_channel_t voltage_adc_ch = VBAT_ADC_CHANNEL;
 #if HW_HAS_PWR2
 static adc_channel_t v_car_on_adc_ch = V_CAR_ON_ADC_CHANNEL;
 #endif
-static bool calibrated = false;
 static EventGroupHandle_t s_mqtt_event_group = NULL;
 static float sleep_voltage = 13.1f;
 static uint8_t enable_sleep = 0;
 static QueueHandle_t voltage_queue = NULL;
+static QueueHandle_t on_voltage_queue = NULL;
 adc_oneshot_unit_handle_t adc_handle;
 static adc_cali_handle_t adc1_cali_chan0_handle = NULL;
+#if HW_HAS_PWR2
+static adc_cali_handle_t adc1_cali_chan1_handle = NULL;
+#endif
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
@@ -182,7 +185,7 @@ static void mqtt_init(void)
     }
 }
 
-static void calibration_init(adc_channel_t adc_ch)
+static void calibration_init(adc_cali_handle_t *cali_handle, adc_channel_t adc_ch)
 {
     esp_err_t ret = ESP_FAIL;
 
@@ -194,14 +197,16 @@ static void calibration_init(adc_channel_t adc_ch)
         .atten = ADC_ATTEN,
         .bitwidth = ADC_BIT_WIDTH,
     };
-    ret = adc_cali_create_scheme_curve_fitting(&cali_config, &adc1_cali_chan0_handle);
+    ret = adc_cali_create_scheme_curve_fitting(&cali_config, cali_handle);
     if (ret == ESP_OK) {
-        calibrated = true;
+        ESP_LOGI(TAG, "Calibration Success");
+    } else {
+        ESP_LOGW(TAG, "Calibration Failed");
     }
 #endif
 
 #if ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
-    if (!calibrated) 
+    if (ret != ESP_OK) 
 	{
         ESP_LOGI(TAG, "calibration scheme version is %s", "Line Fitting");
         adc_cali_line_fitting_config_t cali_config = 
@@ -210,23 +215,18 @@ static void calibration_init(adc_channel_t adc_ch)
             .atten = ADC_ATTEN,
             .bitwidth = ADC_BIT_WIDTH,
         };
-        ret = adc_cali_create_scheme_line_fitting(&cali_config, &cali_handle);
+        ret = adc_cali_create_scheme_line_fitting(&cali_config, cali_handle);
         if (ret == ESP_OK) 
 		{
-            calibrated = true;
+            ESP_LOGI(TAG, "Calibration Success");
+        } else {
+            ESP_LOGW(TAG, "Calibration Failed");
         }
     }
 #endif
-
-    if (calibrated) 
-	{
-        ESP_LOGI(TAG, "Calibration Success");
-    } else {
-        ESP_LOGW(TAG, "Calibration Failed");
-    }
 }
 
-void oneshot_adc_init(adc_channel_t adc_ch)
+void oneshot_adc_init(void)
 {
     // Initialize ADC
     adc_oneshot_unit_init_cfg_t init_config = {
@@ -235,16 +235,24 @@ void oneshot_adc_init(adc_channel_t adc_ch)
     };
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &adc_handle));
 
-    // Configure ADC channel
+    // Configure ADC channels
     adc_oneshot_chan_cfg_t config = {
         .atten = ADC_ATTEN,
         .bitwidth = ADC_BIT_WIDTH,
     };
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, adc_ch, &config));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, voltage_adc_ch, &config));
 
-    ESP_LOGI(TAG, "ADC channel: %d, Attenuation: %d", adc_ch, ADC_ATTEN);
+    ESP_LOGI(TAG, "ADC channel: %d, Attenuation: %d", voltage_adc_ch, ADC_ATTEN);
 
-    calibration_init(adc_ch);
+    calibration_init(&adc1_cali_chan0_handle, voltage_adc_ch);
+
+#if HW_HAS_PWR2
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, v_car_on_adc_ch, &config));
+
+    ESP_LOGI(TAG, "ADC channel: %d, Attenuation: %d", v_car_on_adc_ch, ADC_ATTEN);
+
+    calibration_init(&adc1_cali_chan1_handle, v_car_on_adc_ch);
+#endif
 }
 
 esp_err_t read_ss_adc_voltage(float *voltage_out, adc_channel_t adc_ch)
@@ -260,6 +268,14 @@ esp_err_t read_ss_adc_voltage(float *voltage_out, adc_channel_t adc_ch)
     uint32_t max_raw = 0;
     int sum_voltage = 0;
 
+    adc_cali_handle_t cali_handle = adc1_cali_chan0_handle;
+#if HW_HAS_PWR2
+    if (adc_ch == v_car_on_adc_ch)
+    {
+        cali_handle = adc1_cali_chan1_handle;
+    }
+#endif
+
     // Take multiple readings
     for (int i = 0; i < NUM_SAMPLES; i++)
 	{
@@ -270,9 +286,9 @@ esp_err_t read_ss_adc_voltage(float *voltage_out, adc_channel_t adc_ch)
             int voltage = 0;
             
             // Convert raw to voltage using calibration
-            if (calibrated)
+            if (cali_handle != NULL)
 			{
-                ESP_ERROR_CHECK(adc_cali_raw_to_voltage(adc1_cali_chan0_handle, raw_value, &voltage));
+                ESP_ERROR_CHECK(adc_cali_raw_to_voltage(cali_handle, raw_value, &voltage));
             }
 			else
 			{
@@ -310,7 +326,7 @@ esp_err_t read_ss_adc_voltage(float *voltage_out, adc_channel_t adc_ch)
         
         ESP_LOGI(TAG, "Summary: Raw=%d (min=%lu, max=%lu, avg of %lu), Voltage=%.2f V [%s]", 
                  avg_raw, min_raw, max_raw, valid_samples, *voltage_out,
-                 calibrated ? "CALIBRATED" : "UNCALIBRATED");
+                 cali_handle != NULL ? "CALIBRATED" : "UNCALIBRATED");
                  
         return ESP_OK;
     }
@@ -342,10 +358,7 @@ static void adc_task(void *pvParameters)
     	alert_voltage = 16.0f;
     }
 
-    oneshot_adc_init(voltage_adc_ch);
-#if HW_HAS_PWR2
-    oneshot_adc_init(v_car_on_adc_ch);
-#endif
+    oneshot_adc_init();
 
 	if(config_server_get_sleep_time((uint32_t*)&sleep_time) == -1)
 	{
@@ -356,7 +369,9 @@ static void adc_task(void *pvParameters)
     while(1)
     {
 		float battery_voltage;
+#if HW_HAS_PWR2
         float on_voltage;
+#endif
         float sleep_test_voltage;
 
     	ret = read_ss_adc_voltage(&battery_voltage, voltage_adc_ch);
@@ -375,6 +390,7 @@ static void adc_task(void *pvParameters)
 			vTaskDelay(pdMS_TO_TICKS(1000));
 			continue;
 		}
+    	xQueueOverwrite( on_voltage_queue, &on_voltage );
 #endif
     	
     	battery_voltage += VBAT_READ_OFFSET_V;
@@ -436,7 +452,10 @@ static void adc_task(void *pvParameters)
 
 					if(config_server_get_battery_alert_config())
 					{
-						if(sleep_test_voltage < alert_voltage)
+						// Always alert on the actual battery voltage; in car-off
+						// mode sleep_test_voltage is the hot-when-on pin, which is
+						// 0V whenever the car is off and would false-alert.
+						if(battery_voltage < alert_voltage)
 						{
 							ESP_LOGW(TAG, "battery alert!");
 							if(((esp_timer_get_time() - pub_time) > alert_time) || (pub_time == 0))
@@ -538,13 +557,30 @@ int8_t sleep_mode_get_voltage(float *val)
 	return -1;
 }
 
+int8_t sleep_mode_get_on_voltage(float *val)
+{
+	if(on_voltage_queue != NULL)
+	{
+		if(xQueuePeek( on_voltage_queue, val, 0 ))
+		{
+			return 1;
+		}
+		else return -1;
+	}
+	return -1;
+}
+
 int8_t sleep_mode_init(uint8_t enable, float sleep_volt)
 {
 	enable_sleep = enable;
-	sleep_voltage = sleep_volt;
-	ESP_LOGW(TAG, "sleep_volt: %2.2f", sleep_volt);
+	// Car-off sleep reads the hot-when-on pin (VBAT when on, 0 when off),
+	// so it must use the fixed CAR_ON_VOLTAGE threshold, not the
+	// configurable battery low-voltage cutoff.
+	sleep_voltage = (enable == 2) ? CAR_ON_VOLTAGE : sleep_volt;
+	ESP_LOGW(TAG, "sleep_volt: %2.2f", sleep_voltage);
 	s_mqtt_event_group = xEventGroupCreate();
 	voltage_queue = xQueueCreate(1, sizeof( float) );
+	on_voltage_queue = xQueueCreate(1, sizeof( float) );
 	xTaskCreate(adc_task, "adc_task", 4096, (void*)AF_INET, 5, NULL);
 
 	return 1;

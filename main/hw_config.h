@@ -50,11 +50,11 @@
 // Indicates whether the hardware has a second voltage divider
 // to read a second power pin.
 #define HW_HAS_PWR2                 1
-// GPIO5 (ADC1 ch5) reads the voltage on harness "PWR_12V_7"
+// GPIO5 (ADC1 ch4) reads the voltage on harness "PWR_12V_7"
 // which is MODULE5 power, i.e. hot in on or start
-// V_CAR_ON sense: R1=62K, R2=6.2K divider (x11) to ADC1 ch5
+// V_CAR_ON sense: R1=62K, R2=6.2K divider (x11) to ADC1 ch4
 // V_CAR_ON = VBAT or 0 in steady state
-#define V_CAR_ON_ADC_CHANNEL        ADC_CHANNEL_5
+#define V_CAR_ON_ADC_CHANNEL        ADC_CHANNEL_4
 // These are not used as they're identical to VBAT_* from here
 // #define V_CAR_ON_ADC_ATTEN               ADC_ATTEN_DB_6
 // #define V_CAR_ON_DIVIDER_R1_OHM          62000

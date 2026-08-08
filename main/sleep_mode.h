@@ -24,6 +24,7 @@
 
 int8_t sleep_mode_init(uint8_t enable, float sleep_volt);
 int8_t sleep_mode_get_voltage(float *val);
+int8_t sleep_mode_get_on_voltage(float *val);
 
 // todo (trh): needs testing, but should be safe
 // a car with <5V on a 12V bus is dead or off

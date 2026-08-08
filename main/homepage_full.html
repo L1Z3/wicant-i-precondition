@@ -553,6 +553,12 @@
                         <div id="batt_voltage">12.8V&nbsp;</div>
                     </td>
                 </tr>
+                <tr id="car_on_voltage_row" style="display:none">
+                    <td>Car-On Voltage:</td>
+                    <td>
+                        <div id="car_on_voltage">N/A&nbsp;</div>
+                    </td>
+                </tr>
                 <tr>
                     <td>HV Battery Temperature:</td>
                     <td><div id="battery_temp_status">Waiting for CAN data</div></td>
@@ -1389,27 +1395,20 @@
             toggleSleepVoltageEnabled();
         });
 
-        // Client-side only: disable sleep voltage
+        // Client-side only: the sleep voltage slider only applies to
+        // low-voltage sleep. Car-off sleep uses the fixed car-on threshold
+        // (firmware ignores the slider in that mode); show it in the
+        // readout without clobbering the user's battery threshold.
         function toggleSleepVoltageEnabled() {
             const sleepStatus = document.getElementById("sleep_status").value;
-            if (sleepStatus == 'enable') {
-                document.getElementById("sleep_volt").disabled = false;
-            } else {
-                document.getElementById("sleep_volt").disabled = true;
-            }
+            const sleepVolt = document.getElementById("sleep_volt");
+            sleepVolt.disabled = (sleepStatus != 'enable');
+            document.getElementById("sleep_time").disabled = (sleepStatus == 'disable');
 
             if (sleepStatus == 'car_off') {
-                document.getElementById("sleep_volt").value = document.getElementById("sleep_volt").database.carOnVoltage;
-                document.getElementById("sleep_volt_value").value = document.getElementById("sleep_volt").database.carOnVoltage;
-                document.getElementById("sleep_volt").disabled = true;
-            }
-
-            if (sleepStatus == 'disable') {
-                document.getElementById("sleep_time").disabled = true;
-                document.getElementById("sleep_volt").disabled = true;
+                document.getElementById("sleep_volt_value").textContent = sleepVolt.dataset.carOnVoltage;
             } else {
-                document.getElementById("sleep_time").disabled = false;
-                document.getElementById("sleep_volt").disabled = false;
+                document.getElementById("sleep_volt_value").textContent = sleepVolt.value;
             }
         }
 
@@ -2588,7 +2587,9 @@ function loadAutoTable(jsonData) {
             // enable car-off sleep if hw has pwr2 pin
             if(obj.hw_has_pwr2) {
             	document.querySelector('#sleep_status option[value="car_off"]').disabled = false;
-			    document.getElementById("sleep_volt").database.carOnVoltage = obj.car_on_voltage;
+			    document.getElementById("sleep_volt").dataset.carOnVoltage = obj.car_on_voltage;
+                document.getElementById("car_on_voltage_row").style.display = "";
+                document.getElementById("car_on_voltage").innerHTML = obj.on_voltage;
             }
 			if(obj.port_type == "tcp") {
 				document.getElementById("port_type_status").innerHTML = "TCP";
@@ -3168,10 +3169,8 @@ function loadAutoTable(jsonData) {
 				document.getElementById("ble_status").selectedIndex = "1";
                 document.getElementById("ble_warning_div").style.display = "none";
 			}
-			if(obj.sleep_status == "enable") {
-				document.getElementById("sleep_status").selectedIndex = "0";
-			} else if(obj.sleep_status == "disable") {
-				document.getElementById("sleep_status").selectedIndex = "1";
+			if(obj.sleep_status == "enable" || obj.sleep_status == "car_off" || obj.sleep_status == "disable") {
+				document.getElementById("sleep_status").value = obj.sleep_status;
 			}
 
 			if ("mqtt_tx_en" in obj) {
@@ -3206,6 +3205,7 @@ function loadAutoTable(jsonData) {
             document.getElementById("sleep_volt_value").textContent = obj.sleep_volt;
             document.getElementById("sleep_time").value = obj.sleep_time;
             document.getElementById('sleep_time_value').textContent = obj.sleep_time;
+            toggleSleepVoltageEnabled();
 			document.getElementById("batt_alert").value = obj.batt_alert;
 			document.getElementById("batt_alert_ssid").value = obj.batt_alert_ssid;
 			document.getElementById("batt_alert_pass").value = obj.batt_alert_pass;

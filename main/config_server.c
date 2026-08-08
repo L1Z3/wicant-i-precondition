@@ -1000,6 +1000,16 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 		cJSON_AddStringToObject(root, "batt_voltage", volt);
 	}
 
+	{
+		char on_volt[12] = {0};
+		float on_voltage = 0;
+		if (sleep_mode_get_on_voltage(&on_voltage) == 1)
+			snprintf(on_volt, sizeof(on_volt), "%.1fV", on_voltage);
+		else
+			strlcpy(on_volt, "N/A", sizeof(on_volt));
+		cJSON_AddStringToObject(root, "on_voltage", on_volt);
+	}
+
 	char uptime_str[32];
 	dev_status_format_uptime(uptime_str, sizeof(uptime_str));
 	if(uptime_str[0] == '\0')
