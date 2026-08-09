@@ -1127,7 +1127,6 @@ void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
 fwd_result_t precondition_fwd_hook(twai_message_t *to_send, can_bus_t fwd_bus) {
     return sm_fwd(&precon_sm, to_send, fwd_bus);
 }
-}
 
 bool precondition_get_battery_temperature(precondition_temperature_t *out) {
     if (out == NULL || battery_temperature_queue == NULL) {
