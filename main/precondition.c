@@ -48,6 +48,10 @@ static void set_0x4e8_distance_flag(twai_message_t *packet, uint16_t distance_in
 static bool precondition_requested = false;
 // is the BMU managing preconditioning?
 static bool precondition_BMU_managed = false;
+// is there a known condition (e.g. high batt temp) blocking preconditioning?
+// bitwise-boolean, with smallest bit equal to batt temp blocking
+// add notes here if other conditions are added
+static uint8_t precondition_blocked = 0U;
 // is the car currently in READY? tracked from the 0x038 power status frame
 static bool car_in_ready = false;
 // is the power status frame available? false until we receive a 0x038 frame,
@@ -521,6 +525,13 @@ void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
         };
 
         xQueueOverwrite(battery_temperature_queue, &temperature);
+
+        if (temperature.min_c >= PRECONDITION_BATTERY_TEMPERATURE_SETPOINT) {
+            precondition_blocked |= 0b00000001U;
+        } else {
+            precondition_blocked &= 0b11111110U;
+        }
+
     }
 
     // car off ends the session. persistent mode keeps BMU_managed set so the
@@ -638,22 +649,13 @@ void precondition_tick(void) {
         // if we don't have status messages, we still want to stop displaying the UI after 70 seconds
         precondition_started_confirmed = true;
     }
-    
-    if (precondition_requested) {
-        // could possibly be more efficient
-        // alternate design: upon read in precondition_can_rx_hook(), update a 
-        // precondition_blocked state
-        precondition_temperature_t battery_temperature;  
-        if (precondition_get_battery_temperature(battery_temperature)) {
-            if (battery_temperature.min_c > PRECONDITION_BATTERY_TEMPERATURE_SETPOINT) {
-                // too hot to try; fail fast
-                precondition_start_ticks_remaining = 0U;
-                stop_preconditioning(now);
-                // TODO(trh): send clear error message here
-            }
-        }
+
+    if (precondition_requested && precondition_blocked) {
+        // to hot to try; fail fast
+        precondition_start_ticks_remaining = 0U;
+        stop_preconditioning(now);
+        // TODO(trh): add clear error message for the user here
     }
-                
 
     // while the BMU is managing preconditioning, periodically re-send the start
     // burst so preconditioning is re-requested if it got dropped
