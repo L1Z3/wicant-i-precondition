@@ -415,11 +415,14 @@ static int8_t cached_precon_press_type(void) {
 // toggle preconditioning on an activation event, with debounce between start and stop
 static void toggle_preconditioning(void) {
     int64_t now = now_us();
-    if (!precondition_requested) {
+    // if preconditioning is either actively requested or BMU managed, the activation 
+    // button should cancel it, not request it again
+    if (!precondition_requested && !precondition_BMU_managed) {
         start_preconditioning(now);
     } else if (ts_elapsed(now, precondition_requested_ts) > PRECONDITION_DEBOUNCE_US) {
         stop_preconditioning(now);
     }
+    // TODO(trh) we should handle the else case with an error message
 }
 
 int32_t ts_car_start(void) {
@@ -463,11 +466,13 @@ void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
         status_frame_available = true;
 
         uint8_t status = to_push->data[1];
+        // check if preconditioning is starting
         if (precondition_requested && !precondition_starting_confirmed) {
             if (STATUS_STARTING(status) || STATUS_STARTED(status)) {
                 precondition_starting_confirmed = true;
             }
         }
+        // check if preconditioning started
         if (precondition_requested && !precondition_started_confirmed) {
             if (STATUS_STARTED(status)) {
                 precondition_started_confirmed = true;
@@ -495,7 +500,7 @@ void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
                 }
             }
         }
-        if (!precondition_requested && !precondition_stop_confirmed && !precondition_BMU_managed && precondition_stop_ticks_remaining == 0U) {
+        if (!precondition_requested && !precondition_stop_confirmed && precondition_stop_ticks_remaining == 0U) {
             if (STATUS_IDLE(status)) {
                 precondition_stop_confirmed = true;
             }
