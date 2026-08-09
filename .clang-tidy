@@ -1,0 +1,33 @@
+# clang-tidy configuration for wicant-i-precondition firmware.
+#
+# Sources are C (gnu17) compiled by xtensa-elf-gcc; clang-tidy runs against a
+# sanitized compile database (see tools/clang-tidy/) and only analyzes this
+# repo's sources under main/ and components/.
+#
+# Bug-finding and readability checks that catch real problems in embedded C.
+# The big noise sources are disabled on purpose: every sprintf/strcpy in the
+# firmware trips security.insecureAPI.* (~200 findings), and the optin module
+# is host-oriented. If a check fires too often in code you own, prefer a
+# targeted suppression (// NOLINT, or a per-check exclusion below) over turning
+# off the whole family.
+Checks: >-
+  -*,
+  bugprone-*,
+  clang-analyzer-*,
+  performance-*,
+  portability-*,
+  readability-misleading-indentation,
+  readability-redundant-control-flow,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-switch-missing-default-case,
+  -clang-analyzer-optin.*,
+  -clang-analyzer-security.insecureAPI.*,
+  -misc-include-cleaner,
+  -portability-restrict-system-includes,
+
+WarningsAsErrors: ''
+HeaderFilterRegex: ''
+FormatStyle: none
+User: ''
+CheckOptions: { }

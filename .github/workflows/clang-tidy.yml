@@ -1,0 +1,62 @@
+name: clang-tidy lint
+
+# Static analysis of the project's own sources (main/ + components/) with
+# clang-tidy, against a sanitized copy of the build's compile database.
+# Uses the same vendored esp-idf submodule + ESP-IDF toolchain cache as
+# build-firmware.yml, but only needs the `custom` variant (both variants share
+# all sources; sdkconfig deltas don't affect lint checks).
+#
+# The job FAILS on any finding. The current tree has ~63 pre-existing findings
+# (mostly real bugs: null-deref, uninitialized args, integer overflow); work
+# them down rather than relaxing .clang-tidy wholesale.
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+      - wip-needs-review
+
+concurrency:
+  group: clang-tidy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  clang-tidy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with esp-idf submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Cache ESP-IDF tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.espressif
+          key: espressif-${{ runner.os }}-esp32s3-${{ hashFiles('esp-idf/tools/tools.json') }}
+          restore-keys: |
+            espressif-${{ runner.os }}-esp32s3-
+
+      - name: Install ESP-IDF (esp32s3 toolchain)
+        run: ./esp-idf/install.sh esp32s3
+
+      - name: Install clang-tidy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-tidy
+
+      - name: Run clang-tidy
+        run: |
+          . ./esp-idf/export.sh
+          ./lint.sh custom
+
+      - name: Upload clang-tidy report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clang-tidy-report
+          path: build.custom/tidy/report.txt
+          if-no-files-found: warn
