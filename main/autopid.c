@@ -1238,6 +1238,11 @@ void parse_elm327_response(char *buffer, response_t *response) {
         data_start = strchr(frame, ' ');
         if (data_start != NULL) {
             int header_length = data_start - frame;
+            if (header_length <= 0 || header_length > 8) {
+                ESP_LOGW(TAG, "Unexpected header length: %d, skipping frame", header_length);
+                frame = strtok(NULL, "\r\n");
+                continue;
+            }
             char header_str[9] = {0};
             strncpy(header_str, frame, header_length);
             uint32_t current_header = strtoul(header_str, NULL, 16);
@@ -1262,7 +1267,12 @@ void parse_elm327_response(char *buffer, response_t *response) {
 
             // Handle different header formats
             switch (header_length) {
-                case 2: 
+                case 2:
+                    if (strlen(data_start) < 9) {
+                        ESP_LOGW(TAG, "Frame too short for 2-byte header adjustment, skipping");
+                        frame = strtok(NULL, "\r\n");
+                        continue;
+                    }
                     data_start += 9;
                     ESP_LOGV(TAG, "2-byte header format: Adjusted data_start by 9");
                     break;

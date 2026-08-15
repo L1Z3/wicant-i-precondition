@@ -63,7 +63,7 @@ static void uart_rx_task(void *arg)
 //                    uart_read_bytes(UART_NUM_0, dtmp, event.size, portMAX_DELAY);
 //                    //ESP_LOGI(TAG, "[DATA EVT]:");
 //                    uart_write_bytes(UART_NUM_0, (const char*) dtmp, event.size);
-						rx_buffer.usLen = uart_read_bytes(UART_NUM_0, rx_buffer.ucElement, RX_BUF_SIZE, 1 / portTICK_PERIOD_MS);
+						rx_buffer.usLen = uart_read_bytes(UART_NUM_0, rx_buffer.ucElement, sizeof(rx_buffer.ucElement), 1 / portTICK_PERIOD_MS);
 						rx_buffer.dev_channel = DEV_UART;
 						if(rx_buffer.usLen > 0)
 						{

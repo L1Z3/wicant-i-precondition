@@ -676,6 +676,8 @@ static esp_err_t load_pid_auto_config_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
+    buf[file_size] = '\0';
+
     // Find the last closing brace and terminate the string there
     char *last_brace = strrchr(buf, '}');
     if (last_brace != NULL) {
@@ -1112,32 +1114,40 @@ static esp_err_t ws_handler(httpd_req_t *req)
     }
 //    ESP_LOGI(TAG, "frame len is %d", ws_pkt.len);
 
-    if (ws_pkt.len)
+    if (ws_pkt.len == 0)
     {
-        /* ws_pkt.len + 1 is for NULL termination as we are expecting a string */
-        buf = calloc(1, ws_pkt.len + 1);
-        if (buf == NULL)
-        {
-            ESP_LOGE(TAG, "Failed to calloc memory for buf");
-            return ESP_ERR_NO_MEM;
-        }
-        ws_pkt.payload = buf;
-        /* Set max_len = ws_pkt.len to get the frame payload */
-        ret = httpd_ws_recv_frame(req, &ws_pkt, ws_pkt.len);
-        if (ret != ESP_OK)
-        {
-            ESP_LOGE(TAG, "httpd_ws_recv_frame failed with %d", ret);
-            free(buf);
-            return ret;
-        }
-//        ESP_LOGI(TAG, "Got packet with message: %s", ws_pkt.payload);
+        return ESP_OK;
     }
+
+    /* ws_pkt.len + 1 is for NULL termination as we are expecting a string */
+    buf = calloc(1, ws_pkt.len + 1);
+    if (buf == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to calloc memory for buf");
+        return ESP_ERR_NO_MEM;
+    }
+    ws_pkt.payload = buf;
+    /* Set max_len = ws_pkt.len to get the frame payload */
+    ret = httpd_ws_recv_frame(req, &ws_pkt, ws_pkt.len);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "httpd_ws_recv_frame failed with %d", ret);
+        free(buf);
+        return ret;
+    }
+//    ESP_LOGI(TAG, "Got packet with message: %s", ws_pkt.payload);
 //    ESP_LOGI(TAG, "Packet type: %d", ws_pkt.type);
 
     static xdev_buffer rx_buffer;
-    memcpy(rx_buffer.ucElement, ws_pkt.payload, ws_pkt.len);
+    size_t copy_len = ws_pkt.len;
+    if (copy_len > DEV_BUFFER_LENGTH)
+    {
+        copy_len = DEV_BUFFER_LENGTH;
+        ESP_LOGW(TAG, "websocket frame too large: %d bytes, truncating to %d", (int)ws_pkt.len, DEV_BUFFER_LENGTH);
+    }
+    memcpy(rx_buffer.ucElement, ws_pkt.payload, copy_len);
     rx_buffer.dev_channel = DEV_WIFI_WS;
-    rx_buffer.usLen = ws_pkt.len;
+    rx_buffer.usLen = (int)copy_len;
 
     xQueueSend( *xRX_Queue, ( void * ) &rx_buffer, portMAX_DELAY );
 //    ws_send(rsp_arg, &ws_pkt);

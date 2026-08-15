@@ -176,6 +176,15 @@ static void can_tx_task(void *pvParameters)
 		memset(ucTCP_RX_Buffer.ucElement,0, DEV_BUFFER_LENGTH);
 		xQueueReceive(xMsg_Rx_Queue, &ucTCP_RX_Buffer, portMAX_DELAY);
 
+		if (ucTCP_RX_Buffer.usLen < 0)
+		{
+			ucTCP_RX_Buffer.usLen = 0;
+		}
+		else if (ucTCP_RX_Buffer.usLen > DEV_BUFFER_LENGTH)
+		{
+			ucTCP_RX_Buffer.usLen = DEV_BUFFER_LENGTH;
+		}
+
 		dev_status_wait_for_bits(DEV_AWAKE_BIT, portMAX_DELAY);
 
 		ESP_LOGI(TAG, "----------");
