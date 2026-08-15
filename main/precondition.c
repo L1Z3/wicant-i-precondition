@@ -84,6 +84,8 @@ static bool activation_long_press_fired = false;
 static bool status_frame_available = false;
 
 static QueueHandle_t battery_temperature_queue = NULL;
+static QueueHandle_t precondition_state_queue = NULL;
+static QueueHandle_t precondition_toggle_queue = NULL;
 
 typedef enum {
     // frame carries the current button state: pressed while (byte & mask) == value
@@ -235,9 +237,47 @@ static int64_t ts_elapsed(int64_t now, int64_t old) {
     return now - old;
 }
 
+static void push_precondition_state(void);
+
 void precondition_init(void) {
     battery_temperature_queue = xQueueCreate(1, sizeof(precondition_temperature_t));
     configASSERT(battery_temperature_queue != NULL);
+    precondition_state_queue = xQueueCreate(1, sizeof(precondition_state_t));
+    configASSERT(precondition_state_queue != NULL);
+    precondition_toggle_queue = xQueueCreate(1, sizeof(uint8_t));
+    configASSERT(precondition_toggle_queue != NULL);
+    push_precondition_state();
+}
+
+// push the current state into the queue so the web UI can read it with xQueuePeek
+static void push_precondition_state(void) {
+    if (precondition_state_queue == NULL) {
+        return;
+    }
+    precondition_state_t state = {
+        .requested = precondition_requested,
+        .started_confirmed = precondition_started_confirmed,
+        .BMU_managed = precondition_BMU_managed,
+    };
+    xQueueOverwrite(precondition_state_queue, &state);
+}
+
+// web UI polls this with xQueuePeek to display preconditioning status
+bool precondition_get_state(precondition_state_t *out) {
+    if (out == NULL || precondition_state_queue == NULL) {
+        return false;
+    }
+    return xQueuePeek(precondition_state_queue, out, 0) == pdTRUE;
+}
+
+// called from the web UI (http server task); hand off to the CAN task via a
+// queue so the precondition globals stay single-writer (see main.c can_rx_task)
+void precondition_toggle_request(void) {
+    if (precondition_toggle_queue == NULL) {
+        return;
+    }
+    uint8_t cmd = 1;
+    xQueueOverwrite(precondition_toggle_queue, &cmd);
 }
 
 static void send_precondition_start_msg(uint8_t ticks_remaining) {
@@ -372,6 +412,7 @@ static void start_preconditioning(int64_t now) {
     if(cached_precon_mode() != ONCE) {
         precondition_BMU_managed = true;
     }
+    push_precondition_state();
 }
 
 static void stop_managing_preconditioning(int64_t now) {
@@ -388,6 +429,7 @@ static void stop_managing_preconditioning(int64_t now) {
     // keep track of whether we expect preconditioning
     // to spontanouesly restart itself.
     precondition_BMU_managed = true;
+    push_precondition_state();
 }
 
 // fully reset to idle without sending stop messages: the car being off already
@@ -405,6 +447,7 @@ static void stop_preconditioning(int64_t now) {
     precondition_stop_ticks_remaining = PRECONDITION_STOP_TICKS;
     precondition_keepalive_ticks_remaining = 0U;
     precondition_BMU_managed = false;
+    push_precondition_state();
 }
 
 // Cache the configured activation button type. A config change restarts the
@@ -569,10 +612,19 @@ void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
         activation_button_state_prev = false;
     }
 
+    push_precondition_state();
 }
 
 // called every 40ms
 void precondition_tick(void) {
+    // web UI toggle requests are handled here, on the CAN task, so the
+    // precondition globals stay single-writer
+    uint8_t toggle_cmd = 0;
+    if (precondition_toggle_queue != NULL
+            && xQueueReceive(precondition_toggle_queue, &toggle_cmd, 0) == pdTRUE) {
+        toggle_preconditioning();
+    }
+
     int64_t now = now_us();
     int64_t time_since_last_attempt = ts_elapsed(now, precondition_last_attempt_ts);
 
@@ -662,6 +714,8 @@ void precondition_tick(void) {
         send_precondition_stop_msg(precondition_stop_ticks_remaining);
         precondition_stop_ticks_remaining--;
     }
+
+    push_precondition_state();
 }
 
 bool precondition_get_battery_temperature(precondition_temperature_t *out) {
