@@ -46,8 +46,19 @@ static void set_0x4e8_distance_flag(twai_message_t *packet, uint16_t distance_in
 
 // is the user currently requesting preconditioning to be active?
 static bool precondition_requested = false;
-// is the BMU managing preconditioning? 
+// is the BMU managing preconditioning?
 static bool precondition_BMU_managed = false;
+// is the car currently in READY? tracked from the 0x038 power status frame
+static bool car_in_ready = false;
+// is the power status frame available? false until we receive a 0x038 frame,
+// so platforms that don't broadcast it never enforce the READY gate
+static bool power_status_available = false;
+// timestamp of when the car last entered READY (0 if never seen)
+static int64_t car_ready_ts = 0;
+// timestamp of the last keepalive start burst while the BMU is managing
+static int64_t precondition_keepalive_ts = 0;
+// ticks remaining in the current keepalive start burst
+static uint8_t precondition_keepalive_ticks_remaining = 0U;
 // timestamp of when the user requested preconditioning
 static int64_t precondition_requested_ts = 0U;
 // timestamp of last attempt to send precondition message, used for retry logic
@@ -176,25 +187,13 @@ static bool activation_is_release(const message_payload_t *msg, const twai_messa
     (((status_byte) & STATUS_MASK) == 0x15U)
 
 #define IS_POWER_STATUS_FRAME(frame_id) \
-    ((frame_id == 0x038U))
+    ((frame_id) == 0x038U)
 
 // unclear if this is necessary and sufficient
 // #define POWER_STATUS_MASK 0b00000100U
 #define POWER_STATUS_MASK 0x0F
 #define POWER_STATUS_READY(power_status_byte) \
     (((power_status_byte) & POWER_STATUS_MASK) == 0x04U)
-
-#define IS_CAR_START_FRAME(frame_id) \
-    ((frame_id == 0x039U))
-
-// unclear if this is necessary and sufficient
-// #define CAR_START_MASK 0b00001001U
-#define CAR_START_MASK 0x0F
-#define CAR_STARTING(car_start_byte) \
-    (((car_start_byte) & CAR_START_MASK) == 0x09U)
-
-#define CAR_START_TICKS 4U // 4x 0x09 on frame 0x039
-#define CAR_START_WAIT_US 8000000U  // 8 seconds
 
 #define PRECONDITION_DEBOUNCE_US 1000000U  // 1 second
 #define PRECONDITION_LONG_PRESS_US 1000000U  // short/long press threshold: 1 second
@@ -207,6 +206,8 @@ static bool activation_is_release(const message_payload_t *msg, const twai_messa
 #define PRECONDITION_RETRY_US 10000000U  // 10 seconds
 #define PRECONDITION_MAX_RETRIES 4U
 #define PRECONDITION_STARTED_TIMEOUT_US 70000000U  // 70 seconds
+#define PRECONDITION_RESTART_WINDOW_US 8000000U  // persistent mode: re-request within 8 seconds of the car entering READY
+#define PRECONDITION_KEEPALIVE_US 300000000U  // 5 minutes between keepalive start bursts while the BMU is managing
 
 #define BATTERY_TEMPERATURE_FRAME_ID 0x152U
 #define BATTERY_TEMPERATURE_MIN_INDEX 0U
@@ -352,6 +353,12 @@ static int8_t cached_precon_mode(void) {
     return precon_mode;
 }
 
+// treat the car as in READY while the power status frame has never been seen,
+// so platforms without a decodable 0x038 keep the pre-power-tracking behavior
+static bool car_ready_or_unknown(void) {
+    return !power_status_available || car_in_ready;
+}
+
 static void start_preconditioning(int64_t now) {
     precondition_requested = true;
     precondition_requested_ts = now;
@@ -360,6 +367,8 @@ static void start_preconditioning(int64_t now) {
     precondition_starting_confirmed = false;
     precondition_started_confirmed = false;
     precondition_retries = 0U;
+    precondition_keepalive_ts = now;
+    precondition_keepalive_ticks_remaining = 0U;
     if(cached_precon_mode() != ONCE) {
         precondition_BMU_managed = true;
     }
@@ -371,12 +380,21 @@ static void stop_managing_preconditioning(int64_t now) {
     // confirm stop so retry logic doesn't run
     precondition_stop_confirmed = true;
     precondition_retries = 0U;
-    // this just doesn't attempt to stop preconditoning 
+    // this just doesn't attempt to stop preconditoning
     // and lets the BMU do what it wants once it reaches temp
     precondition_stop_ticks_remaining = 0U;
-    // keep track of whether we expect preconditioning 
+    // schedule the next keepalive burst relative to this handoff
+    precondition_keepalive_ts = now;
+    // keep track of whether we expect preconditioning
     // to spontanouesly restart itself.
     precondition_BMU_managed = true;
+}
+
+// fully reset to idle without sending stop messages: the car being off already
+// ended preconditioning, so there's nothing to stop on the bus
+static void abandon_preconditioning(int64_t now) {
+    stop_managing_preconditioning(now);
+    precondition_BMU_managed = false;
 }
 
 static void stop_preconditioning(int64_t now) {
@@ -385,6 +403,7 @@ static void stop_preconditioning(int64_t now) {
     precondition_stop_confirmed = false;
     precondition_retries = 0U;
     precondition_stop_ticks_remaining = PRECONDITION_STOP_TICKS;
+    precondition_keepalive_ticks_remaining = 0U;
     precondition_BMU_managed = false;
 }
 
@@ -415,46 +434,29 @@ static int8_t cached_precon_press_type(void) {
 // toggle preconditioning on an activation event, with debounce between start and stop
 static void toggle_preconditioning(void) {
     int64_t now = now_us();
-    // if preconditioning is either actively requested or BMU managed, the activation 
+    // if preconditioning is either actively requested or BMU managed, the activation
     // button should cancel it, not request it again
     if (!precondition_requested && !precondition_BMU_managed) {
-        start_preconditioning(now);
+        // reject activation while the car isn't in READY, but only once the
+        // power status frame has actually been seen on this platform
+        if (car_ready_or_unknown()) {
+            start_preconditioning(now);
+        }
     } else if (ts_elapsed(now, precondition_requested_ts) > PRECONDITION_DEBOUNCE_US) {
         stop_preconditioning(now);
     }
     // TODO(trh) we should handle the else case with an error message
 }
 
-int32_t ts_car_start(void) {
-    static uint8_t ticks = 0; 
-    static int32_t ts_start = 0;
-    if (ticks == 0) {
-        ts_start = now_us();
-    }
-    ticks++;
-    if ((ticks > CAR_START_TICKS) && (ts_elapsed(now_us(), ts_start) > CAR_START_WAIT_US)) {
-        // this is a new car start
-        ticks = 0;
-        ts_start = now_us();
-    }
-    return ts_start;
-}
-
 void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
-    // cache button mode
-    static bool car_start_signal = false;
-    if (IS_CAR_START_FRAME(to_push->identifier)) {
-        car_start_signal = CAR_STARTING(to_push->data[0]);
-    }
-    static bool car_in_ready = false;
+    int64_t now = now_us();
     if (IS_POWER_STATUS_FRAME(to_push->identifier)) {
-         car_in_ready = POWER_STATUS_READY(to_push->data[0]);
-    }
-    static int32_t ts_start = 0;
-    // moved this here as it's increasingly commonly used
-    int32_t now = now_us();
-    if (car_start_signal) {
-        ts_start = ts_car_start();
+        power_status_available = true;
+        bool ready = POWER_STATUS_READY(to_push->data[0]);
+        if (ready && !car_in_ready) {
+            car_ready_ts = now;
+        }
+        car_in_ready = ready;
     }
     // 0x2AD/0x0A82AA03 status frame: second byte indicates precondition state
     //   Ioniq 5/6: 0x01 = off/idle, 0x05 = starting, 0x15 = fully running
@@ -519,19 +521,24 @@ void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
         xQueueOverwrite(battery_temperature_queue, &temperature);
     }
 
-    // clean up preconditioning interrupted by car off
-    // does not handle interruptions due to nav in non-MITM
-    // or other unknown interruptions
-    // would be good to reset precondition_BMU_managed if batt temp
-    // falls below 21C, as that's a clear sign the BMU is no longer managing
-    if (precondition_BMU_managed && precondition_requested && !car_in_ready) {
-        stop_managing_preconditioning(now);
+    // car off ends the session. persistent mode keeps BMU_managed set so the
+    // restart below re-requests on the next READY; continuous mode drops
+    // management entirely so the keepalive can't restart it next drive. other
+    // interruptions (e.g. nav in non-MITM) are re-requested by the keepalive burst
+    if (precondition_BMU_managed && !car_ready_or_unknown()) {
+        if (cached_precon_mode() != PERSISTENT) {
+            abandon_preconditioning(now);
+        } else if (precondition_requested) {
+            stop_managing_preconditioning(now);
+        }
     }
-    // if car is in ready and preconditioning isn't requested, request it
-    // requires manual activation after WiCAN power cycle
-    // HANDLE CAR OFF WITH precondition_requested STILL HIGH
-    if (cached_precon_mode() == PERSISTENT && precondition_BMU_managed && !precondition_requested && car_in_ready && (ts_start > 0) && (ts_elapsed(now, ts_start) < CAR_START_WAIT_US)) {
-        toggle_preconditioning();
+    // persistent mode: if the BMU was managing preconditioning when the car shut
+    // off, re-request it shortly after the car comes back to READY.
+    // TODO(ejones): requires manual activation after WiCAN power cycle (can be fixed by saving to flash)
+    if (cached_precon_mode() == PERSISTENT && precondition_BMU_managed && !precondition_requested
+            && car_in_ready && car_ready_ts > 0
+            && ts_elapsed(now, car_ready_ts) < PRECONDITION_RESTART_WINDOW_US) {
+        start_preconditioning(now);
     }
 
     int8_t precon_button_type = cached_precon_button_type();
@@ -630,10 +637,24 @@ void precondition_tick(void) {
         precondition_started_confirmed = true;
     }
 
+    // while the BMU is managing preconditioning, periodically re-send the start
+    // burst so preconditioning is re-requested if it got dropped
+    if (precondition_BMU_managed && !precondition_requested && car_ready_or_unknown()
+            && ts_elapsed(now, precondition_keepalive_ts) > PRECONDITION_KEEPALIVE_US) {
+        precondition_keepalive_ts = now;
+        precondition_keepalive_ticks_remaining = PRECONDITION_START_TICKS;
+    }
+
     // send initial burst of start messages
     if (precondition_requested && precondition_start_ticks_remaining > 0U) {
         send_precondition_start_msg(precondition_start_ticks_remaining);
         precondition_start_ticks_remaining--;
+    }
+
+    // send keepalive burst of start messages
+    if (!precondition_requested && precondition_keepalive_ticks_remaining > 0U) {
+        send_precondition_start_msg(precondition_keepalive_ticks_remaining);
+        precondition_keepalive_ticks_remaining--;
     }
 
     // send initial burst of stop messages
