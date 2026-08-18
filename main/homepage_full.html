@@ -1403,12 +1403,6 @@
             document.getElementById("submit_button").disabled = true;
 
             syncPreconButtonToggle();
-
-            // Refresh the preconditioning indicators without touching the rest
-            // of the config form (checkStatus() also writes to form inputs).
-            if (!window._preconditionStatusTimer) {
-                window._preconditionStatusTimer = setInterval(refreshPreconditionStatus, 5000);
-            }
         });
 
         // If the currently selected button is one of the extra options, show
@@ -2612,21 +2606,6 @@ function loadAutoTable(jsonData) {
 			} else if(document.getElementById("mqtt_en").value == "disable") {
 				document.getElementById("mqtt_en_div").style.display = "none";
 			}
-		};
-		xhttp.open("GET", "/check_status");
-		xhttp.send();
-	}
-
-	// Lightweight poll for the preconditioning status displays only. Unlike
-	// checkStatus(), this never writes to form inputs, so it is safe to run on
-	// an interval without clobbering unsaved edits.
-	function refreshPreconditionStatus() {
-		const xhttp = new XMLHttpRequest();
-		xhttp.onload = function() {
-			var obj = JSON.parse(this.responseText);
-			document.getElementById("precondition_requested_status").textContent = obj.precondition_requested ? "Yes" : "No";
-			document.getElementById("precondition_active_status").textContent = obj.precondition_started_confirmed ? "Yes" : "No";
-			document.getElementById("precondition_bmu_managed_status").textContent = obj.precondition_bmu_managed ? "Yes" : "No";
 		};
 		xhttp.open("GET", "/check_status");
 		xhttp.send();
