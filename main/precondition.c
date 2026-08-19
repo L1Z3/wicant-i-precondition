@@ -220,7 +220,7 @@ enum {
     EV_STATUS_STARTING, // car reports preconditioning starting
     EV_STATUS_STARTED,  // car reports preconditioning fully running
     EV_CAR_READY,       // car power entered READY (0x038 edge)
-    EV_CAR_OFF,         // car power left READY (0x038 edge)
+    EV_CAR_NOT_READY,   // car power left READY (0x038 edge)
 };
 
 static const sm_state_t S_IDLE, S_REQUESTED, S_CAR_START_DELAY, S_START_BURST,
@@ -598,7 +598,7 @@ static bool requested_event(sm_t *sm, sm_event_t ev) {
                 sm_transition(sm, &S_STOPPING);
             }
             return true;
-        case EV_CAR_OFF:
+        case EV_CAR_NOT_READY:
             // the car turning off already ended preconditioning: abandon the
             // session silently; there is nothing left to stop on the bus
             if (config_server_precon_mode() == PERSISTENT && repeating_mode_enabled()) {
@@ -827,7 +827,7 @@ static bool managed_event(sm_t *sm, sm_event_t ev) {
             }
             return true;
     }
-    // EV_TOGGLE and EV_CAR_OFF bubble to REQUESTED
+    // EV_TOGGLE and EV_CAR_NOT_READY bubble to REQUESTED
     return false;
 }
 
@@ -846,7 +846,7 @@ static bool stopping_event(sm_t *sm, sm_event_t ev) {
             // activation while stopping restarts preconditioning
             sm_transition(sm, &S_REQUESTED);
             return true;
-        case EV_CAR_OFF:
+        case EV_CAR_NOT_READY:
             // the car turning off ended preconditioning anyway; abandon the stop
             sm_transition(sm, &S_IDLE);
             return true;
@@ -1019,7 +1019,7 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
         if (ready != platform.car_in_ready) {
             platform.car_in_ready = ready;
             ESP_LOGI(TAG, "car power: %s", ready ? "ready" : "off");
-            sm_send_event(sm, ready ? EV_CAR_READY : EV_CAR_OFF);
+            sm_send_event(sm, ready ? EV_CAR_READY : EV_CAR_NOT_READY);
         }
     }
 
