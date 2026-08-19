@@ -462,13 +462,16 @@ static void run_persistent(void) {
     // manual start mirrors the latch to flash
     toggle();
     expect_state("start-burst");
+    CHECK(!fake_nvs_exists);                    // the flash mirror trails by one tick
+    tick1();
     CHECK(fake_nvs_exists && fake_nvs_value == 1);
-    for (int i = 0; i < 6; i++) tick1();
+    for (int i = 0; i < 5; i++) tick1();
     car_status(0x05, CAN_BUS_0);
     car_status(0x15, CAN_BUS_0);
     expect_state("managed");
 
     // car off: the session survives in MANAGED, latch stays in flash
+    unsigned int commits_before = fake_nvs_commit_count;
     car_power(false);
     expect_state("managed");
     CHECK(fake_nvs_value == 1);
@@ -500,12 +503,25 @@ static void run_persistent(void) {
     car_status(0x15, CAN_BUS_0);
     expect_state("managed");
 
+    // BMU stops: the 5-minute re-nudge re-enters REQUESTED; neither it nor the
+    // relaunch above may touch flash (since the commit happens in the tick)
+    car_status(0x01, CAN_BUS_0);
+    advance_until_state("start-burst", 302000000LL);
+    CHECK(requested.kind == ATTEMPT_PERIODIC);
+    for (int i = 0; i < 6; i++) tick1();
+    car_status(0x05, CAN_BUS_0);
+    car_status(0x15, CAN_BUS_0);
+    expect_state("managed");
+    CHECK(fake_nvs_commit_count == commits_before);
+
     // toggle off from managed clears the flash latch and stops actively
     fake_now += 2000000;
     toggle();
     expect_state("stop-burst");
-    CHECK(fake_nvs_value == 0);
-    for (int i = 0; i < 6; i++) tick1();
+    CHECK(!repeating_enabled);
+    tick1();
+    CHECK(fake_nvs_value == 0);                 // clear flushed on the next tick
+    for (int i = 0; i < 5; i++) tick1();
     expect_state("wait-stopped");
     car_status(0x01, CAN_BUS_0);
     expect_state("idle");
@@ -521,8 +537,14 @@ static void run_persistent_restore(void) {
     fake_nvs_exists = true;
     fake_nvs_value = 1;
     precondition_init();
-    expect_state("idle");
-    CHECK(fwd(0x0C7, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);  // no MITM before ready
+    expect_state("managed");                    // restored latch parks in MANAGED
+    CHECK(fwd(0x0C7, CAN_BUS_0, NULL) == FWD_BLOCK);  // MITM guards the latch from boot
+    // no nudges before the car is ready
+    sent_count = 0;
+    car_status(0x01, CAN_BUS_0);
+    advance_us(310000000LL);
+    CHECK(sent_count == 0);
+    expect_state("managed");
     car_power(true);
     expect_state("car-start-delay");            // first ready edge starts the delay
     CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);  // no countdown before the try
@@ -537,21 +559,31 @@ static void run_persistent_restore(void) {
     car_status(0x05, CAN_BUS_0);
     car_status(0x15, CAN_BUS_0);
     expect_state("managed");
+    CHECK(fake_nvs_commit_count == 0);          // the restore itself never rewrites flash
 }
 
 static void run_persistent_disable_before_ready(void) {
     fake_nvs_exists = true;
     fake_nvs_value = 1;
     precondition_init();
-    expect_state("idle");
+    expect_state("managed");
 
+    // within the debounce window after boot the toggle is swallowed
     toggle();
-    expect_state("idle");
+    expect_state("managed");
+    CHECK(repeating_enabled);
+
+    fake_now += 2000000;
+    toggle();
+    expect_state("stop-burst");                 // disable = active stop, even before ready
     CHECK(!repeating_enabled);
-    CHECK(fake_nvs_value == 0);
+    tick1();
+    CHECK(fake_nvs_value == 0);                 // latch clear flushed to flash
+    for (int i = 0; i < 5; i++) tick1();
+    expect_state("idle");                       // no status frame ever seen: no wait
 
     car_power(true);
-    expect_state("idle");
+    expect_state("idle");                       // disabled: ready must not relaunch
 }
 
 static void run_persistent_write_retry(void) {
@@ -560,6 +592,7 @@ static void run_persistent_write_retry(void) {
 
     toggle();
     expect_state("start-burst");
+    tick1();
     CHECK(fake_nvs_value == 1);
 
     fake_now += 2000000;
@@ -567,15 +600,14 @@ static void run_persistent_write_retry(void) {
     toggle();
     expect_state("stop-burst");
     CHECK(!repeating_enabled);
-    CHECK(persistent_write_pending);
+    tick1();                                    // first flush attempt fails
+    CHECK(fake_nvs_commit_failures == 0);
     CHECK(fake_nvs_value == 1);                 // failed commit left flash stale
 
     advance_us(PRECONDITION_NVS_RETRY_US - 80000);
-    CHECK(persistent_write_pending);
-    CHECK(fake_nvs_value == 1);
-    advance_us(120000);
-    CHECK(!persistent_write_pending);
-    CHECK(fake_nvs_value == 0);
+    CHECK(fake_nvs_value == 1);                 // still inside the backoff
+    advance_us(160000);
+    CHECK(fake_nvs_value == 0);                 // retry landed
 
     car_power(true);
     expect_state("idle");                      // the stale enable cannot relaunch
@@ -584,19 +616,19 @@ static void run_persistent_write_retry(void) {
 static void run_persistent_write_retry_limit(void) {
     precondition_init();
     toggle();
+    tick1();
     CHECK(fake_nvs_value == 1);
 
     fake_now += 2000000;
     fake_nvs_commit_failures = PRECONDITION_NVS_MAX_RETRIES + 2U;
     toggle();
-    CHECK(persistent_write_pending);
-    CHECK(fake_nvs_value == 1);
 
+    // initial attempt + MAX_RETRIES retries, then the budget is spent
     advance_us((PRECONDITION_NVS_MAX_RETRIES + 1U) * PRECONDITION_NVS_RETRY_US);
-    CHECK(!persistent_write_pending);
-    CHECK(persistent_write_retries == PRECONDITION_NVS_MAX_RETRIES);
-    CHECK(fake_nvs_value == 1);
+    CHECK(persistent_save_failures == PRECONDITION_NVS_MAX_RETRIES + 1U);
+    CHECK(fake_nvs_value == 1);                 // flash left stale
     unsigned int failures_left = fake_nvs_commit_failures;
+    CHECK(failures_left == 1U);
 
     advance_us(2 * PRECONDITION_NVS_RETRY_US);
     CHECK(fake_nvs_commit_failures == failures_left);  // no writes after the cap

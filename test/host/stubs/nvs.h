@@ -18,6 +18,7 @@ static uint8_t fake_nvs_value = 0;
 static bool fake_nvs_write_pending = false;
 static uint8_t fake_nvs_pending_value = 0;
 static unsigned int fake_nvs_commit_failures = 0;
+static unsigned int fake_nvs_commit_count = 0;  // every nvs_commit call, failed or not
 
 static inline const char *esp_err_to_name(esp_err_t err) {
     (void)err;
@@ -51,6 +52,7 @@ static inline esp_err_t nvs_set_u8(nvs_handle_t handle, const char *key, uint8_t
 
 static inline esp_err_t nvs_commit(nvs_handle_t handle) {
     (void)handle;
+    fake_nvs_commit_count++;
     if (fake_nvs_commit_failures > 0U) {
         fake_nvs_commit_failures--;
         return 1;

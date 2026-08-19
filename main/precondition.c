@@ -377,56 +377,57 @@ static bool save_persistent_enabled(bool enabled) {
 // Latched toggle shared by the repeating modes; never set in once mode.
 // Continuous clears it when the car turns off; persistent mirrors it to flash
 // so it survives car restarts and WiCAN power cycles. Read/write only through
-// repeating_mode_enabled()/set_repeating_enabled() so the lazy flash load and
-// the flash mirror can't be bypassed.
+// repeating_mode_enabled()/set_repeating_enabled(). RAM is the source of
+// truth; flush_repeating_enabled (called from the global tick) commits it to
+// flash after the value's updated.
 static bool repeating_enabled = false;
-static bool persistent_write_pending = false;
-static int64_t persistent_retry_at = 0;
-static uint8_t persistent_write_retries = 0;
+static bool persistent_flash_mirror = false;  // last value confirmed committed
+static int64_t persistent_retry_at = 0;       // backoff deadline after a failed save
+static uint8_t persistent_save_failures = 0;  // consecutive failed saves of the current value
 
 // is a repeating mode enabled? i.e. are we in continuous/persistent mode,
 // with preconditioning toggled on?
 static bool repeating_mode_enabled(void) {
-    // seed lazily from flash: the config isn't loaded yet when
-    // precondition_init runs, and the mode decides whether the stored
-    // persistent toggle applies at all
+    // seeded from flash on first use
     static bool loaded = false;
     if (!loaded) {
         loaded = true;
         if (config_server_precon_mode() == PERSISTENT) {
             repeating_enabled = load_persistent_enabled();
+            persistent_flash_mirror = repeating_enabled;
         }
     }
     return repeating_enabled;
 }
 
-static void set_repeating_enabled(sm_t *sm, bool enabled) {
-    if (repeating_mode_enabled() == enabled && !persistent_write_pending) {
+static void set_repeating_enabled(bool enabled) {
+    if (repeating_mode_enabled() == enabled) {
         return;
     }
     repeating_enabled = enabled;
-    if (config_server_precon_mode() == PERSISTENT) {
-        persistent_write_pending = !save_persistent_enabled(enabled);
-        persistent_write_retries = 0U;
-        if (persistent_write_pending) {
-            persistent_retry_at = sm_now(sm) + PRECONDITION_NVS_RETRY_US;
-        }
-    } else {
-        persistent_write_pending = false;
-    }
+    // reset flash commit retry logic
+    persistent_save_failures = 0U;
+    persistent_retry_at = 0;
 }
 
-static void retry_persistent_write(sm_t *sm) {
-    if (!persistent_write_pending || sm_now(sm) < persistent_retry_at) {
+// mirror the latch to flash in persistent mode. failed saves retry on a
+// backoff until the budget for the current value is spent; a later value
+// change starts over
+static void flush_repeating_enabled(sm_t *sm) {
+    if (config_server_precon_mode() != PERSISTENT
+            || repeating_mode_enabled() == persistent_flash_mirror
+            || persistent_save_failures > PRECONDITION_NVS_MAX_RETRIES
+            || sm_now(sm) < persistent_retry_at) {
         return;
     }
-    persistent_write_retries++;
-    persistent_write_pending = !save_persistent_enabled(repeating_enabled);
-    if (persistent_write_pending) {
-        if (persistent_write_retries >= PRECONDITION_NVS_MAX_RETRIES) {
-            persistent_write_pending = false;
-            ESP_LOGE(TAG, "Giving up saving persistent preconditioning state after %u retries",
-                     persistent_write_retries);
+    if (save_persistent_enabled(repeating_enabled)) {
+        persistent_flash_mirror = repeating_enabled;
+        persistent_save_failures = 0U;
+    } else {
+        persistent_save_failures++;
+        if (persistent_save_failures > PRECONDITION_NVS_MAX_RETRIES) {
+            ESP_LOGE(TAG, "Giving up saving persistent preconditioning state after %u attempts",
+                     (unsigned)persistent_save_failures);
         } else {
             persistent_retry_at = sm_now(sm) + PRECONDITION_NVS_RETRY_US;
         }
@@ -559,27 +560,22 @@ static void start_timeout(sm_t *sm) {
 
 // ********************* IDLE *********************
 
+static void idle_enter(sm_t *sm) {
+    if (repeating_mode() && repeating_mode_enabled()) {
+        // the WiCAN just booted and restored persistent mode from flash
+        // => wait in MANAGED for car to boot
+        sm_transition(sm, &S_MANAGED);
+    }
+}
+
 static bool idle_event(sm_t *sm, sm_event_t ev) {
     switch (ev) {
         case EV_TOGGLE:
-            if (repeating_mode()) {
-                if (repeating_mode_enabled()) {
-                    // the WiCAN just booted, restored persistent mode from flash,
-                    // but the car hasn't become ready yet.
-                    // then, the user pressed the toggle => turn off repeating mode
-                    set_repeating_enabled(sm, false);
-                    return true;
-                }
-                set_repeating_enabled(sm, true);
-            }
             sm_transition(sm, &S_REQUESTED);
             return true;
         case EV_CAR_READY:
-            // persistent toggle was restored from flash at boot
-            // => wait for the car to finish coming up, then send the start burst
-            if (config_server_precon_mode() == PERSISTENT && repeating_mode_enabled()) {
-                sm_transition(sm, &S_CAR_START_DELAY);
-            }
+            // we only stay in idle during once mode, so nothing to do
+            // on car ready
             return true;
     }
     return false;
@@ -589,6 +585,9 @@ static bool idle_event(sm_t *sm, sm_event_t ev) {
 
 static void requested_enter(sm_t *sm) {
     requested.kind = (attempt_kind_t)sm_entry_arg(sm);
+    if (repeating_mode()) {
+        set_repeating_enabled(true);
+    }
 }
 
 static bool requested_event(sm_t *sm, sm_event_t ev) {
@@ -596,7 +595,6 @@ static bool requested_event(sm_t *sm, sm_event_t ev) {
         case EV_TOGGLE:
             // debounce between start and stop
             if (sm_time_in_us(sm, &S_REQUESTED) > PRECONDITION_DEBOUNCE_US) {
-                set_repeating_enabled(sm, false);
                 sm_transition(sm, &S_STOPPING);
             }
             return true;
@@ -610,7 +608,6 @@ static bool requested_event(sm_t *sm, sm_event_t ev) {
                 sm_transition(sm, &S_MANAGED);
             } else {
                 // reset continuous/once mode state
-                set_repeating_enabled(sm, false);
                 sm_transition(sm, &S_IDLE);
             }
             return true;
@@ -638,6 +635,12 @@ static fwd_result_t requested_fwd(sm_t *sm, twai_message_t *to_send, can_bus_t f
         return FWD_MODIFIED;
     }
     return FWD_PASSTHROUGH;
+}
+
+static void requested_exit(sm_t *sm) {
+    if (repeating_mode()) {
+        set_repeating_enabled(false);
+    }
 }
 
 // ********************* REQUESTED / CAR_START_DELAY *********************
@@ -841,9 +844,6 @@ static bool stopping_event(sm_t *sm, sm_event_t ev) {
     switch (ev) {
         case EV_TOGGLE:
             // activation while stopping restarts preconditioning
-            if (repeating_mode()) {
-                set_repeating_enabled(sm, true);
-            }
             sm_transition(sm, &S_REQUESTED);
             return true;
         case EV_CAR_OFF:
@@ -906,6 +906,7 @@ static bool wait_stopped_event(sm_t *sm, sm_event_t ev) {
 
 static const sm_state_t S_IDLE = {
     .name = "idle",
+    .enter = idle_enter,
     .event = idle_event,
 };
 
@@ -917,6 +918,7 @@ static const sm_state_t S_REQUESTED = {
     .enter = requested_enter,
     .event = requested_event,
     .fwd = requested_fwd,
+    .exit = requested_exit,
 };
 
 static const sm_state_t S_CAR_START_DELAY = {
@@ -994,7 +996,7 @@ static const sm_state_t S_WAIT_STOPPED = {
 // ********************* global hooks *********************
 
 static void precondition_global_tick(sm_t *sm) {
-    retry_persistent_write(sm);
+    flush_repeating_enabled(sm);
 
     // long press mode: trigger once when the hold crosses the threshold, without
     // waiting for the release frame. state only becomes pressed via the rx hook,
