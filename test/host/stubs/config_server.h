@@ -3,8 +3,9 @@
 #pragma once
 #include <stdint.h>
 
-#define CONTINUOUS 0
-#define ONCE 1
+#define ONCE 0
+#define CONTINUOUS 1
+#define PERSISTENT 2
 #define PRESS_SHORT 0
 #define PRESS_LONG 1
 #define BUTTON_DISABLED -1

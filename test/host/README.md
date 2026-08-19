@@ -19,7 +19,7 @@ test/host/
   support/
     test_support.h      fake clock, CHECK/CHECK_MSG, test_report()
   stubs/                minimal stand-ins for ESP-IDF / firmware headers
-    can.h  config_server.h  esp_log.h  esp_timer.h
+    can.h  config_server.h  esp_log.h  esp_timer.h  nvs.h
     driver/twai.h  freertos/FreeRTOS.h  freertos/queue.h
   test_hsm.c            state machine engine semantics
   test_precondition.c   precondition features
@@ -59,9 +59,13 @@ covers and exit 0 on success, non-zero on failure.
 
 ## Quirks worth knowing
 
-- `test_precondition` forks a child for the short-press mode: the firmware's
-  `cached_precon_*` helpers latch the config on first use, so each press mode
-  needs a fresh process. Run one mode directly with
-  `build/test_precondition short|long`.
+- `test_precondition` forks a child per suite: the firmware's
+  `cached_precon_*` helpers, the repeating-mode latch, and the platform
+  discovery flags all latch in static storage on first use, so each
+  mode/press combination needs a fresh process. Run one suite directly with
+  `build/test_precondition <name substring>` (e.g. `continuous`).
+- The `nvs.h` stub is an in-memory single-slot fake; tests seed and inspect
+  it through `fake_nvs_exists`/`fake_nvs_value` (see the persistent-restore
+  suite).
 - The `esp_log.h` stub prints to stdout, so test output includes the engine's
   transition log.
