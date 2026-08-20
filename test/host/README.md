@@ -1,9 +1,9 @@
 # Host-side tests
 
 Plain-C tests that compile the hardware-independent firmware sources
-(`main/hsm.c`, `main/precondition.c`) against stub ESP-IDF headers and drive
-them with a fake clock and fake CAN traffic. They need no ESP-IDF install and
-no hardware to run:
+(`main/hsm.c`, `main/precondition.c`, and `main/persistent_settings.c`) against
+stub ESP-IDF headers and drive them with a fake clock and fake CAN traffic.
+They need no ESP-IDF install and no hardware to run:
 
 ```sh
 make -C test/host
@@ -20,7 +20,7 @@ test/host/
     test_support.h      fake clock, CHECK/CHECK_MSG, test_report()
   stubs/                minimal stand-ins for ESP-IDF / firmware headers
     can.h  config_server.h  esp_log.h  esp_timer.h  nvs.h
-    driver/twai.h  freertos/FreeRTOS.h  freertos/queue.h
+    driver/twai.h  freertos/FreeRTOS.h  freertos/queue.h  freertos/task.h
   test_hsm.c            state machine engine semantics
   test_precondition.c   precondition features
 ```
@@ -47,8 +47,8 @@ covers and exit 0 on success, non-zero on failure.
    because each test binary contains a single test translation unit.
 2. Either link firmware sources (like `test_hsm.c`; they are listed in
    `LINK_SRCS`) or `#include` one directly (like `test_precondition.c`
-   includes `precondition.c`) when the test needs to reach static state for
-   introspection.
+   includes `persistent_settings.c` and `precondition.c`) when the test needs
+   to reach static state for introspection.
 3. If the source under test isn't copied yet, add it to `FW_FILES` in the
    Makefile. If it pulls in a new ESP-IDF header, add a minimal stub under
    `stubs/`. Only what the code under test actually touches, and any
@@ -59,10 +59,9 @@ covers and exit 0 on success, non-zero on failure.
 
 ## Quirks worth knowing
 
-- `test_precondition` forks a child per suite: the firmware's
-  `cached_precon_*` helpers, the repeating-mode latch, and the platform
-  discovery flags all latch in static storage on first use, so each
-  mode/press combination needs a fresh process. Run one suite directly with
+- `test_precondition` forks a child per suite: the firmware's config snapshot,
+  repeating-mode latch, and platform discovery flags live in process static
+  storage, so each mode/press combination needs a fresh process. Run one suite directly with
   `build/test_precondition <name substring>` (e.g. `continuous`).
 - The `nvs.h` stub is an in-memory single-slot fake; tests seed and inspect
   it through `fake_nvs_exists`/`fake_nvs_value` (see the persistent-restore

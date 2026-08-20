@@ -1,6 +1,6 @@
 // host-test stub for ESP-IDF nvs.h: an in-memory single-slot fake covering
-// only the surface precondition.c uses. tests seed and inspect the backing
-// store directly through the fake_nvs_* variables.
+// the persistent-settings surface. tests seed and inspect the backing store
+// directly through the fake_nvs_* variables.
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
