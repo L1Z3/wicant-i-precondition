@@ -5,6 +5,20 @@
 
 #define TAG "hsm"
 
+static void sm_lock(sm_t *sm) {
+    configASSERT(sm != NULL);
+    configASSERT(sm->lock != NULL);
+    BaseType_t taken = xSemaphoreTakeRecursive(sm->lock, portMAX_DELAY);
+    configASSERT(taken == pdTRUE);
+    (void)taken;
+}
+
+static void sm_unlock(sm_t *sm) {
+    BaseType_t given = xSemaphoreGiveRecursive(sm->lock);
+    configASSERT(given == pdTRUE);
+    (void)given;
+}
+
 // fill path[0..n-1] with the ancestor chain of s, outermost first; returns n
 static int ancestor_path(const sm_state_t *s, const sm_state_t *path[SM_MAX_DEPTH]) {
     int n = 0;
@@ -102,9 +116,13 @@ static bool apply_if_pending(sm_t *sm) {
 
 void sm_init(sm_t *sm, const char *tag, const sm_state_t *initial, const sm_hooks_t *global) {
     memset(sm, 0, sizeof(*sm));
+    sm->lock = xSemaphoreCreateRecursiveMutex();
+    configASSERT(sm->lock != NULL);
     sm->tag = tag;
     sm->global = global;
     sm->now = esp_timer_get_time();
+
+    sm_lock(sm);
 
     // enter the initial state from the root down, then descend to a leaf
     const sm_state_t *path[SM_MAX_DEPTH];
@@ -121,10 +139,13 @@ void sm_init(sm_t *sm, const char *tag, const sm_state_t *initial, const sm_hook
     sm->current = leaf;
     apply_if_pending(sm);
     ESP_LOGI(sm->tag, "init -> %s", sm->current->name);
+    sm_unlock(sm);
 }
 
 void sm_tick(sm_t *sm) {
+    sm_lock(sm);
     if (sm->current == NULL) {
+        sm_unlock(sm);
         return;
     }
     sm->now = esp_timer_get_time();
@@ -144,15 +165,19 @@ void sm_tick(sm_t *sm) {
             // any transition (direct or via a nested event) ends the walk;
             // `path` and the remaining handlers belong to the old state
             if (sm->generation != gen) {
+                sm_unlock(sm);
                 return;
             }
         }
     }
     sm->leaf_ticks++;
+    sm_unlock(sm);
 }
 
 void sm_rx(sm_t *sm, const twai_message_t *msg, can_bus_t bus) {
+    sm_lock(sm);
     if (sm->current == NULL) {
+        sm_unlock(sm);
         return;
     }
     sm->now = esp_timer_get_time();
@@ -170,14 +195,18 @@ void sm_rx(sm_t *sm, const twai_message_t *msg, can_bus_t bus) {
             // any transition (direct or via a nested event) ends the walk;
             // continuing along s->parent would visit exited states
             if (sm->generation != gen) {
+                sm_unlock(sm);
                 return;
             }
         }
     }
+    sm_unlock(sm);
 }
 
 fwd_result_t sm_fwd(sm_t *sm, twai_message_t *msg, can_bus_t bus) {
+    sm_lock(sm);
     if (sm->current == NULL) {
+        sm_unlock(sm);
         return FWD_PASSTHROUGH;
     }
     sm->now = esp_timer_get_time();
@@ -197,11 +226,14 @@ fwd_result_t sm_fwd(sm_t *sm, twai_message_t *msg, can_bus_t bus) {
         ESP_LOGW(sm->tag, "transition during fwd dispatch");
         apply_if_pending(sm);
     }
+    sm_unlock(sm);
     return result;
 }
 
 void sm_send_event(sm_t *sm, sm_event_t ev) {
+    sm_lock(sm);
     if (sm->current == NULL) {
+        sm_unlock(sm);
         return;
     }
     sm->now = esp_timer_get_time();
@@ -215,9 +247,11 @@ void sm_send_event(sm_t *sm, sm_event_t ev) {
         // stop on any transition (the handler's own, or one applied inside a
         // recursive sm_send_event) or once a handler claims the event
         if (sm->generation != gen || handled) {
+            sm_unlock(sm);
             return;
         }
     }
+    sm_unlock(sm);
 }
 
 void sm_transition(sm_t *sm, const sm_state_t *target) {

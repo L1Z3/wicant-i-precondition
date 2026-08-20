@@ -8,6 +8,9 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <sched.h>
 #include "test_support.h"
 #include "hsm.h"
 
@@ -181,6 +184,96 @@ static void g_rx(sm_t *sm, const twai_message_t *msg, can_bus_t bus) {
 }
 static const sm_hooks_t hooks = { .tick = g_tick, .rx = g_rx };
 
+// ---- concurrent-dispatch machine ----
+// Every callback widens the race window around an unprotected increment. The
+// per-machine lock must keep active at one, preserve every increment, and also
+// allow the event callback to nest sm_send_event without deadlocking.
+enum { EV_CONCURRENT = 100, EV_CONCURRENT_NESTED };
+
+typedef struct {
+    unsigned calls;
+} concurrent_ctx_t;
+
+static sm_t concurrent_hsm;
+static concurrent_ctx_t concurrent_ctx;
+static atomic_int concurrent_active;
+static atomic_bool concurrent_overlap;
+
+static void concurrent_callback_enter(void) {
+    if (atomic_fetch_add(&concurrent_active, 1) != 0) {
+        atomic_store(&concurrent_overlap, true);
+    }
+    unsigned calls = concurrent_ctx.calls;
+    sched_yield();
+    concurrent_ctx.calls = calls + 1U;
+    atomic_fetch_sub(&concurrent_active, 1);
+}
+
+static void concurrent_tick(sm_t *sm) {
+    concurrent_callback_enter();
+}
+
+static void concurrent_rx(sm_t *sm, const twai_message_t *msg, can_bus_t bus) {
+    concurrent_callback_enter();
+}
+
+static fwd_result_t concurrent_fwd(sm_t *sm, twai_message_t *msg, can_bus_t bus) {
+    concurrent_callback_enter();
+    return FWD_PASSTHROUGH;
+}
+
+static bool concurrent_event(sm_t *sm, sm_event_t ev) {
+    concurrent_callback_enter();
+    if (ev == EV_CONCURRENT) {
+        sm_send_event(sm, EV_CONCURRENT_NESTED);
+    }
+    return true;
+}
+
+static const sm_state_t S_CONCURRENT = {
+    .name = "concurrent",
+    .tick = concurrent_tick,
+    .rx = concurrent_rx,
+    .fwd = concurrent_fwd,
+    .event = concurrent_event,
+};
+
+typedef enum {
+    CONCURRENT_TICK,
+    CONCURRENT_RX,
+    CONCURRENT_FWD,
+    CONCURRENT_EVENT,
+} concurrent_op_t;
+
+typedef struct {
+    concurrent_op_t op;
+    pthread_barrier_t *start;
+    unsigned iterations;
+} concurrent_worker_t;
+
+static void *concurrent_worker(void *arg) {
+    concurrent_worker_t *worker = arg;
+    twai_message_t msg = { .identifier = 0x123, .data_length_code = 8 };
+    pthread_barrier_wait(worker->start);
+    for (unsigned i = 0; i < worker->iterations; i++) {
+        switch (worker->op) {
+            case CONCURRENT_TICK:
+                sm_tick(&concurrent_hsm);
+                break;
+            case CONCURRENT_RX:
+                sm_rx(&concurrent_hsm, &msg, CAN_BUS_0);
+                break;
+            case CONCURRENT_FWD:
+                sm_fwd(&concurrent_hsm, &msg, CAN_BUS_0);
+                break;
+            case CONCURRENT_EVENT:
+                sm_send_event(&concurrent_hsm, EV_CONCURRENT);
+                break;
+        }
+    }
+    return NULL;
+}
+
 // ---- helpers ----
 static void tick(void) {
     fake_now += 40000;
@@ -293,6 +386,31 @@ int main(void) {
     CHECKL(hsm.current == &S_A1);
     CHECKL(strcmp(logbuf,
                   "A2.event.to-a A2.exit A.exit A.enter A1.enter ") == 0);
+
+    // Tick, RX, fwd, and event dispatch may originate on different tasks, but
+    // callbacks and their state context must remain serialized per machine.
+    enum { WORKER_COUNT = 4, ITERATIONS = 500 };
+    fake_now = 1000000;
+    sm_init(&concurrent_hsm, "test-hsm-concurrent", &S_CONCURRENT, NULL);
+    pthread_barrier_t start;
+    CHECK(pthread_barrier_init(&start, NULL, WORKER_COUNT) == 0);
+    pthread_t threads[WORKER_COUNT];
+    concurrent_worker_t workers[WORKER_COUNT];
+    for (int i = 0; i < WORKER_COUNT; i++) {
+        workers[i] = (concurrent_worker_t){
+            .op = (concurrent_op_t)i,
+            .start = &start,
+            .iterations = ITERATIONS,
+        };
+        CHECK(pthread_create(&threads[i], NULL, concurrent_worker, &workers[i]) == 0);
+    }
+    for (int i = 0; i < WORKER_COUNT; i++) {
+        CHECK(pthread_join(threads[i], NULL) == 0);
+    }
+    CHECK(pthread_barrier_destroy(&start) == 0);
+    CHECK(!atomic_load(&concurrent_overlap));
+    // The event worker runs both the outer and nested event callbacks.
+    CHECK(concurrent_ctx.calls == (WORKER_COUNT + 1U) * ITERATIONS);
 
     return test_report("hsm engine");
 }
