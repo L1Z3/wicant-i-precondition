@@ -29,16 +29,19 @@
 // transitions remain inside its subtree. sm_transition_arg supplies a value
 // for enter handlers; plain sm_transition supplies 0.
 //
-// The engine is single-task and non-reentrant. Nested sm_send_event is allowed
-// only from global tick/rx hooks and tick/rx/event handlers. Enter/exit
-// handlers may request transitions but must not start a dispatch. Fwd handlers
-// are pure filters and must not trigger transitions. All sm_t fields are
-// engine-owned after sm_init.
+// Dispatch is serialized per machine: after sm_init returns, sm_tick, sm_rx,
+// sm_fwd, and sm_send_event may be called from different tasks, but only one
+// dispatch runs on a given sm_t at a time. Nested sm_send_event is allowed
+// only from global tick/rx hooks and tick/rx/event handlers. Other nested
+// dispatch is forbidden. Enter/exit handlers may request transitions but
+// must not start a dispatch. Fwd handlers are pure filters and must not
+// trigger transitions. All sm_t fields are engine-owned after sm_init.
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include "driver/twai.h"
+#include "freertos/semphr.h"
 #include "can.h"
 
 // decision for a single frame about to be forwarded/bridged to a bus
@@ -82,6 +85,7 @@ typedef struct {
 } sm_hooks_t;
 
 struct sm {
+    SemaphoreHandle_t lock;        // recursive: callbacks may nest sm_send_event
     const char *tag;               // machine name for logging
     const sm_state_t *current;     // always a leaf; NULL until sm_init
     const sm_hooks_t *global;
@@ -98,7 +102,8 @@ struct sm {
 
 // Initialize a fresh machine. tag and initial are required; global is optional.
 // Enters initial's ancestors, then follows its initial chain to a leaf.
-// Stored pointers must outlive the machine.
+// Stored pointers must outlive the machine. Initialization must finish before
+// the machine is shared with other tasks.
 void sm_init(sm_t *sm, const char *tag, const sm_state_t *initial, const sm_hooks_t *global);
 // Handle one tick.
 void sm_tick(sm_t *sm);

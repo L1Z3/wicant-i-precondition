@@ -23,7 +23,7 @@ FW_FILES := hsm.c hsm.h precondition.c precondition.h
 LINK_SRCS := build/src/hsm.c
 
 CC ?= cc
-CFLAGS ?= -std=gnu17 -Wall -Wextra -Wno-unused-parameter -g
+CFLAGS ?= -std=gnu17 -Wall -Wextra -Wno-unused-parameter -g -pthread
 CPPFLAGS += -Istubs -Isupport -Ibuild/src
 
 TEST_BINS := $(patsubst %.c,build/%,$(wildcard test_*.c))
