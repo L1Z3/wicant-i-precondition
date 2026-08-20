@@ -1,6 +1,6 @@
-# Host-side tests: compile the hardware-independent firmware sources
-# (main/hsm.c, main/precondition.c, main/persistent_settings.c) against stub ESP-IDF headers and drive
-# them with a fake clock. No ESP-IDF and no hardware needed.
+# Host-side tests: compile hardware-independent firmware sources against stub
+# ESP-IDF headers and drive them with a fake clock. No ESP-IDF or hardware is
+# needed.
 #
 #   make          build and run every test
 #   make build    compile only
@@ -17,7 +17,9 @@
 MAIN := ../../main
 
 # firmware files tests compile against (copied into build/src)
-FW_FILES := hsm.c hsm.h precondition.c precondition.h persistent_settings.c persistent_settings.h
+FW_FILES := utf8_utf16_converter.c utf8_utf16_converter.h hsm.c hsm.h \
+	isotp_tx.c isotp_tx.h track_popup.c track_popup.h \
+	precondition.c precondition.h persistent_settings.c persistent_settings.h
 # firmware sources linked into every test binary (tests that #include a
 # source instead, for introspection, don't list it here)
 LINK_SRCS := build/src/hsm.c
@@ -51,7 +53,9 @@ build/src:
 	mkdir -p build/src
 
 build/test_%: test_%.c $(FW_COPIES) $(HEADERS) | build/src
-	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(LINK_SRCS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(LINK_SRCS) \
+		$(if $(filter test_isotp_tx.c test_track_popup.c,$<),build/src/isotp_tx.c) \
+		$(if $(filter test_track_popup.c,$<),build/src/utf8_utf16_converter.c)
 
 clean:
 	rm -rf build
