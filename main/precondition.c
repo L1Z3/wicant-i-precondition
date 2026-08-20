@@ -7,6 +7,7 @@
 #include "hsm.h"
 #include "precondition.h"
 #include "persistent_settings.h"
+#include "track_popup.h"
 #include "config_server.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -894,6 +895,8 @@ static const sm_state_t S_WAIT_STOPPED = {
 static void push_precondition_state(void);
 
 static void precondition_global_tick(sm_t *sm) {
+    track_popup_tick();
+
     // long press mode: trigger once when the hold crosses the threshold, without
     // waiting for the release frame. state only becomes pressed via the rx hook,
     // so this does nothing when the activation button is disabled
@@ -915,6 +918,8 @@ static void precondition_global_tick(sm_t *sm) {
 }
 
 static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_bus_t rx_bus) {
+    track_popup_rx(to_push, rx_bus);
+
     // 0x038 power status: the low nibble of byte 0 reads 0x04 while the car is
     // in READY. only act on edges
     if (IS_POWER_STATUS_FRAME(to_push->identifier)
@@ -990,9 +995,15 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
     }
 }
 
+static fwd_result_t precondition_global_fwd(sm_t *sm, twai_message_t *to_send,
+                                            can_bus_t fwd_bus) {
+    return track_popup_fwd(to_send, fwd_bus);
+}
+
 static const sm_hooks_t precondition_global_hooks = {
     .tick = precondition_global_tick,
     .rx = precondition_global_rx,
+    .fwd = precondition_global_fwd,
 };
 
 // ********************* public API *********************
@@ -1049,6 +1060,7 @@ void precondition_init(void) {
     configASSERT(precondition_state_queue != NULL);
     precondition_toggle_queue = xQueueCreate(1, sizeof(uint8_t));
     configASSERT(precondition_toggle_queue != NULL);
+    track_popup_init();
     sm_init(&precon_sm, "precondition", &S_IDLE, &precondition_global_hooks);
     push_precondition_state();
 }
