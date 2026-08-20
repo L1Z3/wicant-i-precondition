@@ -1,12 +1,13 @@
 // host-side behavioral test: drives the precondition state machine with a
 // fake clock and a recording can_send
 //
-// precondition.c is #included (not linked) so the test can inspect states
-// and per-state context directly.
+// The firmware modules are #included (not linked) so the test can inspect
+// state-machine and persistence internals directly.
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <pthread.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include "test_support.h"
@@ -57,6 +58,7 @@ int8_t config_server_precon_button(void) { return cfg_button; }
 int8_t config_server_precon_mode(void) { return cfg_mode; }
 int8_t config_server_precon_press(void) { return cfg_press; }
 
+#include "persistent_settings.c"
 #include "precondition.c"
 
 // ---- harness ----
@@ -79,7 +81,15 @@ static void toggle(void)  { press(); fake_now += 100000; release(); }
 static void car_status(uint8_t b, can_bus_t bus) { uint8_t d[8] = {0}; d[1] = b; rx_frame(0x2AD, d, bus); }
 static void car_power(bool ready) { uint8_t d[8] = {0}; d[0] = ready ? 0x04 : 0x00; rx_frame(0x038, d, CAN_BUS_0); }
 
-static void tick1(void) { fake_now += 40000; precondition_tick(); }
+// Model the two firmware workers in deterministic order: the timing task runs
+// the state machine, then the lower-priority persistence task gets CPU time.
+static void tick1(void) {
+    fake_now += 40000;
+    precondition_tick();
+    if (cfg_mode == PERSISTENT) {
+        (void)flush_pending_settings();
+    }
+}
 static void advance_us(int64_t us) {
     int64_t end = fake_now + us;
     while (fake_now < end) tick1();
@@ -346,6 +356,66 @@ static void run_long_press(void) {
     CHECK(sm_in(&precon_sm, &S_REQUESTED));     // release in long mode is a no-op
 }
 
+typedef enum {
+    PRECON_CONCURRENT_TICK,
+    PRECON_CONCURRENT_RX,
+    PRECON_CONCURRENT_FWD,
+} precon_concurrent_op_t;
+
+typedef struct {
+    precon_concurrent_op_t op;
+    pthread_barrier_t *start;
+    unsigned int iterations;
+} precon_concurrent_worker_t;
+
+static void *precon_concurrent_worker(void *arg) {
+    precon_concurrent_worker_t *worker = arg;
+    pthread_barrier_wait(worker->start);
+    for (unsigned int i = 0; i < worker->iterations; i++) {
+        twai_message_t frame = { .data_length_code = 8 };
+        switch (worker->op) {
+            case PRECON_CONCURRENT_TICK:
+                precondition_tick();
+                break;
+            case PRECON_CONCURRENT_RX:
+                frame.identifier = 0x448;
+                frame.data[5] = (i & 1U) ? 0x00 : 0x10;
+                precondition_can_rx_hook(&frame, CAN_BUS_0);
+                break;
+            case PRECON_CONCURRENT_FWD:
+                frame.identifier = 0x4E8;
+                precondition_fwd_hook(&frame, CAN_BUS_0);
+                break;
+        }
+    }
+    return NULL;
+}
+
+static void run_concurrent_dispatch(void) {
+    enum { WORKER_COUNT = 3, ITERATIONS = 1000 };
+    precondition_init();
+    fake_now = 1000000;
+
+    pthread_barrier_t start;
+    CHECK(pthread_barrier_init(&start, NULL, WORKER_COUNT) == 0);
+    pthread_t threads[WORKER_COUNT];
+    precon_concurrent_worker_t workers[WORKER_COUNT];
+    for (int i = 0; i < WORKER_COUNT; i++) {
+        workers[i] = (precon_concurrent_worker_t){
+            .op = (precon_concurrent_op_t)i,
+            .start = &start,
+            .iterations = ITERATIONS,
+        };
+        CHECK(pthread_create(&threads[i], NULL, precon_concurrent_worker, &workers[i]) == 0);
+    }
+    for (int i = 0; i < WORKER_COUNT; i++) {
+        CHECK(pthread_join(threads[i], NULL) == 0);
+    }
+    CHECK(pthread_barrier_destroy(&start) == 0);
+    expect_state("idle");
+    CHECK(sent_count == 0);
+}
+
 static void run_continuous(void) {
     precondition_init();
     expect_state("idle");
@@ -462,8 +532,11 @@ static void run_persistent(void) {
     // manual start mirrors the latch to flash
     toggle();
     expect_state("start-burst");
-    CHECK(!fake_nvs_exists);                    // the flash mirror trails by one tick
-    tick1();
+    CHECK(!fake_nvs_exists);
+    fake_now += 40000;
+    precondition_tick();
+    CHECK(!fake_nvs_exists);                    // state-machine task never writes flash
+    (void)flush_pending_settings();              // lower-priority worker mirrors the latch
     CHECK(fake_nvs_exists && fake_nvs_value == 1);
     for (int i = 0; i < 5; i++) tick1();
     car_status(0x05, CAN_BUS_0);
@@ -504,7 +577,7 @@ static void run_persistent(void) {
     expect_state("managed");
 
     // BMU stops: the 5-minute re-nudge re-enters REQUESTED; neither it nor the
-    // relaunch above may touch flash (since the commit happens in the tick)
+    // relaunch above changes the mirrored latch, so neither writes flash
     car_status(0x01, CAN_BUS_0);
     advance_until_state("start-burst", 302000000LL);
     CHECK(requested.kind == ATTEMPT_PERIODIC);
@@ -518,9 +591,9 @@ static void run_persistent(void) {
     fake_now += 2000000;
     toggle();
     expect_state("stop-burst");
-    CHECK(!repeating_enabled);
+    CHECK(!repeating_mode_enabled());
     tick1();
-    CHECK(fake_nvs_value == 0);                 // clear flushed on the next tick
+    CHECK(fake_nvs_value == 0);                 // lower-priority worker flushed the clear
     for (int i = 0; i < 5; i++) tick1();
     expect_state("wait-stopped");
     car_status(0x01, CAN_BUS_0);
@@ -571,12 +644,12 @@ static void run_persistent_disable_before_ready(void) {
     // within the debounce window after boot the toggle is swallowed
     toggle();
     expect_state("managed");
-    CHECK(repeating_enabled);
+    CHECK(repeating_mode_enabled());
 
     fake_now += 2000000;
     toggle();
     expect_state("stop-burst");                 // disable = active stop, even before ready
-    CHECK(!repeating_enabled);
+    CHECK(!repeating_mode_enabled());
     tick1();
     CHECK(fake_nvs_value == 0);                 // latch clear flushed to flash
     for (int i = 0; i < 5; i++) tick1();
@@ -599,12 +672,12 @@ static void run_persistent_write_retry(void) {
     fake_nvs_commit_failures = 1;
     toggle();
     expect_state("stop-burst");
-    CHECK(!repeating_enabled);
+    CHECK(!repeating_mode_enabled());
     tick1();                                    // first flush attempt fails
     CHECK(fake_nvs_commit_failures == 0);
     CHECK(fake_nvs_value == 1);                 // failed commit left flash stale
 
-    advance_us(PRECONDITION_NVS_RETRY_US - 80000);
+    advance_us(PERSISTENT_SETTINGS_RETRY_US - 80000);
     CHECK(fake_nvs_value == 1);                 // still inside the backoff
     advance_us(160000);
     CHECK(fake_nvs_value == 0);                 // retry landed
@@ -620,17 +693,18 @@ static void run_persistent_write_retry_limit(void) {
     CHECK(fake_nvs_value == 1);
 
     fake_now += 2000000;
-    fake_nvs_commit_failures = PRECONDITION_NVS_MAX_RETRIES + 2U;
+    fake_nvs_commit_failures = PERSISTENT_SETTINGS_MAX_RETRIES + 2U;
     toggle();
 
     // initial attempt + MAX_RETRIES retries, then the budget is spent
-    advance_us((PRECONDITION_NVS_MAX_RETRIES + 1U) * PRECONDITION_NVS_RETRY_US);
-    CHECK(persistent_save_failures == PRECONDITION_NVS_MAX_RETRIES + 1U);
+    advance_us((PERSISTENT_SETTINGS_MAX_RETRIES + 1U) * PERSISTENT_SETTINGS_RETRY_US);
+    CHECK(mirrored_u8_settings[MIRRORED_U8_PRECONDITIONING_ENABLED].save_failures
+          == PERSISTENT_SETTINGS_MAX_RETRIES + 1U);
     CHECK(fake_nvs_value == 1);                 // flash left stale
     unsigned int failures_left = fake_nvs_commit_failures;
     CHECK(failures_left == 1U);
 
-    advance_us(2 * PRECONDITION_NVS_RETRY_US);
+    advance_us(2 * PERSISTENT_SETTINGS_RETRY_US);
     CHECK(fake_nvs_commit_failures == failures_left);  // no writes after the cap
     CHECK(fake_nvs_value == 1);
 }
@@ -650,9 +724,8 @@ static void run_once_ignores_stored_latch(void) {
 }
 
 // ---- suite table ----
-// each suite runs in its own forked process: the config caches, the repeating
-// latch, the fake NVS, and the platform discovery flags all live in statics
-// that latch on first use
+// each suite runs in its own forked process: the config snapshot, repeating
+// latch, fake NVS, and platform discovery flags all live in process statics
 typedef struct {
     const char *name;
     int8_t mode;
@@ -663,6 +736,7 @@ typedef struct {
 static const suite_t suites[] = {
     {"precondition short-press once", ONCE, PRESS_SHORT, run_short_press},
     {"precondition long-press once", ONCE, PRESS_LONG, run_long_press},
+    {"precondition concurrent dispatch", ONCE, PRESS_LONG, run_concurrent_dispatch},
     {"precondition continuous", CONTINUOUS, PRESS_SHORT, run_continuous},
     {"precondition persistent", PERSISTENT, PRESS_SHORT, run_persistent},
     {"precondition persistent restore", PERSISTENT, PRESS_SHORT, run_persistent_restore},

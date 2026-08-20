@@ -233,12 +233,62 @@ static void can_tx_task(void *pvParameters)
 }
 #define HEAP_CAPS   (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
 #define PRECONDITION_TICK_PERIOD_US 40000
+#define PRECONDITION_TASK_STACK_SIZE (3 * 1024)
+#define PRECONDITION_TASK_PRIORITY 8
+
+static TaskHandle_t precondition_task_handle = NULL;
+static esp_timer_handle_t precondition_timer = NULL;
+
+// The esp_timer task is shared and high priority, so its callback only wakes
+// the dedicated worker. State-machine dispatch and CAN TX run from the worker;
+// NVS-mirrored setting logic has its own lower-priority task.
+static void precondition_timer_callback(void *arg)
+{
+	(void)arg;
+	if(precondition_task_handle != NULL)
+	{
+		xTaskNotifyGive(precondition_task_handle);
+	}
+}
+
+static void precondition_task(void *arg)
+{
+	(void)arg;
+	while(1)
+	{
+		// The one-shot timer produces at most one notification before rearming.
+		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+		if(dev_status_is_bit_set(DEV_AWAKE_BIT))
+		{
+			precondition_tick();
+		}
+		// Doing it this way (rather than a periodic 40ms timer) has the advantage
+		// of ensuring at least 40ms elapse between each tick, even if the task
+		// is scheduled late.
+		ESP_ERROR_CHECK(esp_timer_start_once(precondition_timer,
+				PRECONDITION_TICK_PERIOD_US));
+	}
+}
+
+static void precondition_task_start(void)
+{
+	const esp_timer_create_args_t timer_args = {
+		.callback = precondition_timer_callback,
+		.name = "precondition",
+	};
+	ESP_ERROR_CHECK(esp_timer_create(&timer_args, &precondition_timer));
+
+	BaseType_t created = xTaskCreate(precondition_task, "precondition_task",
+			PRECONDITION_TASK_STACK_SIZE, NULL, PRECONDITION_TASK_PRIORITY,
+			&precondition_task_handle);
+	ESP_ERROR_CHECK(created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+	ESP_ERROR_CHECK(esp_timer_start_once(precondition_timer, PRECONDITION_TICK_PERIOD_US));
+}
 
 static void can_rx_task(void *pvParameters)
 {
 //	static uint32_t num_msg = 0;
 	static int64_t time_old = 0;
-	static int64_t precondition_tick_last = 0;
 	// MITM (bridge) vs parallel mode. Read once: a config change restarts
 	// the firmware, and the task is created after the config is loaded.
 	// Single-bus builds have nothing to bridge, so hardcode parallel there.
@@ -282,18 +332,10 @@ static void can_rx_task(void *pvParameters)
 		
 		dev_status_wait_for_bits(DEV_AWAKE_BIT, portMAX_DELAY);
 
-		// TODO(ejones): ideally, we'd use esp_timer_start_periodic. but for now,
-		// i don't want to deal with race conditions on the precondition globals, so
-		// let's just do it here for now (should be good enough for most cases)
-        if ((esp_timer_get_time() - precondition_tick_last) >= PRECONDITION_TICK_PERIOD_US) {
-            precondition_tick_last = esp_timer_get_time();
-            precondition_tick();
-        }
-
-		// Block up to 10 ms for the first frame (keeps the 40 ms precondition
-		// tick and LED housekeeping above running when idle), then drain the
-		// backlog without waiting. This blocking is what makes prio 7 safe: the
-		// task only outranks the TCP tasks while there is frame work to do.
+		// Block up to 10 ms for the first frame (keeps LED housekeeping above
+		// running when idle), then drain the backlog without waiting. This
+		// blocking is what makes prio 7 safe: the task only outranks the TCP
+		// tasks while there is frame work to do.
         if (can_receive(&rx_msg, &rx_bus, pdMS_TO_TICKS(10)) != ESP_OK)
         {
             continue;
@@ -671,6 +713,7 @@ void app_main(void)
 		ESP_LOGI(TAG, "Hardware version: %s", hardware_version);
     }
 	wc_mdns_init((char*)uid, hardware_version, firmware_version);
+	precondition_task_start();
     // Prio 7: the CAN datapath must preempt the TCP streaming tasks (prio 5)
     // instead of timeslicing with them. Safe only because can_rx_task blocks
     // in can_receive() when idle (see the receive loop).
@@ -722,4 +765,3 @@ void app_main(void)
 	// debug_logs_init(dbg_net_ready);
 	// DEBUG_LOGI("INIT", "debug_logs initialized (UDP %s:%d) waiting for WiFi", DEBUG_LOGS_UDP_DEST_IP, DEBUG_LOGS_UDP_PORT);`
 }
-

@@ -1,5 +1,5 @@
 # Host-side tests: compile the hardware-independent firmware sources
-# (main/hsm.c, main/precondition.c) against stub ESP-IDF headers and drive
+# (main/hsm.c, main/precondition.c, main/persistent_settings.c) against stub ESP-IDF headers and drive
 # them with a fake clock. No ESP-IDF and no hardware needed.
 #
 #   make          build and run every test
@@ -17,7 +17,7 @@
 MAIN := ../../main
 
 # firmware files tests compile against (copied into build/src)
-FW_FILES := hsm.c hsm.h precondition.c precondition.h
+FW_FILES := hsm.c hsm.h precondition.c precondition.h persistent_settings.c persistent_settings.h
 # firmware sources linked into every test binary (tests that #include a
 # source instead, for introspection, don't list it here)
 LINK_SRCS := build/src/hsm.c

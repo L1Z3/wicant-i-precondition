@@ -2,10 +2,11 @@
 #include <stdint.h>
 #include <string.h>
 #include "esp_log.h"
-#include "nvs.h"
+#include "esp_timer.h"
 #include "can.h"
 #include "hsm.h"
 #include "precondition.h"
+#include "persistent_settings.h"
 #include "config_server.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -170,11 +171,6 @@ static bool activation_is_release(const message_payload_t *msg, const twai_messa
 #define PRECONDITION_CAR_START_DELAY_US 8000000U  // persistent mode: wait 8 seconds after READY before relaunching
 #define REPEATING_MODE_RETRY_INTERVAL_US (5LL * 60LL * 1000000LL)  // 5 minutes between re-nudges
 
-#define PRECONDITION_NVS_NAMESPACE "precondition"
-#define PRECONDITION_NVS_ENABLED_KEY "persist_en"
-#define PRECONDITION_NVS_RETRY_US 5000000U  // retry failed flash writes every 5 seconds
-#define PRECONDITION_NVS_MAX_RETRIES 3U
-
 #define BATTERY_TEMPERATURE_FRAME_ID 0x152U
 #define BATTERY_TEMPERATURE_MIN_INDEX 0U
 #define BATTERY_TEMPERATURE_MAX_INDEX 1U
@@ -301,136 +297,43 @@ static struct {
 
 static QueueHandle_t battery_temperature_queue = NULL;
 
-// ********************* config caches *********************
+// ********************* config snapshot *********************
 
-// TODO(ejones): deduplicate this code?
-// Cache the configured activation button type. A config change restarts the
-// whole firmware, so the value is effectively constant for the lifetime of
-// the process. Read it once on the first CAN message rather than on every frame.
-static int8_t cached_precon_button_type(void) {
-    static int8_t precon_button_type = 0;
-    static bool loaded = false;
-    if (!loaded) {
-        precon_button_type = config_server_precon_button();
-        loaded = true;
-    }
-    return precon_button_type;
-}
-
-// same caching rationale as cached_precon_button_type
-static int8_t cached_precon_press_type(void) {
-    static int8_t precon_press_type = PRESS_SHORT;
-    static bool loaded = false;
-    if (!loaded) {
-        precon_press_type = config_server_precon_press();
-        loaded = true;
-    }
-    return precon_press_type;
-}
+// Config changes restart the firmware, so capture these values before the
+// state machine is published to the tick and CAN tasks.
+static struct {
+    int8_t button_type;
+    int8_t press_type;
+    int8_t mode;
+} precon_config;
 
 // ********************* repeating-mode latch *********************
 
 static bool repeating_mode(void) {
-    int8_t mode = config_server_precon_mode();
-    return mode == CONTINUOUS || mode == PERSISTENT;
+    return precon_config.mode == CONTINUOUS || precon_config.mode == PERSISTENT;
 }
 
-// every failure path means "treat the toggle as off", so only real errors log
-static bool load_persistent_enabled(void) {
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(PRECONDITION_NVS_NAMESPACE, NVS_READONLY, &handle);
-    if (err != ESP_OK) {
-        if (err != ESP_ERR_NVS_NOT_FOUND) {
-            ESP_LOGE(TAG, "Failed to open persistent preconditioning state: %s", esp_err_to_name(err));
-        }
-        return false;
-    }
-
-    uint8_t stored_enabled = 0U;
-    err = nvs_get_u8(handle, PRECONDITION_NVS_ENABLED_KEY, &stored_enabled);
-    nvs_close(handle);
-    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGE(TAG, "Failed to read persistent preconditioning state: %s", esp_err_to_name(err));
-    }
-    return stored_enabled != 0U;
-}
-
-static bool save_persistent_enabled(bool enabled) {
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(PRECONDITION_NVS_NAMESPACE, NVS_READWRITE, &handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open persistent preconditioning state for writing: %s", esp_err_to_name(err));
-        return false;
-    }
-
-    err = nvs_set_u8(handle, PRECONDITION_NVS_ENABLED_KEY, enabled ? 1U : 0U);
-    if (err == ESP_OK) {
-        err = nvs_commit(handle);
-    }
-    nvs_close(handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to save persistent preconditioning state: %s", esp_err_to_name(err));
-    }
-    return err == ESP_OK;
-}
-
-// Latched toggle shared by the repeating modes; never set in once mode.
-// Continuous clears it when the car turns off; persistent mirrors it to flash
-// so it survives car restarts and WiCAN power cycles. Read/write only through
-// repeating_mode_enabled()/set_repeating_enabled(). RAM is the source of
-// truth; flush_repeating_enabled (called from the global tick) commits it to
-// flash after the value's updated.
-static bool repeating_enabled = false;
-static bool persistent_flash_mirror = false;  // last value confirmed committed
-static int64_t persistent_retry_at = 0;       // backoff deadline after a failed save
-static uint8_t persistent_save_failures = 0;  // consecutive failed saves of the current value
+// RAM-only latch for continuous mode. Persistent mode, on the other hand,
+// uses persistent_settings_(get|set)_precon_enabled, which has logic to
+// asynchronously mirror the value to flash.
+// This bool is owned by repeating_mode_enabled and set_repeating_enabled
+// and shouldn't be accessed directly.
+static bool continuous_enabled = false;
 
 // is a repeating mode enabled? i.e. are we in continuous/persistent mode,
 // with preconditioning toggled on?
 static bool repeating_mode_enabled(void) {
-    // seeded from flash on first use
-    static bool loaded = false;
-    if (!loaded) {
-        loaded = true;
-        if (config_server_precon_mode() == PERSISTENT) {
-            repeating_enabled = load_persistent_enabled();
-            persistent_flash_mirror = repeating_enabled;
-        }
+    if (precon_config.mode == PERSISTENT) {
+        return persistent_settings_get_precon_enabled();
     }
-    return repeating_enabled;
+    return continuous_enabled;
 }
 
 static void set_repeating_enabled(bool enabled) {
-    if (repeating_mode_enabled() == enabled) {
-        return;
-    }
-    repeating_enabled = enabled;
-    // reset flash commit retry logic
-    persistent_save_failures = 0U;
-    persistent_retry_at = 0;
-}
-
-// mirror the latch to flash in persistent mode. failed saves retry on a
-// backoff until the budget for the current value is spent; a later value
-// change starts over
-static void flush_repeating_enabled(sm_t *sm) {
-    if (config_server_precon_mode() != PERSISTENT
-            || repeating_mode_enabled() == persistent_flash_mirror
-            || persistent_save_failures > PRECONDITION_NVS_MAX_RETRIES
-            || sm_now(sm) < persistent_retry_at) {
-        return;
-    }
-    if (save_persistent_enabled(repeating_enabled)) {
-        persistent_flash_mirror = repeating_enabled;
-        persistent_save_failures = 0U;
+    if (precon_config.mode == PERSISTENT) {
+        persistent_settings_set_precon_enabled(enabled);
     } else {
-        persistent_save_failures++;
-        if (persistent_save_failures > PRECONDITION_NVS_MAX_RETRIES) {
-            ESP_LOGE(TAG, "Giving up saving persistent preconditioning state after %u attempts",
-                     (unsigned)persistent_save_failures);
-        } else {
-            persistent_retry_at = sm_now(sm) + PRECONDITION_NVS_RETRY_US;
-        }
+        continuous_enabled = enabled;
     }
 }
 
@@ -601,7 +504,7 @@ static bool requested_event(sm_t *sm, sm_event_t ev) {
         case EV_CAR_NOT_READY:
             // the car turning off already ended preconditioning: abandon the
             // session silently; there is nothing left to stop on the bus
-            if (config_server_precon_mode() == PERSISTENT && repeating_mode_enabled()) {
+            if (precon_config.mode == PERSISTENT && repeating_mode_enabled()) {
                 // wait in MANAGED for the next car_ready rising edge.
                 // when MANAGED is already the leaf this is a self-transition,
                 // which usefully resets its stale start-burst ctx
@@ -822,7 +725,7 @@ static bool managed_event(sm_t *sm, sm_event_t ev) {
         case EV_CAR_READY:
             // persistent mode relaunches after the car has had time to finish
             // coming up in READY
-            if (config_server_precon_mode() == PERSISTENT) {
+            if (precon_config.mode == PERSISTENT) {
                 sm_transition(sm, &S_CAR_START_DELAY);
             }
             return true;
@@ -996,13 +899,11 @@ static const sm_state_t S_WAIT_STOPPED = {
 // ********************* global hooks *********************
 
 static void precondition_global_tick(sm_t *sm) {
-    flush_repeating_enabled(sm);
-
     // long press mode: trigger once when the hold crosses the threshold, without
     // waiting for the release frame. state only becomes pressed via the rx hook,
     // so this does nothing when the activation button is disabled
     if (button.pressed && !button.long_press_fired
-            && cached_precon_press_type() == PRESS_LONG
+            && precon_config.press_type == PRESS_LONG
             && ts_elapsed(sm_now(sm), button.press_start_ts) >= PRECONDITION_LONG_PRESS_US) {
         button.long_press_fired = true;
         sm_send_event(sm, EV_TOGGLE);
@@ -1054,7 +955,7 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
         xQueueOverwrite(battery_temperature_queue, &temperature);
     }
 
-    int8_t precon_button_type = cached_precon_button_type();
+    int8_t precon_button_type = precon_config.button_type;
     if (precon_button_type == BUTTON_DISABLED) {
         // activation button disabled in config; don't listen for any button press
         return;
@@ -1075,7 +976,7 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
         button.pressed = true;
     } else if (activation_is_release(activation, to_push)) {
         if (button.pressed
-                && cached_precon_press_type() == PRESS_SHORT
+                && precon_config.press_type == PRESS_SHORT
                 && ts_elapsed(sm_now(sm), button.press_start_ts) < PRECONDITION_LONG_PRESS_US) {
             sm_send_event(sm, EV_TOGGLE);
         }
@@ -1091,6 +992,17 @@ static const sm_hooks_t precondition_global_hooks = {
 // ********************* public API *********************
 
 void precondition_init(void) {
+    precon_config.button_type = config_server_precon_button();
+    precon_config.press_type = config_server_precon_press();
+    precon_config.mode = config_server_precon_mode();
+
+    if (precon_config.mode == PERSISTENT) {
+        // Currently our only persistent setting is whether persistent
+        // mode was enabled. If that changes, we should make this init
+        // unconditional.
+        persistent_settings_init();
+    }
+
     battery_temperature_queue = xQueueCreate(1, sizeof(precondition_temperature_t));
     configASSERT(battery_temperature_queue != NULL);
     sm_init(&precon_sm, "precondition", &S_IDLE, &precondition_global_hooks);
