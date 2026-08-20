@@ -197,8 +197,8 @@ static int64_t ts_elapsed(int64_t now, int64_t old) {
     return now - old;
 }
 
-// TODO(ejones): draw out full state machine summary diagram and put pdf in repo
 // ********************* state machine outline *********************
+// Also see docs/electroniq_buttons/ for a pdf with a diagram of the state machine
 //
 // IDLE                       No preconditioning request is active.
 // REQUESTED                  Owns a start request and prevents the car from cancelling it.
