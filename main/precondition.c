@@ -84,6 +84,7 @@ static bool activation_long_press_fired = false;
 static bool status_frame_available = false;
 
 static QueueHandle_t battery_temperature_queue = NULL;
+static QueueHandle_t battery_soc_queue = NULL;
 
 typedef enum {
     // frame carries the current button state: pressed while (byte & mask) == value
@@ -216,6 +217,18 @@ static bool activation_is_release(const message_payload_t *msg, const twai_messa
 
 #define IS_BATTERY_TEMPERATURE_FRAME(frame_id) ((frame_id) == BATTERY_TEMPERATURE_FRAME_ID)
 
+// High-voltage battery state of charge, broadcast on M-CAN. Byte 7 holds the
+// displayed SoC in half-percent steps. Corroborated against the recorded M-CAN
+// logs in tylerharvey/Ioniq5_CAN: the byte is stable across each session
+// (0x7F, 0x97, 0x9D => 63.5%, 75.5%, 78.5%) and differs between sessions, while
+// the neighbouring byte 6 swings several counts within seconds of a climate
+// start and so is not SoC.
+#define BATTERY_SOC_FRAME_ID 0x2FCU
+#define BATTERY_SOC_INDEX 7U
+#define BATTERY_SOC_DATA_LENGTH 8U
+
+#define IS_BATTERY_SOC_FRAME(frame_id) ((frame_id) == BATTERY_SOC_FRAME_ID)
+
 #define CAR_BUS CAN_BUS_0
 #define HEAD_UNIT_BUS CAN_BUS_1
 
@@ -238,6 +251,8 @@ static int64_t ts_elapsed(int64_t now, int64_t old) {
 void precondition_init(void) {
     battery_temperature_queue = xQueueCreate(1, sizeof(precondition_temperature_t));
     configASSERT(battery_temperature_queue != NULL);
+    battery_soc_queue = xQueueCreate(1, sizeof(precondition_soc_t));
+    configASSERT(battery_soc_queue != NULL);
 }
 
 static void send_precondition_start_msg(uint8_t ticks_remaining) {
@@ -521,6 +536,17 @@ void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
         xQueueOverwrite(battery_temperature_queue, &temperature);
     }
 
+    if (IS_BATTERY_SOC_FRAME(to_push->identifier)
+            && rx_bus == CAR_BUS
+            && to_push->data_length_code >= BATTERY_SOC_DATA_LENGTH) {
+        precondition_soc_t soc = {
+            .raw = to_push->data[BATTERY_SOC_INDEX],
+            .updated_at_us = esp_timer_get_time(),
+        };
+
+        xQueueOverwrite(battery_soc_queue, &soc);
+    }
+
     // car off ends the session. persistent mode keeps BMU_managed set so the
     // restart below re-requests on the next READY; continuous mode drops
     // management entirely so the keepalive can't restart it next drive. other
@@ -670,4 +696,12 @@ bool precondition_get_battery_temperature(precondition_temperature_t *out) {
     }
 
     return xQueuePeek(battery_temperature_queue, out, 0) == pdTRUE;
+}
+
+bool precondition_get_battery_soc(precondition_soc_t *out) {
+    if (out == NULL || battery_soc_queue == NULL) {
+        return false;
+    }
+
+    return xQueuePeek(battery_soc_queue, out, 0) == pdTRUE;
 }

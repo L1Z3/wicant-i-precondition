@@ -988,6 +988,20 @@ char *config_server_get_status_json(bool remove_sensitive_info)
         cJSON_AddBoolToObject(root, "battery_temp_valid", false);
 	}
 
+	precondition_soc_t soc;
+
+	if (precondition_get_battery_soc(&soc)) {
+        cJSON_AddBoolToObject(root, "battery_soc_valid", true);
+        cJSON_AddNumberToObject(root, "battery_soc_pct", soc.raw * BATTERY_SOC_SCALE);
+        cJSON_AddNumberToObject(
+            root,
+            "battery_soc_age_ms",
+            (esp_timer_get_time() - soc.updated_at_us) / 1000
+        );
+	} else {
+        cJSON_AddBoolToObject(root, "battery_soc_valid", false);
+	}
+
 	{
 		char volt[12] = {0};
 		float tmp = 0;

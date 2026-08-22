@@ -24,4 +24,15 @@ typedef struct {
 
 bool precondition_get_battery_temperature(precondition_temperature_t *out);
 
+// Displayed state of charge is transmitted in half-percent steps.
+#define BATTERY_SOC_SCALE 0.5f
+
+typedef struct {
+    // raw byte from the frame; percent is raw * BATTERY_SOC_SCALE
+    uint8_t raw;
+    int64_t updated_at_us;
+} precondition_soc_t;
+
+bool precondition_get_battery_soc(precondition_soc_t *out);
+
 #endif
