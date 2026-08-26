@@ -607,12 +607,40 @@ static void car_start_delay_tick(sm_t *sm) {
 
 // ********************* REQUESTED / START_BURST *********************
 
+// Abort a start attempt when the entire battery is already at the
+// preconditioning cutoff.
+static bool stop_start_if_battery_too_warm(sm_t *sm) {
+    precondition_temperature_t temperature;
+    if (!precondition_get_battery_temperature(&temperature)
+            || temperature.min_c < PRECONDITION_BATTERY_TEMPERATURE_CUTOFF_C) {
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Start blocked: battery minimum temperature is %d C", temperature.min_c);
+    if (requested.kind == ATTEMPT_MANUAL && precon_config.mode == ONCE) {
+        char message[48];
+        snprintf(message, sizeof(message), "Once: temp too high: %d°C ≥ 21°C", temperature.min_c);
+        track_popup_show(message);
+    }
+    if (precon_config.mode == ONCE) {
+        // silent attempt
+        sm_transition_arg(sm, &S_STOPPING, PRECONDITION_MAX_RETRIES);
+    } else {
+        sm_transition(sm, &S_MANAGED);
+    }
+    return true;
+}
+
 // retry timers and the countdown display measure from the moment the burst began
 static void start_burst_enter(sm_t *sm) {
     requested.last_attempt_ts = sm_now(sm);
+    stop_start_if_battery_too_warm(sm);
 }
 
 static void start_burst_tick(sm_t *sm) {
+    if (stop_start_if_battery_too_warm(sm)) {
+        return;
+    }
     uint32_t t = sm_ticks_in_state(sm);
     send_precondition_start_msg(t);
     // Status events deliberately do not cut the burst short. After all start
@@ -635,6 +663,9 @@ static void start_burst_tick(sm_t *sm) {
 // ********************* REQUESTED / WAIT_STARTING *********************
 
 static void wait_starting_tick(sm_t *sm) {
+    if (stop_start_if_battery_too_warm(sm)) {
+        return;
+    }
     int64_t time_since_last_attempt = ts_elapsed(sm_now(sm), requested.last_attempt_ts);
     if (!precon_status_available()) {
         // without status frames we can't confirm or retry anything; after the
@@ -667,6 +698,9 @@ static bool wait_starting_event(sm_t *sm, sm_event_t ev) {
 // ********************* REQUESTED / WAIT_STARTED *********************
 
 static void wait_started_tick(sm_t *sm) {
+    if (stop_start_if_battery_too_warm(sm)) {
+        return;
+    }
     // the car said "starting" but hasn't reached fully started
     // (i.e. we got 2AD 05 but not 15 after a long time)
     int64_t time_since_last_attempt = ts_elapsed(sm_now(sm), requested.last_attempt_ts);

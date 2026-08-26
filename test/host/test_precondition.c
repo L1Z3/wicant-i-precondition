@@ -442,6 +442,66 @@ static void run_long_press(void) {
     CHECK(sm_in(&precon_sm, &S_REQUESTED));     // release in long mode is a no-op
 }
 
+static void run_battery_temperature_cutoff(void) {
+    precondition_init();
+    expect_state("idle");
+
+    // The cutoff is inclusive. A manual attempt displays an error and takes
+    // the stop path without emitting any start frames.
+    battery_temperature(21, 24);
+    sent_count = 0;
+    toggle();
+    expect_state("stop-burst");
+    CHECK(popup_show_count == 1);
+    CHECK(strcmp(popup_text, "Once: temp too high: 21°C ≥ 21°C") == 0);
+    CHECK(sent_count == 0);
+    for (int i = 0; i < 6; i++) tick1();
+    expect_state("idle");
+    CHECK(sent_count == 6);
+    check_stop_burst_msgs(0);
+
+    // A reading just below the cutoff still allows the normal start sequence.
+    battery_temperature(20, 24);
+    sent_count = 0;
+    toggle();
+    expect_state("start-burst");
+    tick1();
+    CHECK(sent_count == 1);
+    CHECK(sent[0].msg.data[3] == 0x40 && sent[0].msg.data[4] == 0x03);
+    CHECK(popup_show_count == 1);
+
+    // A newly hot reading also aborts an in-flight manual attempt before a
+    // status confirmation can move it into ACTIVE.
+    for (int i = 0; i < 5; i++) tick1();
+    expect_state("wait-starting");
+    battery_temperature(21, 24);
+    tick1();
+    expect_state("stop-burst");
+    CHECK(popup_show_count == 2);
+}
+
+static void run_automatic_temperature_cutoff(void) {
+    precondition_init();
+    battery_temperature(20, 24);
+    car_power(true);
+    toggle();
+    for (int i = 0; i < 6; i++) tick1();
+    car_status(0x15, CAN_BUS_0);
+    expect_state("active");
+
+    // A periodic attempt at the cutoff is dropped silently and leaves the
+    // repeating-mode latch enabled.
+    int popup_count_before_periodic = popup_show_count;
+    battery_temperature(21, 24);
+    car_status(0x01, CAN_BUS_0);
+    sent_count = 0;
+    advance_us(REPEATING_MODE_RETRY_INTERVAL_US + 80000);
+    expect_state("managed");
+    CHECK(sent_count == 0);
+    CHECK(popup_show_count == popup_count_before_periodic);
+    CHECK(repeating_mode_enabled());
+}
+
 typedef enum {
     PRECON_CONCURRENT_TICK,
     PRECON_CONCURRENT_RX,
@@ -944,6 +1004,8 @@ typedef struct {
 static const suite_t suites[] = {
     {"precondition short-press once", ONCE, PRESS_SHORT, run_short_press},
     {"precondition long-press once", ONCE, PRESS_LONG, run_long_press},
+    {"precondition battery temperature cutoff", ONCE, PRESS_SHORT, run_battery_temperature_cutoff},
+    {"precondition automatic temperature cutoff", CONTINUOUS, PRESS_SHORT, run_automatic_temperature_cutoff},
     {"precondition concurrent dispatch", ONCE, PRESS_LONG, run_concurrent_dispatch},
     {"precondition continuous", CONTINUOUS, PRESS_SHORT, run_continuous},
     {"precondition persistent", PERSISTENT, PRESS_SHORT, run_persistent},
