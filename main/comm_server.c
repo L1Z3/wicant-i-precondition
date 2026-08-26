@@ -367,7 +367,7 @@ static void tcp_server_task(void *pvParameters)
 				int peeked;
 				// MSG_PEEK leaves the hello bytes queued for the rx task.
 				if (select(new_sock + 1, &rfds, NULL, NULL, &tv) <= 0 ||
-				    (peeked = recv(new_sock, peek, sizeof(peek), MSG_PEEK)) <= 0)
+				    (peeked = recv(new_sock, peek, sizeof(peek), MSG_PEEK)) <= 0) // NOLINT(bugprone-assignment-in-if-condition) -- recv idiom
 				{
 					ESP_LOGW(TAG, "Rejecting %s: session active and newcomer sent no data", addr_str);
 					close(new_sock);

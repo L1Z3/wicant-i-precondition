@@ -94,7 +94,7 @@ static void gvret_setup_bus(can_bus_t bus, uint32_t speed, bool enabled, bool li
 {
 	can_disable(bus);
 	ESP_LOGI(__func__, "bus %u speed: %lu", bus, speed);
-	for(uint8_t i = 0; i < sizeof(can_speed)/sizeof(uint32_t); i++)
+	for(uint8_t i = 0; i < sizeof(can_speed)/sizeof(uint32_t); i++) // NOLINT(bugprone-too-small-loop-variable) -- 11 entries
 	{
 		if(can_speed[i] == speed)
 		{
@@ -395,7 +395,7 @@ void gvret_parse(uint8_t *buf, uint8_t len, twai_message_t *frame, QueueHandle_t
 				gvret_response((char*)transmitBuffer, transmitBufferLength, q);
 				transmitBufferLength = 0;
 				break;
-			case GET_DIG_INPUTS:
+			case GET_DIG_INPUTS: // NOLINT(bugprone-branch-clone) -- no-op stub
 				// nothing to do
 				break;
 			case GET_ANALOG_INPUTS:
@@ -512,14 +512,14 @@ void gvret_parse(uint8_t *buf, uint8_t len, twai_message_t *frame, QueueHandle_t
 				}
 				step++;
 				break;
-			case GET_CANBUS_PARAMS:
+			case GET_CANBUS_PARAMS: // NOLINT(bugprone-branch-clone) -- no-op stub
 				// nothing to do
 				break;
 			case GET_DEVICE_INFO:
 				// nothing to do
 				break;
 			case SET_SINGLEWIRE_MODE:
-				if(in_byte == 0x10){
+				if(in_byte == 0x10){ // NOLINT(bugprone-branch-clone) -- stubbed upstream
 				} else {
 				}
 				//EEPROM.writeBytes(0, &settings, sizeof(settings));
@@ -540,7 +540,7 @@ void gvret_parse(uint8_t *buf, uint8_t len, twai_message_t *frame, QueueHandle_t
 				switch(step)
 				{
 					static uint8_t tmp_len = 0;
-					case 0:
+					case 0: // NOLINT(bugprone-branch-clone) -- disabled upstream
 //						build_out_frame.id = in_byte;
 						break;
 					case 1:

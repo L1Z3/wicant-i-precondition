@@ -651,7 +651,7 @@ static esp_err_t load_pid_auto_config_handler(httpd_req_t *req)
     // Seek to the end of the file to determine its size
     fseek(fd, 0, SEEK_END);
     long file_size = ftell(fd);
-    rewind(fd);
+    rewind(fd); // NOLINT(bugprone-unsafe-functions) -- fd verified non-NULL above
 
     if (file_size <= 0)
     {
@@ -991,7 +991,7 @@ char *config_server_get_status_json(bool remove_sensitive_info)
         cJSON_AddNumberToObject(
             root,
             "battery_temp_age_ms",
-            (esp_timer_get_time() - temperature.updated_at_us) / 1000
+            (esp_timer_get_time() - temperature.updated_at_us) / 1000 // NOLINT(bugprone-integer-division) -- integer ms intended
         );
 	} else {
         cJSON_AddBoolToObject(root, "battery_temp_valid", false);
@@ -1051,7 +1051,7 @@ char *config_server_get_status_json(bool remove_sensitive_info)
  * and internal socket fd in order
  * to use out of request send
  */
-typedef  struct _async_resp_arg {
+typedef  struct _async_resp_arg { // NOLINT(bugprone-reserved-identifier)
     httpd_handle_t hd;
     int fd;
 }async_resp_arg_t;
@@ -1260,7 +1260,7 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     {
 //        ESP_LOGI(TAG, "Remaining size : %d", remaining);
         /* Receive the file part by part into a buffer */
-        if ((received = httpd_req_recv(req, buf, MIN(remaining, SCRATCH_BUFSIZE))) <= 0)
+        if ((received = httpd_req_recv(req, buf, MIN(remaining, SCRATCH_BUFSIZE))) <= 0) // NOLINT(bugprone-assignment-in-if-condition) -- recv idiom
         {
             if (received == HTTPD_SOCK_ERR_TIMEOUT)
             {
@@ -1322,7 +1322,7 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     /* Close file upon upload completion */
     ESP_LOGI(TAG, "File reception complete: %lu", total_size);
 
-    if ((received = httpd_req_recv(req, buf, SCRATCH_BUFSIZE)) <= 0)
+    if ((received = httpd_req_recv(req, buf, SCRATCH_BUFSIZE)) <= 0) // NOLINT(clang-analyzer-deadcode.DeadStores, bugprone-assignment-in-if-condition) -- value only used in condition
     {
         ESP_LOGE(TAG, "File reception failed!");
         esp_ota_abort(update_handle);
@@ -1425,7 +1425,7 @@ static esp_err_t upload_car_data_handler(httpd_req_t *req)
     {
 //        ESP_LOGI(TAG, "Remaining size : %d", remaining);
         /* Receive the file part by part into a buffer */
-        if ((received = httpd_req_recv(req, buf, MIN(remaining, SCRATCH_BUFSIZE))) <= 0)
+        if ((received = httpd_req_recv(req, buf, MIN(remaining, SCRATCH_BUFSIZE))) <= 0) // NOLINT(bugprone-assignment-in-if-condition) -- recv idiom
         {
             if (received == HTTPD_SOCK_ERR_TIMEOUT)
             {
