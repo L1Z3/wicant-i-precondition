@@ -689,7 +689,8 @@ static void gvret_broadcast_task(void *pvParameters)
     int sock = socket(addr_family, SOCK_DGRAM, ip_protocol);
     if (sock < 0) {
         ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
-//        break;
+        vTaskDelete(NULL);
+        return;
     }
     ESP_LOGI(TAG, "Socket created");
 

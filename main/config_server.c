@@ -556,6 +556,7 @@ static esp_err_t store_canflt_handler(httpd_req_t *req)
 		mqtt_canflt_file[filesize] = 0;
 		fseek(f1, 0, SEEK_SET);
 		ESP_LOGI(TAG, "mqtt_canfilt.json: %s", mqtt_canflt_file);
+		fclose(f1);
 	}
     const char *resp_str = "CAN filter saved! Filter will take effect after submit.";
     httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
@@ -596,6 +597,14 @@ static esp_err_t load_pid_auto_handler(httpd_req_t *req)
     fseek(f, 0, SEEK_END);
     long filesize = ftell(f);
     fseek(f, 0, SEEK_SET);
+
+    if (filesize <= 0)
+    {
+        ESP_LOGE(TAG, "auto_pid.json is empty or invalid");
+        fclose(f);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
 
     char *buf = malloc(filesize + 1);
     if (!buf)
@@ -2289,6 +2298,12 @@ config_error:
         // Delete it if it exists
         unlink(FS_MOUNT_POINT"/config.json");
 		FILE* f = fopen(FS_MOUNT_POINT"/config.json", "w");
+		if (f == NULL)
+		{
+			ESP_LOGE(TAG, "Failed to restore default config.json");
+			cJSON_Delete(root);
+			return;
+		}
 		// sprintf(device_config_default, device_id, device_id);
 		fprintf(f, device_config_default, (char*)device_id, (char*)device_id, (char*)device_id);
 		fclose(f);
@@ -2387,10 +2402,20 @@ static httpd_handle_t config_server_init(void)
 		{
 			ESP_LOGI(TAG, "Config file does not exist, load default");
 			f = fopen(FS_MOUNT_POINT"/config.json", "w");
+			if (f == NULL)
+			{
+				ESP_LOGE(TAG, "Failed to create config.json");
+				return NULL;
+			}
 //			fwrite(device_config_default , 1 , sizeof(device_config_default) , f );
 			fprintf(f, device_config_default, (char*)device_id, (char*)device_id, (char*)device_id);
 			fclose(f);
 			f = fopen(FS_MOUNT_POINT"/config.json", "r");
+			if (f == NULL)
+			{
+				ESP_LOGE(TAG, "Failed to open config.json after creating default");
+				return NULL;
+			}
 		}
 		fseek(f, 0, SEEK_END);
 		int filesize = ftell(f);
@@ -2402,6 +2427,7 @@ static httpd_handle_t config_server_init(void)
 		fread(device_config_file, sizeof(char), filesize, f);
 		device_config_file[filesize] = 0;
 		fseek(f, 0, SEEK_SET);
+		fclose(f);
 		ESP_LOGI(TAG, "config.json: %s", device_config_file);
 		config_server_load_cfg(device_config_file);
 		
