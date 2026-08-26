@@ -10,15 +10,25 @@
 # is host-oriented. If a check fires too often in code you own, prefer a
 # targeted suppression (// NOLINT, or a per-check exclusion below) over turning
 # off the whole family.
+#
+# Two families disabled after an audit of all their findings (2026-08):
+# - readability-misleading-indentation: upstream code mixes tabs/spaces in
+#   brace-delimited if/else chains; all findings were false-positive style
+#   noise (no dangle-else). Existing sites were fixed in code; the check stays
+#   off so future upstream merges don't flood the gate.
+# - bugprone-implicit-widening-of-multiplication-result: every instance is a
+#   small constant (20*1000, 1000*1000, ...) multiplied in int and compared to
+#   an int64_t timer value; none can overflow in practice.
 Checks: >-
   -*,
   bugprone-*,
   clang-analyzer-*,
   performance-*,
   portability-*,
-  readability-misleading-indentation,
+  -readability-misleading-indentation,
   readability-redundant-control-flow,
   -bugprone-easily-swappable-parameters,
+  -bugprone-implicit-widening-of-multiplication-result,
   -bugprone-narrowing-conversions,
   -bugprone-switch-missing-default-case,
   -clang-analyzer-optin.*,
