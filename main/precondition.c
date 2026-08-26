@@ -1,4 +1,5 @@
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 #include "esp_log.h"
@@ -169,13 +170,14 @@ static bool activation_is_release(const message_payload_t *msg, const twai_messa
 #define PRECONDITION_RETRY_US 10000000U  // 10 seconds
 #define PRECONDITION_MAX_RETRIES 4U
 #define PRECONDITION_STARTED_TIMEOUT_US 70000000U  // 70 seconds
-#define PRECONDITION_CAR_START_DELAY_US 8000000U  // persistent mode: wait 8 seconds after READY before relaunching
+#define PRECONDITION_CAR_START_DELAY_US 8000000U  // wait 8 seconds after READY before startup actions
 #define REPEATING_MODE_RETRY_INTERVAL_US (5LL * 60LL * 1000000LL)  // 5 minutes between re-nudges
 
 #define BATTERY_TEMPERATURE_FRAME_ID 0x152U
 #define BATTERY_TEMPERATURE_MIN_INDEX 0U
 #define BATTERY_TEMPERATURE_MAX_INDEX 1U
 #define BATTERY_TEMPERATURE_DATA_LENGTH 2U
+#define PRECONDITION_BATTERY_TEMPERATURE_CUTOFF_C 21
 
 #define IS_BATTERY_TEMPERATURE_FRAME(frame_id) ((frame_id) == BATTERY_TEMPERATURE_FRAME_ID)
 
@@ -247,6 +249,14 @@ typedef enum {
     ATTEMPT_PERIODIC,    // repeating-mode re-nudge; silent and one-shot
     ATTEMPT_BMU_RESTART, // status-only BMU restart; silent and not retried directly
 } attempt_kind_t;
+
+// owned by IDLE
+static struct {
+    // one-shot notice carried across the off-to-ready power cycle
+    // when turning the car off implicitly disables an active Continuous session
+    bool continuous_disabled_by_car_off;
+    int64_t continuous_disabled_ready_at_us;
+} idle;
 
 // owned by REQUESTED and its children; describes the most recent start
 // attempt, so it is dormant while ACTIVE or MANAGED is the leaf
@@ -463,10 +473,22 @@ static void start_timeout(sm_t *sm) {
 // ********************* IDLE *********************
 
 static void idle_enter(sm_t *sm) {
+    bool disabled_by_car_off = sm_entry_arg(sm) != 0;
+    idle.continuous_disabled_by_car_off = disabled_by_car_off
+                                       && precon_config.mode == CONTINUOUS;
     if (repeating_mode() && repeating_mode_enabled()) {
         // the WiCAN just booted and restored persistent mode from flash
         // => wait in MANAGED for car to boot
         sm_transition(sm, &S_MANAGED);
+    }
+}
+
+static void idle_tick(sm_t *sm) {
+    if (idle.continuous_disabled_by_car_off && platform.car_in_ready
+            && ts_elapsed(sm_now(sm), idle.continuous_disabled_ready_at_us)
+                    >= PRECONDITION_CAR_START_DELAY_US) {
+        idle.continuous_disabled_by_car_off = false;
+        track_popup_show("Continuous: disabled by car restart");
     }
 }
 
@@ -476,8 +498,9 @@ static bool idle_event(sm_t *sm, sm_event_t ev) {
             sm_transition(sm, &S_REQUESTED);
             return true;
         case EV_CAR_READY:
-            // we only stay in idle during once mode, so nothing to do
-            // on car ready
+            if (idle.continuous_disabled_by_car_off) {
+                idle.continuous_disabled_ready_at_us = sm_now(sm);
+            }
             return true;
     }
     return false;
@@ -489,6 +512,22 @@ static void requested_enter(sm_t *sm) {
     requested.kind = (attempt_kind_t)sm_entry_arg(sm);
     if (repeating_mode()) {
         set_repeating_enabled(true);
+        if (requested.kind == ATTEMPT_MANUAL || requested.kind == ATTEMPT_CAR_START) {
+            const char *mode_name = precon_config.mode == PERSISTENT
+                                  ? "Persistent" : "Continuous";
+            precondition_temperature_t temperature;
+            char message[64];
+            if (precondition_get_battery_temperature(&temperature)) {
+                snprintf(message, sizeof(message),
+                         "%s: maintaining %d°C (%d°C)",
+                         mode_name, PRECONDITION_BATTERY_TEMPERATURE_CUTOFF_C, temperature.min_c);
+            } else {
+                snprintf(message, sizeof(message),
+                         "%s: maintaining %d°C",
+                         mode_name, PRECONDITION_BATTERY_TEMPERATURE_CUTOFF_C);
+            }
+            track_popup_show(message);
+        }
     }
     if (requested.kind == ATTEMPT_BMU_RESTART) {
         requested.last_attempt_ts = sm_now(sm);
@@ -504,6 +543,11 @@ static bool requested_event(sm_t *sm, sm_event_t ev) {
         case EV_TOGGLE:
             // debounce between start and stop
             if (sm_time_in_us(sm, &S_REQUESTED) > PRECONDITION_DEBOUNCE_US) {
+                if (precon_config.mode == PERSISTENT) {
+                    track_popup_show("Persistent mode: stopping");
+                } else if (precon_config.mode == CONTINUOUS) {
+                    track_popup_show("Continuous mode: stopping");
+                }
                 sm_transition(sm, &S_STOPPING);
             }
             return true;
@@ -516,8 +560,7 @@ static bool requested_event(sm_t *sm, sm_event_t ev) {
                 // which usefully resets its stale start-burst ctx
                 sm_transition(sm, &S_MANAGED);
             } else {
-                // reset continuous/once mode state
-                sm_transition(sm, &S_IDLE);
+                sm_transition_arg(sm, &S_IDLE, true);
             }
             return true;
     }
@@ -803,7 +846,10 @@ static bool wait_stopped_event(sm_t *sm, sm_event_t ev) {
 
 static const sm_state_t S_IDLE = {
     .name = "idle",
+    .ctx = &idle,
+    .ctx_size = sizeof(idle),
     .enter = idle_enter,
+    .tick = idle_tick,
     .event = idle_event,
 };
 
