@@ -69,6 +69,8 @@ int8_t config_server_precon_press(void) { return cfg_press; }
 
 // Track popup behavior has its own suite. These stubs keep this test focused
 // on precondition behavior while still exercising the global-hook delegation.
+static int popup_show_count = 0;
+static char popup_text[128];
 void track_popup_init(void) {}
 void track_popup_tick(void) {}
 void track_popup_rx(const twai_message_t *msg, can_bus_t rx_bus) {
@@ -79,6 +81,11 @@ fwd_result_t track_popup_fwd(twai_message_t *msg, can_bus_t fwd_bus) {
     (void)msg;
     (void)fwd_bus;
     return FWD_PASSTHROUGH;
+}
+bool track_popup_show(const char *utf8_text) {
+    popup_show_count++;
+    snprintf(popup_text, sizeof(popup_text), "%s", utf8_text);
+    return true;
 }
 
 #include "persistent_settings.c"
@@ -103,6 +110,10 @@ static void release(void) { uint8_t d[8] = {0}; rx_frame(0x448, d, CAN_BUS_0); }
 static void toggle(void)  { press(); fake_now += 100000; release(); }
 static void car_status(uint8_t b, can_bus_t bus) { uint8_t d[8] = {0}; d[1] = b; rx_frame(0x2AD, d, bus); }
 static void car_power(bool ready) { uint8_t d[8] = {0}; d[0] = ready ? 0x04 : 0x00; rx_frame(0x038, d, CAN_BUS_0); }
+static void battery_temperature(int8_t min_c, int8_t max_c) {
+    uint8_t d[8] = {(uint8_t)min_c, (uint8_t)max_c};
+    rx_frame(0x152, d, CAN_BUS_0);
+}
 
 // Model the two firmware workers in deterministic order: the timing task runs
 // the state machine, then the lower-priority persistence task gets CPU time.
@@ -226,6 +237,7 @@ static void run_short_press(void) {
     fake_now += 2000000;
     toggle();
     expect_state("stop-burst");
+    CHECK(popup_show_count == 0);                // ONCE mode has no mode-specific popup
     CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);
     sent_count = 0;
     for (int i = 0; i < 6; i++) tick1();
@@ -390,6 +402,7 @@ static void run_short_press(void) {
     car_power(false);
     expect_state("idle");
     CHECK(!precondition_display().starting);
+    CHECK(!idle.continuous_disabled_by_car_off);
     CHECK(sent_count == 0);                    // no stop burst: nothing left to stop
     CHECK(fwd(0x0C7, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);
 
@@ -492,12 +505,15 @@ static void run_concurrent_dispatch(void) {
 static void run_continuous(void) {
     precondition_init();
     expect_state("idle");
+    battery_temperature(-5, 2);
     car_power(true);
     expect_state("idle");                       // ready edge alone starts nothing
 
     // manual start shows the countdown and becomes ACTIVE once confirmed
     toggle();
     expect_state("start-burst");
+    CHECK(strcmp(popup_text,
+                 "Continuous: maintaining 21°C (-5°C)") == 0);
     twai_message_t m;
     CHECK(fwd(0x4E8, CAN_BUS_0, &m) == FWD_MODIFIED);
     for (int i = 0; i < 6; i++) tick1();
@@ -624,6 +640,7 @@ static void run_continuous(void) {
     toggle();
     expect_state("stop-burst");
     CHECK(!precondition_display().active);
+    CHECK(strcmp(popup_text, "Continuous mode: stopping") == 0);
     for (int i = 0; i < 6; i++) tick1();
     check_stop_burst_msgs(0);
     expect_state("wait-stopped");
@@ -645,12 +662,29 @@ static void run_continuous(void) {
     expect_state("active");
     CHECK(precondition_display().active);
     CHECK(!precondition_display().starting);
+    int popup_count_before_car_off = popup_show_count;
     car_power(false);
     expect_state("idle");
     CHECK(!precondition_display().active);
+    CHECK(idle.continuous_disabled_by_car_off);
+    CHECK(popup_show_count == popup_count_before_car_off);
     sent_count = 0;
-    car_power(true);                            // ready again: nothing restarts
+    car_power(true);                            // arm notice, but do not restart
     expect_state("idle");
+    CHECK(idle.continuous_disabled_by_car_off);
+    CHECK(popup_show_count == popup_count_before_car_off);
+
+    advance_us(PRECONDITION_CAR_START_DELAY_US - 40000);
+    expect_state("idle");
+    CHECK(idle.continuous_disabled_by_car_off);
+    CHECK(popup_show_count == popup_count_before_car_off);
+
+    tick1();
+    expect_state("idle");
+    CHECK(!idle.continuous_disabled_by_car_off);
+    CHECK(popup_show_count == popup_count_before_car_off + 1);
+    CHECK(strcmp(popup_text,
+                 "Continuous: disabled by car restart") == 0);
     car_status(0x01, CAN_BUS_0);
     advance_us(310000000LL);
     CHECK(sent_count == 0);
@@ -677,12 +711,15 @@ static void run_continuous(void) {
 static void run_persistent(void) {
     precondition_init();
     expect_state("idle");
+    battery_temperature(7, 10);
     car_power(true);
     expect_state("idle");                       // nothing stored in flash yet
 
     // manual start mirrors the latch to flash
     toggle();
     expect_state("start-burst");
+    CHECK(strcmp(popup_text,
+                 "Persistent: maintaining 21°C (7°C)") == 0);
     CHECK(!fake_nvs_exists);
     fake_now += 40000;
     precondition_tick();
