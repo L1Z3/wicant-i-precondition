@@ -4,9 +4,8 @@
 #include <stdbool.h>
 #include "hsm.h"
 
-// Initialize the cluster track-selection popup service. MITM mode can suppress
-// competing frames; parallel and single-bus modes attempt the same popup as
-// modified duplicates and injected frames on the target bus, best-effort.
+// Initialize the cluster track-selection popup service. Reuse a known active
+// media type and transport when possible, otherwise force the fallback type.
 void track_popup_init(void);
 
 // Drive the popup state machine from the precondition machine's global hooks.
