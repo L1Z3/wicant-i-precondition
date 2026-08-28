@@ -198,9 +198,11 @@ static void run_short_press(void) {
     toggle();
     expect_state("start-burst");
     car_status(0x01, CAN_BUS_1);               // head unit bus: must be ignored
-    CHECK(!platform.status_frame_available);
-    car_status(0x01, CAN_BUS_0);               // idle status during burst: ignored but latched
-    CHECK(platform.status_frame_available);
+    CHECK(platform.precon_status == PRECON_STATUS_UNKNOWN);
+    car_status(0x00, CAN_BUS_0);               // unrecognized status remains unknown
+    CHECK(platform.precon_status == PRECON_STATUS_UNKNOWN);
+    car_status(0x01, CAN_BUS_0);               // idle is now the latest car status
+    CHECK(platform.precon_status == PRECON_STATUS_IDLE);
     expect_state("start-burst");
     for (int i = 0; i < 6; i++) tick1();
     expect_state("wait-starting");
@@ -212,9 +214,13 @@ static void run_short_press(void) {
     CHECK((m.data[6] & 0x0F) == 0x0);          // FLAG_DESTINATION after starting confirm
     car_status(0x55, CAN_BUS_0);               // EV6-style "started"
     expect_state("active");
-    // downgrade: active -> starting again
+    // Once-mode downgrade stays within the original request and retains its
+    // retry budget.
+    requested.retries = 2;
     car_status(0x05, CAN_BUS_0);
     expect_state("wait-started");
+    CHECK(requested.kind == ATTEMPT_MANUAL);
+    CHECK(requested.retries == 2);
     car_status(0x15, CAN_BUS_0);
     expect_state("active");
     // "complete" in ONCE mode -> real stop
@@ -422,7 +428,7 @@ static void run_continuous(void) {
     car_power(true);
     expect_state("idle");                       // ready edge alone starts nothing
 
-    // manual start shows the countdown, confirms, hands off to MANAGED
+    // manual start shows the countdown and becomes ACTIVE once confirmed
     toggle();
     expect_state("start-burst");
     twai_message_t m;
@@ -432,12 +438,26 @@ static void run_continuous(void) {
     car_status(0x05, CAN_BUS_0);
     expect_state("wait-started");
     car_status(0x15, CAN_BUS_0);
-    expect_state("managed");
-    // MITM stays on while the BMU manages; the display does not
+    expect_state("active");
+    // MITM stays on while preconditioning is active; the display does not
     CHECK(fwd(0x0C7, CAN_BUS_0, NULL) == FWD_BLOCK);
     CHECK(fwd(0x4ED, CAN_BUS_0, &m) == FWD_MODIFIED);
     CHECK(m.data[5] == 0x10 && m.data[6] == 0xA0 && m.data[7] == 0x00);
     CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);
+
+    // A downgrade while a repeating session is active is a fresh, silent BMU
+    // restart rather than a continuation of the old attempt.
+    requested.retries = 3;
+    int sent_before_bmu_restart = sent_count;
+    car_status(0x05, CAN_BUS_0);
+    expect_state("wait-started");
+    CHECK(requested.kind == ATTEMPT_BMU_RESTART);
+    CHECK(requested.retries == 0);
+    CHECK(requested.last_attempt_ts == fake_now);
+    CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);
+    CHECK(sent_count == sent_before_bmu_restart);
+    car_status(0x15, CAN_BUS_0);
+    expect_state("active");
 
     // while the BMU reports running, no re-requests ever fire
     sent_count = 0;
@@ -445,11 +465,12 @@ static void run_continuous(void) {
     car_status(0x15, CAN_BUS_0);
     advance_us(310000000LL);
     CHECK(sent_count == 0);
-    expect_state("managed");
+    expect_state("active");
 
-    // BMU stops: the idle edge arms the 5-minute re-nudge
+    // BMU stops: enter MANAGED and arm the 5-minute re-nudge on this idle edge
     car_status(0x01, CAN_BUS_0);
     expect_state("managed");
+    CHECK(managed.nudge_base_ts == fake_now);
     advance_us(295000000LL);                    // just under 5 minutes
     CHECK(sent_count == 0);
     expect_state("managed");
@@ -466,12 +487,58 @@ static void run_continuous(void) {
     sent_count = 0;
     advance_until_state("managed", 11000000LL);
     CHECK(sent_count == 0);                     // no retry bursts, no stop burst
+    CHECK(managed.nudge_base_ts == fake_now);
 
-    // next interval: nudge again, confirm mid-burst
-    car_status(0x01, CAN_BUS_0);                // re-arm (ctx was re-zeroed)
+    // A late start after the periodic timeout re-enters REQUESTED with fresh,
+    // silent BMU-restart context. If it stalls, no burst is sent and a fresh
+    // MANAGED interval begins.
+    requested.retries = 3;                     // stale prior-attempt context
+    car_status(0x05, CAN_BUS_0);
+    expect_state("wait-started");
+    CHECK(requested.kind == ATTEMPT_BMU_RESTART);
+    CHECK(requested.retries == 0);
+    CHECK(requested.last_attempt_ts == fake_now);
+    CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);
+    sent_count = 0;
+    advance_until_state("managed", 71000000LL);
+    CHECK(sent_count == 0);
+    CHECK(managed.nudge_base_ts == fake_now);
+
+    // An observed restart that falls back to idle keeps the same 70-second
+    // confirmation window, then returns to MANAGED without sending a burst.
+    car_status(0x05, CAN_BUS_0);
+    expect_state("wait-started");
+    car_status(0x01, CAN_BUS_0);
+    expect_state("wait-started");
+    sent_count = 0;
+    advance_until_state("managed", 71000000LL);
+    CHECK(sent_count == 0);
+    CHECK(managed.nudge_base_ts == fake_now);
+
+    // A fully-started report in MANAGED takes the same clean re-entry path,
+    // then routes directly to ACTIVE without sending a start burst.
+    requested.retries = 3;
+    sent_count = 0;
+    car_status(0x15, CAN_BUS_0);
+    expect_state("active");
+    CHECK(requested.kind == ATTEMPT_BMU_RESTART);
+    CHECK(requested.retries == 0);
+    CHECK(sent_count == 0);
+    car_status(0x01, CAN_BUS_0);
+    expect_state("managed");
+
+    // next interval: the latest status at the end of the burst determines
+    // routing rather than the highest status observed during it
     advance_until_state("start-burst", 302000000LL);
     car_status(0x15, CAN_BUS_0);
+    car_status(0x01, CAN_BUS_0);
     for (int i = 0; i < 6; i++) tick1();        // burst still runs to completion
+    expect_state("wait-starting");
+    car_status(0x15, CAN_BUS_0);
+    expect_state("active");
+
+    // another completed session returns to the repeating-mode resting state
+    car_status(0x01, CAN_BUS_0);
     expect_state("managed");
 
     // toggle while managed: latch off, active stop
@@ -491,12 +558,12 @@ static void run_continuous(void) {
     expect_state("idle");
     CHECK(fwd(0x0C7, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);
 
-    // car-off while managed drops the latch entirely (continuous)
+    // car-off while active drops the latch entirely (continuous)
     toggle();
     for (int i = 0; i < 6; i++) tick1();
     car_status(0x05, CAN_BUS_0);
     car_status(0x15, CAN_BUS_0);
-    expect_state("managed");
+    expect_state("active");
     car_power(false);
     expect_state("idle");
     sent_count = 0;
@@ -541,9 +608,9 @@ static void run_persistent(void) {
     for (int i = 0; i < 5; i++) tick1();
     car_status(0x05, CAN_BUS_0);
     car_status(0x15, CAN_BUS_0);
-    expect_state("managed");
+    expect_state("active");
 
-    // car off: the session survives in MANAGED, latch stays in flash
+    // car off: the enabled session rests in MANAGED, latch stays in flash
     unsigned int commits_before = fake_nvs_commit_count;
     car_power(false);
     expect_state("managed");
@@ -574,16 +641,19 @@ static void run_persistent(void) {
     check_start_burst_msgs(0);
     car_status(0x05, CAN_BUS_0);
     car_status(0x15, CAN_BUS_0);
-    expect_state("managed");
+    expect_state("active");
 
     // BMU stops: the 5-minute re-nudge re-enters REQUESTED; neither it nor the
     // relaunch above changes the mirrored latch, so neither writes flash
     car_status(0x01, CAN_BUS_0);
+    expect_state("managed");
     advance_until_state("start-burst", 302000000LL);
     CHECK(requested.kind == ATTEMPT_PERIODIC);
     for (int i = 0; i < 6; i++) tick1();
     car_status(0x05, CAN_BUS_0);
     car_status(0x15, CAN_BUS_0);
+    expect_state("active");
+    car_status(0x01, CAN_BUS_0);
     expect_state("managed");
     CHECK(fake_nvs_commit_count == commits_before);
 
@@ -612,9 +682,16 @@ static void run_persistent_restore(void) {
     precondition_init();
     expect_state("managed");                    // restored latch parks in MANAGED
     CHECK(fwd(0x0C7, CAN_BUS_0, NULL) == FWD_BLOCK);  // MITM guards the latch from boot
+    // A late status report moves a restored session into ACTIVE, then its
+    // idle edge returns to MANAGED without clearing the persistent latch.
+    car_status(0x15, CAN_BUS_0);
+    expect_state("active");
+    CHECK(requested.kind == ATTEMPT_BMU_RESTART);
+    CHECK(requested.retries == 0);
+    car_status(0x01, CAN_BUS_0);
+    expect_state("managed");
     // no nudges before the car is ready
     sent_count = 0;
-    car_status(0x01, CAN_BUS_0);
     advance_us(310000000LL);
     CHECK(sent_count == 0);
     expect_state("managed");
@@ -631,7 +708,7 @@ static void run_persistent_restore(void) {
     for (int i = 0; i < 6; i++) tick1();
     car_status(0x05, CAN_BUS_0);
     car_status(0x15, CAN_BUS_0);
-    expect_state("managed");
+    expect_state("active");
     CHECK(fake_nvs_commit_count == 0);          // the restore itself never rewrites flash
 }
 
