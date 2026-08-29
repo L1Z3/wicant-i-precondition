@@ -1,14 +1,12 @@
 name: clang-tidy lint
 
-# Static analysis of the project's own sources (main/ + components/) with
-# clang-tidy, against a sanitized copy of the build's compile database.
+# Static analysis of the project's own sources (main/ + components/) via
+# idf.py clang-check (ESP-IDF pyclang, IDF_TOOLCHAIN=clang / esp-clang).
 # Uses the same vendored esp-idf submodule + ESP-IDF toolchain cache as
 # build-firmware.yml, but only needs the `custom` variant (both variants share
 # all sources; sdkconfig deltas don't affect lint checks).
 #
-# The job FAILS on any finding. The current tree has ~63 pre-existing findings
-# (mostly real bugs: null-deref, uninitialized args, integer overflow); work
-# them down rather than relaxing .clang-tidy wholesale.
+# The job FAILS on any finding.
 
 on:
   workflow_dispatch:
@@ -40,15 +38,12 @@ jobs:
           restore-keys: |
             espressif-${{ runner.os }}-esp32s3-
 
-      - name: Install ESP-IDF (esp32s3 toolchain)
-        run: ./esp-idf/install.sh esp32s3
-
-      - name: Install clang-tidy
+      - name: Install ESP-IDF (esp32s3 + esp-clang)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-tidy
+          ./esp-idf/install.sh esp32s3
+          ./esp-idf/tools/idf_tools.py install esp-clang
 
-      - name: Run clang-tidy
+      - name: Run clang-tidy via idf.py clang-check
         run: |
           . ./esp-idf/export.sh
           ./lint.sh custom
