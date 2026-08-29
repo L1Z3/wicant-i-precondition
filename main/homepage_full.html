@@ -558,6 +558,14 @@
                     <td><div id="battery_temp_status">Waiting for CAN data</div></td>
                 </tr>
                 <tr>
+                    <td>Car Power State:</td>
+                    <td><div id="car_power_status">Waiting for CAN data</div></td>
+                </tr>
+                <tr>
+                    <td>Charging:</td>
+                    <td><div id="charge_status">Waiting for CAN data</div></td>
+                </tr>
+                <tr>
                     <td><input id="check_status_button" name="check_status_button" type="button" onclick="checkStatus()"
                             value="Check status" /></td>
                     <td>&nbsp;</td>
@@ -2567,6 +2575,17 @@ function loadAutoTable(jsonData) {
 				document.getElementById("battery_temp_status").textContent = `Min: ${obj.battery_temp_min_c} °C; Max: ${obj.battery_temp_max_c} °C; (${formatAge(obj.battery_temp_age_ms)} ago)`;
 			} else {
 				document.getElementById("battery_temp_status").textContent = "Waiting for CAN data";
+			}
+			if (obj.car_power_valid) {
+				const raw = ("0" + Number(obj.car_power_raw).toString(16).toUpperCase()).slice(-2);
+				const states = { ready: "Ready", charging: "Charging", off: "Off" };
+				const label = states[obj.car_power_state] || obj.car_power_state || "Unknown";
+				const age = formatAge(obj.car_power_age_ms);
+				document.getElementById("car_power_status").textContent = `${label} (0x${raw}; ${age} ago)`;
+				document.getElementById("charge_status").textContent = `${obj.charging ? "Yes" : "No"} (${age} ago)`;
+			} else {
+				document.getElementById("car_power_status").textContent = "Waiting for CAN data";
+				document.getElementById("charge_status").textContent = "Waiting for CAN data";
 			}
 			document.getElementById("port_status").innerHTML = obj.port;
 			document.getElementById("fw_version").innerHTML = obj.fw_version;

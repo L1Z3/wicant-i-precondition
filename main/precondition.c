@@ -156,6 +156,8 @@ static bool activation_is_release(const message_payload_t *msg, const twai_messa
 #define POWER_STATUS_MASK 0x0FU
 #define POWER_STATUS_READY(power_status_byte) \
     (((power_status_byte) & POWER_STATUS_MASK) == 0x04U)
+#define POWER_STATUS_CHARGING(power_status_byte) \
+    (((power_status_byte) & POWER_STATUS_MASK) == CAR_POWER_CHARGING)
 
 #define PRECONDITION_DEBOUNCE_US 1000000U  // 1 second
 #define PRECONDITION_LONG_PRESS_US 1000000U  // short/long press threshold: 1 second
@@ -297,6 +299,7 @@ static struct {
 } button;
 
 static QueueHandle_t battery_temperature_queue = NULL;
+static QueueHandle_t car_power_queue = NULL;
 
 // ********************* config snapshot *********************
 
@@ -908,6 +911,18 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
             && rx_bus == CAR_BUS
             && to_push->data_length_code >= 1U) {
         bool ready = POWER_STATUS_READY(to_push->data[0]);
+
+        // Publish every frame, not just edges: a consumer needs to tell "in
+        // READY right now" from "READY was the last thing seen before the bus
+        // went quiet", and only a per-frame timestamp does that.
+        precondition_power_t power = {
+            .ready = ready,
+            .charging = POWER_STATUS_CHARGING(to_push->data[0]),
+            .raw = to_push->data[0],
+            .updated_at_us = sm_now(sm),
+        };
+        xQueueOverwrite(car_power_queue, &power);
+
         if (ready != platform.car_in_ready) {
             platform.car_in_ready = ready;
             ESP_LOGI(TAG, "car power: %s", ready ? "ready" : "off");
@@ -998,6 +1013,8 @@ void precondition_init(void) {
 
     battery_temperature_queue = xQueueCreate(1, sizeof(precondition_temperature_t));
     configASSERT(battery_temperature_queue != NULL);
+    car_power_queue = xQueueCreate(1, sizeof(precondition_power_t));
+    configASSERT(car_power_queue != NULL);
     sm_init(&precon_sm, "precondition", &S_IDLE, &precondition_global_hooks);
 }
 
@@ -1025,4 +1042,12 @@ bool precondition_get_battery_temperature(precondition_temperature_t *out) {
     }
 
     return xQueuePeek(battery_temperature_queue, out, 0) == pdTRUE;
+}
+
+bool precondition_get_car_power(precondition_power_t *out) {
+    if (out == NULL || car_power_queue == NULL) {
+        return false;
+    }
+
+    return xQueuePeek(car_power_queue, out, 0) == pdTRUE;
 }
