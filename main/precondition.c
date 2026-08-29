@@ -297,6 +297,8 @@ static struct {
 } button;
 
 static QueueHandle_t battery_temperature_queue = NULL;
+static QueueHandle_t precondition_state_queue = NULL;
+static QueueHandle_t precondition_toggle_queue = NULL;
 
 // ********************* config snapshot *********************
 
@@ -889,6 +891,8 @@ static const sm_state_t S_WAIT_STOPPED = {
 
 // ********************* global hooks *********************
 
+static void push_precondition_state(void);
+
 static void precondition_global_tick(sm_t *sm) {
     // long press mode: trigger once when the hold crosses the threshold, without
     // waiting for the release frame. state only becomes pressed via the rx hook,
@@ -899,6 +903,15 @@ static void precondition_global_tick(sm_t *sm) {
         button.long_press_fired = true;
         sm_send_event(sm, EV_TOGGLE);
     }
+    // web UI toggle requests are handled here, on the precondition task, so
+    // the precondition state machine stays single-writer
+    uint8_t toggle_cmd = 0;
+    if (precondition_toggle_queue != NULL
+            && xQueueReceive(precondition_toggle_queue, &toggle_cmd, 0) == pdTRUE) {
+        sm_send_event(&precon_sm, EV_TOGGLE);
+    }
+
+    push_precondition_state();
 }
 
 static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_bus_t rx_bus) {
@@ -984,6 +997,40 @@ static const sm_hooks_t precondition_global_hooks = {
 
 // ********************* public API *********************
 
+// push the current state into the queue so the web UI can read it with xQueuePeek
+static void push_precondition_state(void) {
+    if (precondition_state_queue == NULL) {
+        return;
+    }
+    // derive the display state straight from the machine's current leaf:
+    // requested is any state under REQUESTED (incl. MANAGED), starting is the
+    // two wait states, active only once fully running in ACTIVE
+    precondition_state_t state = {
+        .requested = sm_in(&precon_sm, &S_REQUESTED),
+        .active = sm_in(&precon_sm, &S_ACTIVE),
+        .starting = sm_in(&precon_sm, &S_WAIT_STARTING) || sm_in(&precon_sm, &S_WAIT_STARTED),
+    };
+    xQueueOverwrite(precondition_state_queue, &state);
+}
+
+// web UI polls this with xQueuePeek to display preconditioning status
+bool precondition_get_state(precondition_state_t *out) {
+    if (out == NULL || precondition_state_queue == NULL) {
+        return false;
+    }
+    return xQueuePeek(precondition_state_queue, out, 0) == pdTRUE;
+}
+
+// called from the web UI (http server task); hand off to the precondition task
+// via a queue so the precondition state machine stays single-writer
+void precondition_toggle_request(void) {
+    if (precondition_toggle_queue == NULL) {
+        return;
+    }
+    uint8_t cmd = 1;
+    xQueueOverwrite(precondition_toggle_queue, &cmd);
+}
+
 void precondition_init(void) {
     precon_config.button_type = config_server_precon_button();
     precon_config.press_type = config_server_precon_press();
@@ -998,7 +1045,12 @@ void precondition_init(void) {
 
     battery_temperature_queue = xQueueCreate(1, sizeof(precondition_temperature_t));
     configASSERT(battery_temperature_queue != NULL);
+    precondition_state_queue = xQueueCreate(1, sizeof(precondition_state_t));
+    configASSERT(precondition_state_queue != NULL);
+    precondition_toggle_queue = xQueueCreate(1, sizeof(uint8_t));
+    configASSERT(precondition_toggle_queue != NULL);
     sm_init(&precon_sm, "precondition", &S_IDLE, &precondition_global_hooks);
+    push_precondition_state();
 }
 
 // called every 40ms

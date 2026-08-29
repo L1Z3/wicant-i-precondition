@@ -50,6 +50,14 @@ BaseType_t xQueuePeek(QueueHandle_t qh, void *item, TickType_t w) {
     memcpy(item, q->data, q->size);
     return 1;
 }
+BaseType_t xQueueReceive(QueueHandle_t qh, void *item, TickType_t w) {
+    (void)w;
+    fake_queue_t *q = qh;
+    if (!q->has) return 0;
+    memcpy(item, q->data, q->size);
+    q->has = 0;
+    return 1;
+}
 
 static int8_t cfg_button = SW_STAR;
 static int8_t cfg_mode = ONCE;
@@ -155,9 +163,23 @@ static void check_stop_burst_msgs(int base) {
     }
 }
 
+// snapshot the web UI display state: push_precondition_state() derives it from
+// the machine's current leaf, so call it directly (the test includes the
+// source) rather than waiting for a tick, then read the queue like the UI does
+static precondition_state_t precondition_display(void) {
+    precondition_state_t s;
+    push_precondition_state();
+    if (!precondition_get_state(&s)) {
+        s = (precondition_state_t){0};
+    }
+    return s;
+}
+
 static void run_short_press(void) {
     precondition_init();
     expect_state("idle");
+    CHECK(!precondition_display().starting);
+    CHECK(!precondition_display().active);
 
     // --- platform without status frames: no retries, fake-active at 70s ---
     sent_count = 0;
@@ -181,6 +203,8 @@ static void run_short_press(void) {
     advance_us(71000000);
     expect_state("active");
     CHECK(sent_count == 0);                    // no retries without status frames
+    CHECK(precondition_display().active);
+    CHECK(!precondition_display().starting);
     CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);  // display off in active
     CHECK(fwd(0x0C7, CAN_BUS_0, NULL) == FWD_BLOCK);        // still blocking
     // stop without status frames: burst then straight to idle, no display
@@ -193,6 +217,8 @@ static void run_short_press(void) {
     CHECK(sent_count == 6);
     check_stop_burst_msgs(0);
     expect_state("idle");
+    CHECK(!precondition_display().active);
+    CHECK(!precondition_display().starting);
 
     // --- happy path with status frames ---
     toggle();
@@ -206,14 +232,19 @@ static void run_short_press(void) {
     expect_state("start-burst");
     for (int i = 0; i < 6; i++) tick1();
     expect_state("wait-starting");
+    CHECK(precondition_display().starting);
     CHECK(fwd(0x4E8, CAN_BUS_0, &m) == FWD_MODIFIED);
     CHECK((m.data[6] & 0x0F) == 0x1);          // FLAG_BLUE_1 before starting confirm
     car_status(0x45, CAN_BUS_0);               // EV6-style "starting"
     expect_state("wait-started");
+    CHECK(precondition_display().starting);
+    CHECK(!precondition_display().active);
     CHECK(fwd(0x4E8, CAN_BUS_0, &m) == FWD_MODIFIED);
     CHECK((m.data[6] & 0x0F) == 0x0);          // FLAG_DESTINATION after starting confirm
     car_status(0x55, CAN_BUS_0);               // EV6-style "started"
     expect_state("active");
+    CHECK(precondition_display().active);
+    CHECK(!precondition_display().starting);
     // Once-mode downgrade stays within the original request and retains its
     // retry budget.
     requested.retries = 2;
@@ -221,11 +252,16 @@ static void run_short_press(void) {
     expect_state("wait-started");
     CHECK(requested.kind == ATTEMPT_MANUAL);
     CHECK(requested.retries == 2);
+    CHECK(precondition_display().starting);
+    CHECK(!precondition_display().active);
     car_status(0x15, CAN_BUS_0);
     expect_state("active");
+    CHECK(precondition_display().active);
     // "complete" in ONCE mode -> real stop
     car_status(0x01, CAN_BUS_0);
     expect_state("stop-burst");
+    CHECK(!precondition_display().active);
+    CHECK(!precondition_display().starting);
     car_status(0x01, CAN_BUS_0);               // stop confirm ignored during burst
     expect_state("stop-burst");
     CHECK(fwd(0x4E8, CAN_BUS_1, NULL) == FWD_PASSTHROUGH);
@@ -236,6 +272,8 @@ static void run_short_press(void) {
     expect_state("wait-stopped");
     car_status(0x01, CAN_BUS_0);
     expect_state("idle");
+    CHECK(!precondition_display().active);
+    CHECK(!precondition_display().starting);
 
     // --- debounce ---
     toggle();
@@ -244,8 +282,10 @@ static void run_short_press(void) {
     CHECK(sm_in(&precon_sm, &S_REQUESTED));
     advance_us(1200000);
     expect_state("wait-starting");
+    CHECK(precondition_display().starting);
     toggle();                                   // past debounce: stop
     expect_state("stop-burst");
+    CHECK(!precondition_display().starting);
     toggle();                                   // toggle during stopping restarts
     expect_state("start-burst");
     advance_us(1200000);
@@ -261,11 +301,13 @@ static void run_short_press(void) {
     for (int i = 0; i < 6; i++) tick1();
     expect_state("wait-starting");
     CHECK(requested.retries == 0);
+    CHECK(precondition_display().starting);
     for (int r = 1; r <= 4; r++) {
         advance_until_state("start-burst", 11000000);   // >10s: retry
         CHECK(requested.retries == r);
         for (int i = 0; i < 6; i++) tick1();
         expect_state("wait-starting");
+        CHECK(precondition_display().starting);
     }
     CHECK(sent_count == 5 * 6);
     CHECK(fwd(0x4E8, CAN_BUS_0, &m) == FWD_MODIFIED);
@@ -274,6 +316,8 @@ static void run_short_press(void) {
     int base = sent_count;
     advance_until_state("stop-burst", 11000000);
     CHECK(stopping.retries == 4);
+    CHECK(!precondition_display().starting);
+    CHECK(!precondition_display().active);
     CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);  // silent stop: no display
     for (int i = 0; i < 6; i++) tick1();
     expect_state("wait-stopped");
@@ -282,12 +326,14 @@ static void run_short_press(void) {
     advance_us(10100000);                       // no stop retries in the give-up case
     expect_state("idle");
     CHECK(sent_count == base + 6);
+    CHECK(!precondition_display().starting);
 
     // --- wait-started timeout retries at 70s, confirm mid-burst ---
     toggle();
     for (int i = 0; i < 6; i++) tick1();
     car_status(0x05, CAN_BUS_0);
     expect_state("wait-started");
+    CHECK(precondition_display().starting);
     advance_us(10100000);
     expect_state("wait-started");               // 10s retry does NOT apply here
     advance_until_state("start-burst", 61000000);  // ...but 70s does
@@ -295,12 +341,15 @@ static void run_short_press(void) {
     sent_count = 0;
     for (int i = 0; i < 3; i++) tick1();        // mid-burst
     expect_state("start-burst");
+    CHECK(!precondition_display().starting);  // timeout cleared the wait flag
     car_status(0x15, CAN_BUS_0);                // started confirm mid-burst
     expect_state("start-burst");                // burst still runs to completion
     CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);  // but display is off
     for (int i = 0; i < 3; i++) tick1();
     CHECK(sent_count == 6);                     // full burst sent despite confirm
     expect_state("active");
+    CHECK(precondition_display().active);
+    CHECK(!precondition_display().starting);
     // stop retries
     fake_now += 2000000;
     toggle();
@@ -313,6 +362,7 @@ static void run_short_press(void) {
     expect_state("wait-stopped");
     car_status(0x01, CAN_BUS_0);
     expect_state("idle");
+    CHECK(!precondition_display().active);
 
     // --- the car turning off silently abandons an attempt (all modes) ---
     car_power(true);
@@ -320,9 +370,11 @@ static void run_short_press(void) {
     toggle();
     for (int i = 0; i < 6; i++) tick1();
     expect_state("wait-starting");
+    CHECK(precondition_display().starting);
     sent_count = 0;
     car_power(false);
     expect_state("idle");
+    CHECK(!precondition_display().starting);
     CHECK(sent_count == 0);                    // no stop burst: nothing left to stop
     CHECK(fwd(0x0C7, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);
 
@@ -435,10 +487,14 @@ static void run_continuous(void) {
     CHECK(fwd(0x4E8, CAN_BUS_0, &m) == FWD_MODIFIED);
     for (int i = 0; i < 6; i++) tick1();
     expect_state("wait-starting");
+    CHECK(precondition_display().starting);
     car_status(0x05, CAN_BUS_0);
     expect_state("wait-started");
+    CHECK(precondition_display().starting);
     car_status(0x15, CAN_BUS_0);
     expect_state("active");
+    CHECK(precondition_display().active);
+    CHECK(!precondition_display().starting);
     // MITM stays on while preconditioning is active; the display does not
     CHECK(fwd(0x0C7, CAN_BUS_0, NULL) == FWD_BLOCK);
     CHECK(fwd(0x4ED, CAN_BUS_0, &m) == FWD_MODIFIED);
@@ -471,23 +527,28 @@ static void run_continuous(void) {
     car_status(0x01, CAN_BUS_0);
     expect_state("managed");
     CHECK(managed.nudge_base_ts == fake_now);
+    CHECK(!precondition_display().active);             // idle while waiting to re-nudge
     advance_us(295000000LL);                    // just under 5 minutes
     CHECK(sent_count == 0);
     expect_state("managed");
     advance_until_state("start-burst", 10000000LL);
     CHECK(requested.kind == ATTEMPT_PERIODIC);
+    CHECK(!precondition_display().starting);  // start-burst is not a wait state
     CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);  // periodic attempts are silent
     sent_count = 0;
     for (int i = 0; i < 6; i++) tick1();
     CHECK(sent_count == 6);
     check_start_burst_msgs(0);
     expect_state("wait-starting");
+    CHECK(precondition_display().starting);
 
     // periodic attempts are one-shot: a 10s timeout goes back to MANAGED
     sent_count = 0;
     advance_until_state("managed", 11000000LL);
     CHECK(sent_count == 0);                     // no retry bursts, no stop burst
     CHECK(managed.nudge_base_ts == fake_now);
+    CHECK(!precondition_display().starting);
+    CHECK(!precondition_display().active);             // never confirmed started
 
     // A late start after the periodic timeout re-enters REQUESTED with fresh,
     // silent BMU-restart context. If it stalls, no burst is sent and a fresh
@@ -540,17 +601,20 @@ static void run_continuous(void) {
     // another completed session returns to the repeating-mode resting state
     car_status(0x01, CAN_BUS_0);
     expect_state("managed");
+    CHECK(!precondition_display().active);       // managed is not ACTIVE
 
     // toggle while managed: latch off, active stop
     fake_now += 2000000;                        // clear the start/stop debounce
     sent_count = 0;
     toggle();
     expect_state("stop-burst");
+    CHECK(!precondition_display().active);
     for (int i = 0; i < 6; i++) tick1();
     check_stop_burst_msgs(0);
     expect_state("wait-stopped");
     car_status(0x01, CAN_BUS_0);
     expect_state("idle");
+    CHECK(!precondition_display().active);
     // latch is off: idle status + 5 minutes produce nothing
     sent_count = 0;
     advance_us(310000000LL);
@@ -564,8 +628,11 @@ static void run_continuous(void) {
     car_status(0x05, CAN_BUS_0);
     car_status(0x15, CAN_BUS_0);
     expect_state("active");
+    CHECK(precondition_display().active);
+    CHECK(!precondition_display().starting);
     car_power(false);
     expect_state("idle");
+    CHECK(!precondition_display().active);
     sent_count = 0;
     car_power(true);                            // ready again: nothing restarts
     expect_state("idle");
@@ -583,10 +650,12 @@ static void run_continuous(void) {
         CHECK(requested.retries == r);
         for (int i = 0; i < 6; i++) tick1();
         expect_state("wait-starting");
+        CHECK(precondition_display().starting);
     }
     sent_count = 0;
     advance_until_state("managed", 11000000LL);
     CHECK(sent_count == 0);                     // no stop burst on repeating give-up
+    CHECK(!precondition_display().active);             // start never confirmed: no "active"
     CHECK(fwd(0x0C7, CAN_BUS_0, NULL) == FWD_BLOCK);  // MITM stays latched
 }
 
@@ -609,11 +678,14 @@ static void run_persistent(void) {
     car_status(0x05, CAN_BUS_0);
     car_status(0x15, CAN_BUS_0);
     expect_state("active");
+    CHECK(precondition_display().active);
+    CHECK(!precondition_display().starting);
 
     // car off: the enabled session rests in MANAGED, latch stays in flash
     unsigned int commits_before = fake_nvs_commit_count;
     car_power(false);
     expect_state("managed");
+    CHECK(!precondition_display().active);             // parked: no active session shown
     CHECK(fake_nvs_value == 1);
     CHECK(fwd(0x0C7, CAN_BUS_0, NULL) == FWD_BLOCK);   // MITM still latched
     // no nudges while the car is off
@@ -642,6 +714,8 @@ static void run_persistent(void) {
     car_status(0x05, CAN_BUS_0);
     car_status(0x15, CAN_BUS_0);
     expect_state("active");
+    CHECK(precondition_display().active);
+    CHECK(!precondition_display().starting);
 
     // BMU stops: the 5-minute re-nudge re-enters REQUESTED; neither it nor the
     // relaunch above changes the mirrored latch, so neither writes flash
@@ -661,6 +735,7 @@ static void run_persistent(void) {
     fake_now += 2000000;
     toggle();
     expect_state("stop-burst");
+    CHECK(!precondition_display().active);
     CHECK(!repeating_mode_enabled());
     tick1();
     CHECK(fake_nvs_value == 0);                 // lower-priority worker flushed the clear
@@ -681,6 +756,7 @@ static void run_persistent_restore(void) {
     fake_nvs_value = 1;
     precondition_init();
     expect_state("managed");                    // restored latch parks in MANAGED
+    CHECK(!precondition_display().active);             // car not ready at boot: no session
     CHECK(fwd(0x0C7, CAN_BUS_0, NULL) == FWD_BLOCK);  // MITM guards the latch from boot
     // A late status report moves a restored session into ACTIVE, then its
     // idle edge returns to MANAGED without clearing the persistent latch.
@@ -709,6 +785,8 @@ static void run_persistent_restore(void) {
     car_status(0x05, CAN_BUS_0);
     car_status(0x15, CAN_BUS_0);
     expect_state("active");
+    CHECK(precondition_display().active);
+    CHECK(!precondition_display().starting);
     CHECK(fake_nvs_commit_count == 0);          // the restore itself never rewrites flash
 }
 
@@ -798,6 +876,7 @@ static void run_once_ignores_stored_latch(void) {
     car_status(0x05, CAN_BUS_0);
     car_status(0x15, CAN_BUS_0);
     expect_state("active");                     // not managed
+    CHECK(precondition_display().active);
 }
 
 // ---- suite table ----
