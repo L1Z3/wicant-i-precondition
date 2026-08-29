@@ -1,8 +1,8 @@
 # clang-tidy configuration for wicant-i-precondition firmware.
 #
-# Sources are C (gnu17) compiled by xtensa-elf-gcc; clang-tidy runs against a
-# sanitized compile database (see tools/clang-tidy/) and only analyzes this
-# repo's sources under main/ and components/.
+# Sources are C (gnu17) compiled by xtensa-elf-gcc; clang-tidy runs against
+# a clang-native compilation database (ESP-IDF pyclang + esp-clang) and only
+# analyzes this repo's sources under main/ and components/.
 #
 # Bug-finding and readability checks that catch real problems in embedded C.
 # The big noise sources are disabled on purpose: every sprintf/strcpy in the
@@ -11,7 +11,7 @@
 # targeted suppression (// NOLINT, or a per-check exclusion below) over turning
 # off the whole family.
 #
-# Two families disabled after an audit of all their findings (2026-08):
+# Three families disabled after an audit of all their findings (2026-08):
 # - readability-misleading-indentation: upstream code mixes tabs/spaces in
 #   brace-delimited if/else chains; all findings were false-positive style
 #   noise (no dangle-else). Existing sites were fixed in code; the check stays
@@ -19,6 +19,10 @@
 # - bugprone-implicit-widening-of-multiplication-result: every instance is a
 #   small constant (20*1000, 1000*1000, ...) multiplied in int and compared to
 #   an int64_t timer value; none can overflow in practice.
+# - bugprone-multi-level-implicit-pointer-conversion: every instance is a
+#   FreeRTOS xQueue* call passing &frame (const twai_frame_t **) where the
+#   macro signature takes void*; inherent to the API, not fixable at the
+#   call site.
 Checks: >-
   -*,
   bugprone-*,
@@ -29,6 +33,7 @@ Checks: >-
   readability-redundant-control-flow,
   -bugprone-easily-swappable-parameters,
   -bugprone-implicit-widening-of-multiplication-result,
+  -bugprone-multi-level-implicit-pointer-conversion,
   -bugprone-narrowing-conversions,
   -bugprone-switch-missing-default-case,
   -clang-analyzer-optin.*,
