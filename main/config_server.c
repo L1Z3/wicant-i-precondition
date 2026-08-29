@@ -988,6 +988,25 @@ char *config_server_get_status_json(bool remove_sensitive_info)
         cJSON_AddBoolToObject(root, "battery_temp_valid", false);
 	}
 
+	precondition_power_t car_power;
+
+	if (precondition_get_car_power(&car_power)) {
+        cJSON_AddBoolToObject(root, "car_power_valid", true);
+        cJSON_AddBoolToObject(root, "car_ready", car_power.ready);
+        cJSON_AddBoolToObject(root, "charging", car_power.charging);
+        cJSON_AddStringToObject(root, "car_power_state",
+                car_power.ready ? "ready" : (car_power.charging ? "charging" : "off"));
+        cJSON_AddNumberToObject(root, "car_power_raw", car_power.raw);
+        cJSON_AddNumberToObject(
+            root,
+            "car_power_age_ms",
+            (esp_timer_get_time() - car_power.updated_at_us) / 1000
+        );
+	} else {
+        cJSON_AddBoolToObject(root, "car_power_valid", false);
+        cJSON_AddStringToObject(root, "car_power_state", "unknown");
+	}
+
 	{
 		char volt[12] = {0};
 		float tmp = 0;
