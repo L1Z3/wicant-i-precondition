@@ -250,6 +250,13 @@ typedef enum {
     ATTEMPT_BMU_RESTART, // status-only BMU restart; silent and not retried directly
 } attempt_kind_t;
 
+typedef uint8_t precondition_blockers_t;
+
+enum {
+    PRECONDITION_BLOCK_NONE = 0U,
+    PRECONDITION_BLOCK_BATTERY_WARM = 1U << 0,
+};
+
 // owned by IDLE
 static struct {
     // one-shot notice carried across the off-to-ready power cycle
@@ -310,6 +317,17 @@ static struct {
 static QueueHandle_t battery_temperature_queue = NULL;
 static QueueHandle_t precondition_state_queue = NULL;
 static QueueHandle_t precondition_toggle_queue = NULL;
+
+// Reasons that a start attempt cannot proceed.
+static precondition_blockers_t precon_blockers = PRECONDITION_BLOCK_NONE;
+
+static void set_precon_blocker(precondition_blockers_t blocker, bool active) {
+    if (active) {
+        precon_blockers |= blocker;
+    } else {
+        precon_blockers &= ~blocker;
+    }
+}
 
 // ********************* config snapshot *********************
 
@@ -607,20 +625,23 @@ static void car_start_delay_tick(sm_t *sm) {
 
 // ********************* REQUESTED / START_BURST *********************
 
-// Abort a start attempt when the entire battery is already at the
-// preconditioning cutoff.
-static bool stop_start_if_battery_too_warm(sm_t *sm) {
-    precondition_temperature_t temperature;
-    if (!precondition_get_battery_temperature(&temperature)
-            || temperature.min_c < PRECONDITION_BATTERY_TEMPERATURE_CUTOFF_C) {
+// Abort an in-progress start attempt when any known blocking condition is active.
+static bool stop_start_if_blocked(sm_t *sm) {
+    if (precon_blockers == PRECONDITION_BLOCK_NONE) {
         return false;
     }
 
-    ESP_LOGI(TAG, "Start blocked: battery minimum temperature is %d C", temperature.min_c);
-    if (requested.kind == ATTEMPT_MANUAL && precon_config.mode == ONCE) {
-        char message[48];
-        snprintf(message, sizeof(message), "Once: temp too high: %d°C ≥ 21°C", temperature.min_c);
-        track_popup_show(message);
+    if (precon_blockers & PRECONDITION_BLOCK_BATTERY_WARM) {
+        precondition_temperature_t temperature;
+        if (precondition_get_battery_temperature(&temperature)) {
+            ESP_LOGI(TAG, "Start blocked: battery minimum temperature is %d C", temperature.min_c);
+            if (requested.kind == ATTEMPT_MANUAL && precon_config.mode == ONCE) {
+                char message[48];
+                snprintf(message, sizeof(message), "Once: temp too high: %d°C ≥ %d°C",
+                         temperature.min_c, PRECONDITION_BATTERY_TEMPERATURE_CUTOFF_C);
+                track_popup_show(message);
+            }
+        }
     }
     if (precon_config.mode == ONCE) {
         // silent attempt
@@ -634,11 +655,11 @@ static bool stop_start_if_battery_too_warm(sm_t *sm) {
 // retry timers and the countdown display measure from the moment the burst began
 static void start_burst_enter(sm_t *sm) {
     requested.last_attempt_ts = sm_now(sm);
-    stop_start_if_battery_too_warm(sm);
+    stop_start_if_blocked(sm);
 }
 
 static void start_burst_tick(sm_t *sm) {
-    if (stop_start_if_battery_too_warm(sm)) {
+    if (stop_start_if_blocked(sm)) {
         return;
     }
     uint32_t t = sm_ticks_in_state(sm);
@@ -663,7 +684,7 @@ static void start_burst_tick(sm_t *sm) {
 // ********************* REQUESTED / WAIT_STARTING *********************
 
 static void wait_starting_tick(sm_t *sm) {
-    if (stop_start_if_battery_too_warm(sm)) {
+    if (stop_start_if_blocked(sm)) {
         return;
     }
     int64_t time_since_last_attempt = ts_elapsed(sm_now(sm), requested.last_attempt_ts);
@@ -698,7 +719,7 @@ static bool wait_starting_event(sm_t *sm, sm_event_t ev) {
 // ********************* REQUESTED / WAIT_STARTED *********************
 
 static void wait_started_tick(sm_t *sm) {
-    if (stop_start_if_battery_too_warm(sm)) {
+    if (stop_start_if_blocked(sm)) {
         return;
     }
     // the car said "starting" but hasn't reached fully started
@@ -1044,6 +1065,10 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
         };
 
         xQueueOverwrite(battery_temperature_queue, &temperature);
+        set_precon_blocker(
+            PRECONDITION_BLOCK_BATTERY_WARM,
+            temperature.min_c >= PRECONDITION_BATTERY_TEMPERATURE_CUTOFF_C
+        );
     }
 
     int8_t precon_button_type = precon_config.button_type;
@@ -1126,7 +1151,8 @@ void precondition_init(void) {
     precon_config.button_type = config_server_precon_button();
     precon_config.press_type = config_server_precon_press();
     precon_config.mode = config_server_precon_mode();
-
+    precon_blockers = PRECONDITION_BLOCK_NONE;
+    
     if (precon_config.mode == PERSISTENT) {
         // Currently our only persistent setting is whether persistent
         // mode was enabled. If that changes, we should make this init

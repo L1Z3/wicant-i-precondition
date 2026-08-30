@@ -445,10 +445,12 @@ static void run_long_press(void) {
 static void run_battery_temperature_cutoff(void) {
     precondition_init();
     expect_state("idle");
+    CHECK(precon_blockers == PRECONDITION_BLOCK_NONE);
 
     // The cutoff is inclusive. A manual attempt displays an error and takes
     // the stop path without emitting any start frames.
     battery_temperature(21, 24);
+    CHECK(precon_blockers == PRECONDITION_BLOCK_BATTERY_WARM);
     sent_count = 0;
     toggle();
     expect_state("stop-burst");
@@ -462,6 +464,7 @@ static void run_battery_temperature_cutoff(void) {
 
     // A reading just below the cutoff still allows the normal start sequence.
     battery_temperature(20, 24);
+    CHECK(precon_blockers == PRECONDITION_BLOCK_NONE);
     sent_count = 0;
     toggle();
     expect_state("start-burst");
@@ -475,6 +478,7 @@ static void run_battery_temperature_cutoff(void) {
     for (int i = 0; i < 5; i++) tick1();
     expect_state("wait-starting");
     battery_temperature(21, 24);
+    CHECK(precon_blockers == PRECONDITION_BLOCK_BATTERY_WARM);
     tick1();
     expect_state("stop-burst");
     CHECK(popup_show_count == 2);
