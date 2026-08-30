@@ -27,7 +27,7 @@ typedef struct {
 void precondition_toggle_request(void);
 bool precondition_get_state(precondition_state_t *out);
 
-// Displayed state of charge is transmitted in half-percent steps.
+// SoC on 0x2FC frame is transmitted in half-percent steps.
 #define BATTERY_SOC_SCALE 0.5f
 
 typedef struct {

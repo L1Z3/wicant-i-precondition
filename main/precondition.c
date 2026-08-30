@@ -181,12 +181,7 @@ static bool activation_is_release(const message_payload_t *msg, const twai_messa
 
 #define IS_BATTERY_TEMPERATURE_FRAME(frame_id) ((frame_id) == BATTERY_TEMPERATURE_FRAME_ID)
 
-// High-voltage battery state of charge, broadcast on M-CAN. Byte 7 holds the
-// displayed SoC in half-percent steps. Checked against the recorded M-CAN logs
-// in tylerharvey/Ioniq5_CAN: 2027 matching frames across 11 logs all decode
-// inside 0-100%, hold one value per session, and differ between cars (63.5% vs
-// 75.5-78.5%). Byte 6 was ruled out because it moves several counts within
-// seconds of a climate start. Confirmed against the dash on an EV6.
+// High-voltage battery state of charge. Last byte has SoC in half-percent steps.
 #define BATTERY_SOC_FRAME_ID 0x2FCU
 #define BATTERY_SOC_INDEX 7U
 #define BATTERY_SOC_DATA_LENGTH 8U
