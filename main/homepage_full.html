@@ -554,6 +554,10 @@
                     </td>
                 </tr>
                 <tr>
+                    <td>HV Battery State of Charge:</td>
+                    <td><div id="battery_soc_status">Waiting for CAN data</div></td>
+                </tr>
+                <tr>
                     <td>HV Battery Temperature:</td>
                     <td><div id="battery_temp_status">Waiting for CAN data</div></td>
                 </tr>
@@ -2577,6 +2581,11 @@ function loadAutoTable(jsonData) {
 				document.getElementById("port_type_status").innerHTML = "TCP";
 			} else if(obj.port_type == "udp") {
 				document.getElementById("port_type_status").innerHTML = "UDP";
+			}
+			if (obj.battery_soc_valid) {
+				document.getElementById("battery_soc_status").textContent = `${obj.battery_soc_pct}%; (${formatAge(obj.battery_soc_age_ms)} ago)`;
+			} else {
+				document.getElementById("battery_soc_status").textContent = "Waiting for CAN data";
 			}
 			if (obj.battery_temp_valid) {
 				document.getElementById("battery_temp_status").textContent = `Min: ${obj.battery_temp_min_c} °C; Max: ${obj.battery_temp_max_c} °C; (${formatAge(obj.battery_temp_age_ms)} ago)`;
