@@ -98,7 +98,7 @@ static const char logo[] = {"<svg data-bbox=\"8.091 171.26 470.264 169.479\" ove
 extern const unsigned char homepage_start[] asm("_binary_homepage_full_html_start");
 extern const unsigned char homepage_end[]   asm("_binary_homepage_full_html_end");
 
-static char can_datarate_str[11][7] = {
+static const char can_datarate_str[11][7] = {
 								"5k",
 								"10K",
 								"20K",
@@ -943,7 +943,17 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	cJSON_AddBoolToObject(root, "sta_connected", wifi_network_is_connected());
 	cJSON_AddStringToObject(root, "mdns", wc_mdns_get_hostname());
 	cJSON_AddStringToObject(root, "ble_status", device_config.ble_status);
-	cJSON_AddStringToObject(root, "can_datarate", can_datarate_str[can_get_bitrate(CAN_BUS_0)]);
+	{
+		// Bounds-check rather than indexing straight from can_get_bitrate():
+		// config_server_start() runs before can_init(), so /check_status can be
+		// answered while can_cfg still holds its BSS default, and an
+		// out-of-range index would hand cJSON whatever follows the table.
+		uint8_t can_rate_idx = can_get_bitrate(CAN_BUS_0);
+		cJSON_AddStringToObject(root, "can_datarate",
+				(can_rate_idx < (sizeof(can_datarate_str) / sizeof(can_datarate_str[0])))
+					? can_datarate_str[can_rate_idx]
+					: "unknown");
+	}
 	cJSON_AddStringToObject(root, "can_mode", device_config.can_mode);
 	cJSON_AddNumberToObject(root, "can_bus_count", CAN_BUS_COUNT);
 #if CAN_BUS_COUNT > 1
