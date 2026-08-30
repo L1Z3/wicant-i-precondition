@@ -1,16 +1,22 @@
 #!/bin/bash
 set -euo pipefail
 
-BIN=~/Packages/wicant-i-precondition/saved_builds/build_shipped_version/wican-fw_obd_wican-4-20-eb-0-1-0/wican-fw_obd_wican-4-20-eb-0-1-0.bin
+if ! command -v nmcli >/dev/null 2>&1; then
+  echo "ERROR: nmcli not found" >&2
+  exit 1
+fi
+
+BIN=$(ls -t build.custom/*.bin build.v300/*.bin 2>/dev/null | head -1 || true)
 OTA_URL="http://192.168.80.1/upload/ota.bin"
 PAGE_URL="http://192.168.80.1/"
 WIFI_PASS="@meatpi#"
-RESUME_SSID="Squash-2.4"
+RESUME_SSID=$(nmcli -t -f active,ssid dev wifi 2>/dev/null | grep '^yes:' | head -1 | cut -d: -f2- || true)
 STATIC_IP="192.168.80.100/24"
 VERIFY_STR='section-title">Buttons'
 DEVICE_HOST="192.168.80.1"
 FLASH_WAIT_MAX=120
 BOOT_WAIT_MAX=180
+WICAN_SEARCH_STRING="^WiCAN_"
 
 if [[ ! -f "$BIN" ]]; then
   echo "ERROR: Firmware binary not found at $BIN" >&2
@@ -59,7 +65,7 @@ wait_for_http() {
 get_ssids() {
   nmcli dev wifi rescan >/dev/null 2>&1 || true
   sleep 2
-  nmcli -t -f SSID dev wifi list | grep -E '^WiCAN_4|^WiCAN_5' | sort -u
+  nmcli -t -f SSID dev wifi list | grep -E '^${WICAN_SEARCH_STRING}' | sort -u
 }
 
 flash_one() {
