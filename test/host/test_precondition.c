@@ -484,6 +484,31 @@ static void run_battery_temperature_cutoff(void) {
     CHECK(popup_show_count == 2);
 }
 
+static void run_battery_soc(void) {
+    precondition_init();
+    precondition_soc_t soc;
+    twai_message_t frame = {
+        .identifier = BATTERY_SOC_FRAME_ID,
+        .data_length_code = BATTERY_SOC_DATA_LENGTH,
+        .data = {[BATTERY_SOC_INDEX] = 127},
+    };
+
+    CHECK(!precondition_get_battery_soc(&soc));
+    precondition_can_rx_hook(&frame, CAN_BUS_1);
+    CHECK(!precondition_get_battery_soc(&soc));
+    frame.data_length_code--;
+    precondition_can_rx_hook(&frame, CAN_BUS_0);
+    CHECK(!precondition_get_battery_soc(&soc));
+
+    frame.data_length_code++;
+    fake_now = 123456;
+    precondition_can_rx_hook(&frame, CAN_BUS_0);
+    CHECK(precondition_get_battery_soc(&soc));
+    CHECK(soc.raw == 127);
+    CHECK(soc.raw * BATTERY_SOC_SCALE == 63.5f);
+    CHECK(soc.updated_at_us == fake_now);
+}
+
 static void run_automatic_temperature_cutoff(void) {
     precondition_init();
     battery_temperature(20, 24);
@@ -1009,6 +1034,7 @@ static const suite_t suites[] = {
     {"precondition short-press once", ONCE, PRESS_SHORT, run_short_press},
     {"precondition long-press once", ONCE, PRESS_LONG, run_long_press},
     {"precondition battery temperature cutoff", ONCE, PRESS_SHORT, run_battery_temperature_cutoff},
+    {"precondition battery state of charge", ONCE, PRESS_SHORT, run_battery_soc},
     {"precondition automatic temperature cutoff", CONTINUOUS, PRESS_SHORT, run_automatic_temperature_cutoff},
     {"precondition concurrent dispatch", ONCE, PRESS_LONG, run_concurrent_dispatch},
     {"precondition continuous", CONTINUOUS, PRESS_SHORT, run_continuous},
