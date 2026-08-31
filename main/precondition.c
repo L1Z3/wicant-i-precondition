@@ -181,6 +181,13 @@ static bool activation_is_release(const message_payload_t *msg, const twai_messa
 
 #define IS_BATTERY_TEMPERATURE_FRAME(frame_id) ((frame_id) == BATTERY_TEMPERATURE_FRAME_ID)
 
+// High-voltage battery state of charge. Last byte has SoC in half-percent steps.
+#define BATTERY_SOC_FRAME_ID 0x2FCU
+#define BATTERY_SOC_INDEX 7U
+#define BATTERY_SOC_DATA_LENGTH 8U
+
+#define IS_BATTERY_SOC_FRAME(frame_id) ((frame_id) == BATTERY_SOC_FRAME_ID)
+
 #define CAR_BUS CAN_BUS_0
 #define HEAD_UNIT_BUS CAN_BUS_1
 
@@ -315,6 +322,7 @@ static struct {
 } button;
 
 static QueueHandle_t battery_temperature_queue = NULL;
+static QueueHandle_t battery_soc_queue = NULL;
 static QueueHandle_t precondition_state_queue = NULL;
 static QueueHandle_t precondition_toggle_queue = NULL;
 
@@ -1071,6 +1079,17 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
         );
     }
 
+    if (IS_BATTERY_SOC_FRAME(to_push->identifier)
+            && rx_bus == CAR_BUS
+            && to_push->data_length_code >= BATTERY_SOC_DATA_LENGTH) {
+        precondition_soc_t soc = {
+            .raw = to_push->data[BATTERY_SOC_INDEX],
+            .updated_at_us = sm_now(sm),
+        };
+
+        xQueueOverwrite(battery_soc_queue, &soc);
+    }
+
     int8_t precon_button_type = precon_config.button_type;
     if (precon_button_type == BUTTON_DISABLED) {
         // activation button disabled in config; don't listen for any button press
@@ -1162,6 +1181,8 @@ void precondition_init(void) {
 
     battery_temperature_queue = xQueueCreate(1, sizeof(precondition_temperature_t));
     configASSERT(battery_temperature_queue != NULL);
+    battery_soc_queue = xQueueCreate(1, sizeof(precondition_soc_t));
+    configASSERT(battery_soc_queue != NULL);
     precondition_state_queue = xQueueCreate(1, sizeof(precondition_state_t));
     configASSERT(precondition_state_queue != NULL);
     precondition_toggle_queue = xQueueCreate(1, sizeof(uint8_t));
@@ -1195,4 +1216,12 @@ bool precondition_get_battery_temperature(precondition_temperature_t *out) {
     }
 
     return xQueuePeek(battery_temperature_queue, out, 0) == pdTRUE;
+}
+
+bool precondition_get_battery_soc(precondition_soc_t *out) {
+    if (out == NULL || battery_soc_queue == NULL) {
+        return false;
+    }
+
+    return xQueuePeek(battery_soc_queue, out, 0) == pdTRUE;
 }
