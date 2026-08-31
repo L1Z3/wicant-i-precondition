@@ -75,6 +75,7 @@
 #include "hw_config.h"
 #include "ha_webhooks.h"
 #include "precondition.h"
+#include "track_popup.h"
 #include "esp_timer.h"
 
 #define WIFI_CONNECTED_BIT			BIT0
@@ -737,6 +738,57 @@ static esp_err_t precondition_toggle_handler(httpd_req_t *req)
 	const char *resp_str = "Preconditioning toggled";
     httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
+}
+
+static esp_err_t track_popup_handler(httpd_req_t *req)
+{
+    if (req->content_len == 0U)
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "Track popup text cannot be empty");
+        return ESP_FAIL;
+    }
+
+    if (req->content_len > TRACK_POPUP_MAX_TEXT_UTF8_BYTES)
+    {
+        httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE,
+                            "Track popup text is too long");
+        return ESP_FAIL;
+    }
+
+    char text[TRACK_POPUP_MAX_TEXT_UTF8_BYTES + 1U];
+    size_t received = 0U;
+    while (received < req->content_len)
+    {
+        int chunk_size = httpd_req_recv(req, text + received,
+                                        req->content_len - received);
+        if (chunk_size <= 0)
+        {
+            httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT,
+                                "Failed to receive track popup text");
+            return ESP_FAIL;
+        }
+        received += (size_t)chunk_size;
+    }
+
+    // track_popup_show accepts a NUL-terminated string, so reject embedded NUL
+    // bytes so we don't only show part of the requested string
+    if (memchr(text, '\0', received) != NULL)
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "Track popup text contains a NUL byte");
+        return ESP_FAIL;
+    }
+    text[received] = '\0';
+
+    if (!track_popup_show(text))
+    {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return httpd_resp_send(req, "Track popup is busy or text is too long",
+                               HTTPD_RESP_USE_STRLEN);
+    }
+
+    return httpd_resp_send(req, "Track popup queued", HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t logo_handler(httpd_req_t *req)
@@ -1683,6 +1735,12 @@ static const httpd_uri_t precondition_toggle = {
     .handler   = precondition_toggle_handler,
     .user_ctx  = NULL
 };
+static const httpd_uri_t track_popup = {
+    .uri       = "/track_popup",
+    .method    = HTTP_POST,
+    .handler   = track_popup_handler,
+    .user_ctx  = NULL
+};
 static const httpd_uri_t store_auto_data_uri = {
     .uri       = "/store_auto_data",
     .method    = HTTP_POST,
@@ -2499,6 +2557,7 @@ static httpd_handle_t config_server_init(void)
         httpd_register_uri_handler(server, &file_upload);
 		httpd_register_uri_handler(server, &system_reboot);
 		httpd_register_uri_handler(server, &precondition_toggle);
+		httpd_register_uri_handler(server, &track_popup);
 		httpd_register_uri_handler(server, &store_canflt_uri);
 		httpd_register_uri_handler(server, &load_canflt_uri);
 		httpd_register_uri_handler(server, &store_auto_data_uri);
@@ -2539,6 +2598,7 @@ void config_server_restart(void)
         httpd_register_uri_handler(server, &file_upload);
 		httpd_register_uri_handler(server, &system_reboot);
 		httpd_register_uri_handler(server, &precondition_toggle);
+		httpd_register_uri_handler(server, &track_popup);
 		httpd_register_uri_handler(server, &store_canflt_uri);
 		httpd_register_uri_handler(server, &load_canflt_uri);
 		httpd_register_uri_handler(server, &store_auto_data_uri);

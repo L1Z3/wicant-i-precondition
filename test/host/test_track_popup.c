@@ -126,14 +126,14 @@ static void test_popup_flow(void) {
     CHECK(replacement.size == sizeof(expected_replacement));
     CHECK(memcmp(replacement.data, expected_replacement,
                  sizeof(expected_replacement)) == 0);
-    char max_length[TRACK_POPUP_MAX_TEXT_CHARACTERS + 1U];
+    char max_length[TRACK_POPUP_MAX_TEXT_CODE_UNITS + 1U];
     memset(max_length, 'x', sizeof(max_length) - 1U);
     max_length[sizeof(max_length) - 1U] = '\0';
     track_popup_request_t max_length_request = {0};
     CHECK(encode_text(max_length, &max_length_request));
     CHECK(max_length_request.size == TRACK_POPUP_MAX_TEXT_BYTES);
 
-    char oversized[TRACK_POPUP_MAX_TEXT_CHARACTERS + 2U];
+    char oversized[TRACK_POPUP_MAX_TEXT_CODE_UNITS + 2U];
     memset(oversized, 'x', sizeof(oversized) - 1U);
     oversized[sizeof(oversized) - 1U] = '\0';
     CHECK(!encode_text(oversized, &max_length_request));

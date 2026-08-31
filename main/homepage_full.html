@@ -1382,6 +1382,16 @@
                             onclick="preconActivate()" value="Toggle" />
                     </td>
                 </tr>
+                <tr>
+                    <td>Track Popup Text:</td>
+                    <td>
+                        <input id="track_popup_text" name="track_popup_text" type="text" maxlength="50"
+                            autocomplete="off" placeholder="Text to show in the car"
+                            onkeydown="if (event.key === 'Enter') showTrackPopup();" />
+                        <input id="track_popup_button" name="track_popup_button" type="button"
+                            onclick="showTrackPopup()" value="Show Popup" />
+                    </td>
+                </tr>
                 <tr class="can1_row" style="display:none">
                     <td>CAN Connection Mode:</td>
                     <td>
@@ -2957,6 +2967,33 @@ function loadAutoTable(jsonData) {
         };
 		xhttp.open("POST", "/precondition_toggle");
 		xhttp.send();
+	}
+
+	function showTrackPopup() {
+		const textInput = document.getElementById("track_popup_text");
+		const popupButton = document.getElementById("track_popup_button");
+		if (textInput.value.length === 0) {
+			showNotification("Enter track popup text", "red");
+			return;
+		}
+
+		const xhttp = new XMLHttpRequest();
+		popupButton.disabled = true;
+		xhttp.onload = function() {
+			popupButton.disabled = false;
+			if (this.status >= 200 && this.status < 300) {
+				showNotification(this.responseText, "green");
+			} else {
+				showNotification(this.responseText || "Failed to show track popup", "red");
+			}
+		};
+		xhttp.onerror = function() {
+			popupButton.disabled = false;
+			showNotification("Failed to show track popup", "red");
+		};
+		xhttp.open("POST", "/track_popup");
+		xhttp.setRequestHeader("Content-Type", "text/plain; charset=UTF-8");
+		xhttp.send(textInput.value);
 	}
 
     function send_system_command(command) {

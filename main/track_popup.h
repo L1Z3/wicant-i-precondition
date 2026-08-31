@@ -4,6 +4,13 @@
 #include <stdbool.h>
 #include "hsm.h"
 
+// The cluster payload holds up to 50 UTF-16 code units. A matching valid UTF-8
+// string needs at most three bytes per UTF-16 code unit:
+// https://stackoverflow.com/a/58581109
+#define TRACK_POPUP_MAX_TEXT_CODE_UNITS 50U
+#define TRACK_POPUP_MAX_TEXT_UTF8_BYTES \
+    (TRACK_POPUP_MAX_TEXT_CODE_UNITS * 3U)
+
 // Initialize the cluster track-selection popup service. Reuse a known active
 // media type and transport when possible, otherwise force the fallback type.
 void track_popup_init(void);
