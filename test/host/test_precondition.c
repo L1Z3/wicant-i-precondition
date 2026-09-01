@@ -87,6 +87,21 @@ bool track_popup_show(const char *utf8_text) {
     snprintf(popup_text, sizeof(popup_text), "%s", utf8_text);
     return true;
 }
+static bool track_popup_show_prefixed(const char *prefix,
+                                      const char *utf8_text) {
+    char message[sizeof(popup_text)];
+    snprintf(message, sizeof(message), "%s%s", prefix, utf8_text);
+    return track_popup_show(message);
+}
+bool track_popup_show_info(const char *utf8_text) {
+    return track_popup_show_prefixed("ⓘ ", utf8_text);
+}
+bool track_popup_show_warning(const char *utf8_text) {
+    return track_popup_show_prefixed("⚠ ", utf8_text);
+}
+bool track_popup_show_error(const char *utf8_text) {
+    return track_popup_show_prefixed("‼ ", utf8_text);
+}
 
 #include "persistent_settings.c"
 #include "precondition.c"
@@ -216,7 +231,7 @@ static void run_short_press(void) {
     toggle();
     expect_state("start-burst");
     CHECK(popup_show_count == 1);
-    CHECK(strcmp(popup_text, "Once: starting") == 0);
+    CHECK(strcmp(popup_text, "ⓘ Once: starting") == 0);
     for (int i = 0; i < 6; i++) tick1();
     CHECK(sent_count == 6);
     check_start_burst_msgs(0);
@@ -244,7 +259,7 @@ static void run_short_press(void) {
     toggle();
     expect_state("stop-burst");
     CHECK(popup_show_count == 2);
-    CHECK(strcmp(popup_text, "Once: stopping") == 0);
+    CHECK(strcmp(popup_text, "ⓘ Once: stopping") == 0);
     CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);
     sent_count = 0;
     for (int i = 0; i < 6; i++) tick1();
@@ -294,7 +309,7 @@ static void run_short_press(void) {
     // "complete" in ONCE mode -> real stop
     car_status(0x01, CAN_BUS_0);
     expect_state("stop-burst");
-    CHECK(strcmp(popup_text, "Once: stopping") == 0);
+    CHECK(strcmp(popup_text, "⚠ Once: stopping") == 0);
     CHECK(!precondition_display().active);
     CHECK(!precondition_display().starting);
     car_status(0x01, CAN_BUS_0);               // stop confirm ignored during burst
@@ -463,7 +478,7 @@ static void run_battery_temperature_cutoff(void) {
     toggle();
     expect_state("stop-burst");
     CHECK(popup_show_count == 1);
-    CHECK(strcmp(popup_text, "Once: temp too high: 21°C ≥ 21°C") == 0);
+    CHECK(strcmp(popup_text, "‼ Once: temp too high: 21°C ≥ 21°C") == 0);
     CHECK(sent_count == 0);
     for (int i = 0; i < 6; i++) tick1();
     expect_state("idle");
@@ -480,7 +495,7 @@ static void run_battery_temperature_cutoff(void) {
     CHECK(sent_count == 1);
     CHECK(sent[0].msg.data[3] == 0x40 && sent[0].msg.data[4] == 0x03);
     CHECK(popup_show_count == 2);
-    CHECK(strcmp(popup_text, "Once: starting") == 0);
+    CHECK(strcmp(popup_text, "ⓘ Once: starting") == 0);
 
     // A newly hot reading also aborts an in-flight manual attempt before a
     // status confirmation can move it into ACTIVE.
@@ -491,7 +506,7 @@ static void run_battery_temperature_cutoff(void) {
     tick1();
     expect_state("stop-burst");
     CHECK(popup_show_count == 3);
-    CHECK(strcmp(popup_text, "Once: temp too high: 21°C ≥ 21°C") == 0);
+    CHECK(strcmp(popup_text, "‼ Once: temp too high: 21°C ≥ 21°C") == 0);
 }
 
 static void run_battery_soc(void) {
@@ -529,7 +544,7 @@ static void run_battery_soc(void) {
     toggle();
     expect_state("stop-burst");
     CHECK(popup_show_count == 1);
-    CHECK(strcmp(popup_text, "Once: SoC too low: 19.5% < 20%") == 0);
+    CHECK(strcmp(popup_text, "‼ Once: SoC too low: 19.5% < 20%") == 0);
     CHECK(sent_count == 0);
     for (int i = 0; i < 6; i++) tick1();
     expect_state("idle");
@@ -547,7 +562,7 @@ static void run_battery_soc(void) {
     CHECK(sent_count == 1);
     CHECK(sent[0].msg.data[3] == 0x40 && sent[0].msg.data[4] == 0x03);
     CHECK(popup_show_count == 2);
-    CHECK(strcmp(popup_text, "Once: starting") == 0);
+    CHECK(strcmp(popup_text, "ⓘ Once: starting") == 0);
 
     // A newly low reading aborts an in-flight attempt too.
     for (int i = 0; i < 5; i++) tick1();
@@ -557,7 +572,7 @@ static void run_battery_soc(void) {
     tick1();
     expect_state("stop-burst");
     CHECK(popup_show_count == 3);
-    CHECK(strcmp(popup_text, "Once: SoC too low: 19.5% < 20%") == 0);
+    CHECK(strcmp(popup_text, "‼ Once: SoC too low: 19.5% < 20%") == 0);
 }
 
 static void run_automatic_temperature_cutoff(void) {
@@ -600,7 +615,7 @@ static void run_automatic_soc_cutoff(void) {
     int popup_count_before_low_soc = popup_show_count;
     battery_soc(39);
     CHECK(popup_show_count == popup_count_before_low_soc + 1);
-    CHECK(strcmp(popup_text, "Continuous: resuming when SoC ≥ 20%") == 0);
+    CHECK(strcmp(popup_text, "⚠ Cont.: resuming when SoC ≥ 20%") == 0);
     battery_soc(39);
     CHECK(popup_show_count == popup_count_before_low_soc + 1);
     car_status(0x01, CAN_BUS_0);
@@ -615,7 +630,7 @@ static void run_automatic_soc_cutoff(void) {
     battery_soc(40);
     battery_soc(39);
     CHECK(popup_show_count == popup_count_before_low_soc + 2);
-    CHECK(strcmp(popup_text, "Continuous: resuming when SoC ≥ 20%") == 0);
+    CHECK(strcmp(popup_text, "⚠ Cont.: resuming when SoC ≥ 20%") == 0);
 }
 
 static void run_repeating_soc_cutoff_message(void) {
@@ -633,8 +648,8 @@ static void run_repeating_soc_cutoff_message(void) {
     CHECK(popup_show_count == 1);
 
     const char *expected = cfg_mode == PERSISTENT
-                         ? "Persistent: resuming when SoC ≥ 20%"
-                         : "Continuous: resuming when SoC ≥ 20%";
+                         ? "⚠ Pers.: resuming when SoC ≥ 20%"
+                         : "⚠ Cont.: resuming when SoC ≥ 20%";
     CHECK(strcmp(popup_text, expected) == 0);
 
     if (cfg_mode == PERSISTENT) {
@@ -664,8 +679,8 @@ static void run_repeating_temperature_notice(void) {
     CHECK(popup_show_count == 1);
 
     const char *expected = cfg_mode == PERSISTENT
-                         ? "Persistent: maintaining 21°C (23°C)"
-                         : "Continuous: maintaining 21°C (23°C)";
+                         ? "ⓘ Pers.: maintaining 21°C (23°C now)"
+                         : "ⓘ Cont.: maintaining 21°C (23°C now)";
     CHECK(strcmp(popup_text, expected) == 0);
 
     if (cfg_mode == PERSISTENT) {
@@ -700,7 +715,7 @@ static void run_once_stopping_notices(void) {
     expect_state("stop-burst");
     CHECK(stopping.reason == STOP_REASON_TEMPERATURE_REACHED);
     CHECK(popup_show_count == popup_count_before_limit + 1);
-    CHECK(strcmp(popup_text, "Once: stopping (reached 21°C)") == 0);
+    CHECK(strcmp(popup_text, "ⓘ Once: stopping (reached 21°C)") == 0);
     for (int i = 0; i < 6; i++) tick1();
     car_status(0x01, CAN_BUS_0);
     expect_state("idle");
@@ -720,7 +735,7 @@ static void run_once_stopping_notices(void) {
     expect_state("stop-burst");
     CHECK(stopping.reason == STOP_REASON_LOW_SOC);
     CHECK(popup_show_count == popup_count_before_limit + 1);
-    CHECK(strcmp(popup_text, "Once: stopping (<20% SoC)") == 0);
+    CHECK(strcmp(popup_text, "⚠ Once: stopping (<20% SoC)") == 0);
     for (int i = 0; i < 6; i++) tick1();
     car_status(0x01, CAN_BUS_0);
     expect_state("idle");
@@ -738,10 +753,10 @@ static void run_once_stopping_notices(void) {
     expect_state("stop-burst");
     CHECK(stopping.reason == STOP_REASON_UNEXPECTED_IDLE);
     CHECK(popup_show_count == popup_count_before_idle + 1);
-    CHECK(strcmp(popup_text, "Once: stopping") == 0);
+    CHECK(strcmp(popup_text, "⚠ Once: stopping") == 0);
     battery_temperature(21, 24);
     CHECK(popup_show_count == popup_count_before_idle + 1);
-    CHECK(strcmp(popup_text, "Once: stopping") == 0);
+    CHECK(strcmp(popup_text, "⚠ Once: stopping") == 0);
 }
 
 typedef enum {
@@ -815,7 +830,7 @@ static void run_continuous(void) {
     toggle();
     expect_state("start-burst");
     CHECK(strcmp(popup_text,
-                 "Continuous: maintaining 21°C (-5°C)") == 0);
+                 "ⓘ Cont.: maintaining 21°C (-5°C now)") == 0);
     twai_message_t m;
     CHECK(fwd(0x4E8, CAN_BUS_0, &m) == FWD_MODIFIED);
     for (int i = 0; i < 6; i++) tick1();
@@ -942,7 +957,7 @@ static void run_continuous(void) {
     toggle();
     expect_state("stop-burst");
     CHECK(!precondition_display().active);
-    CHECK(strcmp(popup_text, "Continuous: stopping") == 0);
+    CHECK(strcmp(popup_text, "ⓘ Continuous: stopping") == 0);
     for (int i = 0; i < 6; i++) tick1();
     check_stop_burst_msgs(0);
     expect_state("wait-stopped");
@@ -986,7 +1001,7 @@ static void run_continuous(void) {
     CHECK(!idle.continuous_disabled_by_car_off);
     CHECK(popup_show_count == popup_count_before_car_off + 1);
     CHECK(strcmp(popup_text,
-                 "Continuous: disabled by car restart") == 0);
+                 "ⓘ Continuous: disabled by car restart") == 0);
     car_status(0x01, CAN_BUS_0);
     advance_us(310000000LL);
     CHECK(sent_count == 0);
@@ -1021,7 +1036,7 @@ static void run_persistent(void) {
     toggle();
     expect_state("start-burst");
     CHECK(strcmp(popup_text,
-                 "Persistent: maintaining 21°C (7°C)") == 0);
+                 "ⓘ Pers.: maintaining 21°C (7°C now)") == 0);
     CHECK(!fake_nvs_exists);
     fake_now += 40000;
     precondition_tick();
@@ -1064,7 +1079,7 @@ static void run_persistent(void) {
     CHECK(requested.kind == ATTEMPT_CAR_START);
     CHECK(popup_show_count == popup_count_before_restart + 1);
     CHECK(strcmp(popup_text,
-                 "Persistent: maintaining 21°C (7°C)") == 0);
+                 "ⓘ Pers.: maintaining 21°C (7°C now)") == 0);
     CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_MODIFIED);
     for (int i = 0; i < 6; i++) tick1();
     CHECK(sent_count == 6);
@@ -1095,7 +1110,7 @@ static void run_persistent(void) {
     expect_state("stop-burst");
     CHECK(!precondition_display().active);
     CHECK(!repeating_mode_enabled());
-    CHECK(strcmp(popup_text, "Persistent: stopping") == 0);
+    CHECK(strcmp(popup_text, "ⓘ Persistent: stopping") == 0);
     tick1();
     CHECK(fake_nvs_value == 0);                 // lower-priority worker flushed the clear
     for (int i = 0; i < 5; i++) tick1();
@@ -1143,7 +1158,7 @@ static void run_persistent_restore(void) {
     expect_state("start-burst");
     CHECK(requested.kind == ATTEMPT_CAR_START);
     CHECK(popup_show_count == popup_count_before_restart + 1);
-    CHECK(strcmp(popup_text, "Persistent: maintaining 21°C") == 0);
+    CHECK(strcmp(popup_text, "ⓘ Persistent: maintaining 21°C") == 0);
     CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_MODIFIED);  // countdown shown
     for (int i = 0; i < 6; i++) tick1();
     car_status(0x05, CAN_BUS_0);

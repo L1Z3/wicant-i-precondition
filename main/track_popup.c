@@ -27,8 +27,10 @@
 #define TRACK_POPUP_TRIGGER_SETTLE_US 5000U
 #define TRACK_POPUP_TRIGGER_TIMEOUT_US 2000000U
 #define TRACK_POPUP_DISPLAY_HOLD_US 5000000U
+
 #define TRACK_POPUP_MAX_TEXT_BYTES \
     (TRACK_POPUP_MAX_TEXT_CODE_UNITS * sizeof(utf16_t))
+#define TRACK_POPUP_MAX_PREFIX_BYTES 4U  // for track_popup_show_prefixed
 #define TRACK_POPUP_QUEUE_DEPTH 2U
 
 #define TRACK_POPUP_ISOTP_FLOW_CONTROL_TIMEOUT_US 1000000U
@@ -537,4 +539,34 @@ bool track_popup_show(const char *utf8_text) {
         return false;
     }
     return xQueueSend(popup.queue, &request, 0) == pdTRUE;
+}
+
+static bool track_popup_show_prefixed(const char *prefix,
+                                      const char *utf8_text) {
+    if (popup.queue == NULL || utf8_text == NULL || utf8_text[0] == '\0') {
+        return false;
+    }
+
+    char prefixed[TRACK_POPUP_MAX_TEXT_UTF8_BYTES
+                  + TRACK_POPUP_MAX_PREFIX_BYTES + 1U];
+    size_t prefix_size = strlen(prefix);
+    size_t text_size = strlen(utf8_text);
+    if (prefix_size + text_size >= sizeof(prefixed)) {
+        return false;
+    }
+    memcpy(prefixed, prefix, prefix_size);
+    memcpy(prefixed + prefix_size, utf8_text, text_size + 1U);
+    return track_popup_show(prefixed);
+}
+
+bool track_popup_show_info(const char *utf8_text) {
+    return track_popup_show_prefixed("ⓘ ", utf8_text);
+}
+
+bool track_popup_show_warning(const char *utf8_text) {
+    return track_popup_show_prefixed("⚠ ", utf8_text);
+}
+
+bool track_popup_show_error(const char *utf8_text) {
+    return track_popup_show_prefixed("‼ ", utf8_text);
 }

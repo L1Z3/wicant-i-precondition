@@ -421,12 +421,12 @@ static void set_repeating_enabled(bool enabled) {
 
 // ********************* notifications *********************
 
-static const char *precondition_mode_name(void) {
+static const char *precondition_mode_name(bool abbreviated) {
     switch (precon_config.mode) {
         case PERSISTENT:
-            return "Persistent";
+            return abbreviated ? "Pers." : "Persistent";
         case CONTINUOUS:
-            return "Continuous";
+            return abbreviated ? "Cont." : "Continuous";
         default:
             return "Once";
     }
@@ -446,7 +446,7 @@ static void show_once_blocker_notice(precondition_blockers_t blocker) {
                      "Once: SoC too low: < %u%%",
                      PRECONDITION_BATTERY_SOC_CUTOFF_PCT);
         }
-        track_popup_show(message);
+        track_popup_show_error(message);
         return;
     }
 
@@ -461,7 +461,7 @@ static void show_once_blocker_notice(precondition_blockers_t blocker) {
                      "Once: temp too high: ≥ %d°C",
                      PRECONDITION_BATTERY_TEMPERATURE_CUTOFF_C);
         }
-        track_popup_show(message);
+        track_popup_show_error(message);
     }
 }
 
@@ -469,8 +469,8 @@ static void show_repeating_soc_notice(void) {
     char message[48];
     snprintf(message, sizeof(message),
              "%s: resuming when SoC ≥ %u%%",
-             precondition_mode_name(), PRECONDITION_BATTERY_SOC_CUTOFF_PCT);
-    track_popup_show(message);
+             precondition_mode_name(true), PRECONDITION_BATTERY_SOC_CUTOFF_PCT);
+    track_popup_show_warning(message);
 }
 
 static void show_repeating_maintaining_notice(void) {
@@ -478,15 +478,15 @@ static void show_repeating_maintaining_notice(void) {
     char message[64];
     if (precondition_get_battery_temperature(&temperature)) {
         snprintf(message, sizeof(message),
-                 "%s: maintaining %d°C (%d°C)",
-                 precondition_mode_name(), PRECONDITION_BATTERY_TEMPERATURE_CUTOFF_C,
+                 "%s: maintaining %d°C (%d°C now)",
+                 precondition_mode_name(true), PRECONDITION_BATTERY_TEMPERATURE_CUTOFF_C,
                  temperature.min_c);
     } else {
         snprintf(message, sizeof(message),
                  "%s: maintaining %d°C",
-                 precondition_mode_name(), PRECONDITION_BATTERY_TEMPERATURE_CUTOFF_C);
+                 precondition_mode_name(false), PRECONDITION_BATTERY_TEMPERATURE_CUTOFF_C);
     }
-    track_popup_show(message);
+    track_popup_show_info(message);
 }
 
 // Manual starts and persistent car-restart resumes are user-visible. Periodic
@@ -499,7 +499,7 @@ static void show_request_started_notice(void) {
     precondition_blockers_t blocker = primary_precon_blocker();
     if (precon_config.mode == ONCE) {
         if (blocker == PRECONDITION_BLOCK_NONE) {
-            track_popup_show("Once: starting");
+            track_popup_show_info("Once: starting");
         } else {
             show_once_blocker_notice(blocker);
             requested.notified_blockers |= blocker;
@@ -538,23 +538,24 @@ static void show_stopping_notice(stop_reason_t reason) {
     char message[48];
     switch (reason) {
         case STOP_REASON_USER:
-            snprintf(message, sizeof(message), "%s: stopping", precondition_mode_name());
-            track_popup_show(message);
+            snprintf(message, sizeof(message), "%s: stopping",
+                     precondition_mode_name(false));
+            track_popup_show_info(message);
             break;
         case STOP_REASON_UNEXPECTED_IDLE:
-            track_popup_show("Once: stopping");
+            track_popup_show_warning("Once: stopping");
             break;
         case STOP_REASON_TEMPERATURE_REACHED:
             snprintf(message, sizeof(message),
                      "Once: stopping (reached %d°C)",
                      PRECONDITION_BATTERY_TEMPERATURE_CUTOFF_C);
-            track_popup_show(message);
+            track_popup_show_info(message);
             break;
         case STOP_REASON_LOW_SOC:
             snprintf(message, sizeof(message),
                      "Once: stopping (<%u%% SoC)",
                      PRECONDITION_BATTERY_SOC_CUTOFF_PCT);
-            track_popup_show(message);
+            track_popup_show_warning(message);
             break;
         case STOP_REASON_START_ABORTED:
             // The start error was already displayed, or the retry exhaustion
@@ -701,7 +702,7 @@ static void idle_tick(sm_t *sm) {
             && ts_elapsed(sm_now(sm), idle.continuous_disabled_ready_at_us)
                     >= PRECONDITION_CAR_START_DELAY_US) {
         idle.continuous_disabled_by_car_off = false;
-        track_popup_show("Continuous: disabled by car restart");
+        track_popup_show_info("Continuous: disabled by car restart");
     }
 }
 
