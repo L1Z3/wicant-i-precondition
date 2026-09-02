@@ -345,14 +345,20 @@
  
      if(config_server_get_wifi_mode() == APSTA_MODE || (sta_ssid != 0 && sta_pass != 0))
      {
-         if(sta_ssid == 0 && sta_pass == 0)
+         if(sta_ssid == 0)
          {
              strcpy( (char*)wifi_config_sta.sta.ssid, (char*)config_server_get_sta_ssid());
-             strcpy( (char*)wifi_config_sta.sta.password, (char*)config_server_get_sta_pass());
          }
          else
          {
              strcpy( (char*)wifi_config_sta.sta.ssid, (char*)sta_ssid);
+         }
+         if(sta_pass == 0)
+         {
+             strcpy( (char*)wifi_config_sta.sta.password, (char*)config_server_get_sta_pass());
+         }
+         else
+         {
              strcpy( (char*)wifi_config_sta.sta.password, (char*)sta_pass);
          }
          ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));

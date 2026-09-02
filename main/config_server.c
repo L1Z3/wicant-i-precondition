@@ -557,6 +557,7 @@ static esp_err_t store_canflt_handler(httpd_req_t *req)
 		mqtt_canflt_file[filesize] = 0;
 		fseek(f1, 0, SEEK_SET);
 		ESP_LOGI(TAG, "mqtt_canfilt.json: %s", mqtt_canflt_file);
+		fclose(f1);
 	}
     const char *resp_str = "CAN filter saved! Filter will take effect after submit.";
     httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
@@ -597,6 +598,14 @@ static esp_err_t load_pid_auto_handler(httpd_req_t *req)
     fseek(f, 0, SEEK_END);
     long filesize = ftell(f);
     fseek(f, 0, SEEK_SET);
+
+    if (filesize <= 0)
+    {
+        ESP_LOGE(TAG, "auto_pid.json is empty or invalid");
+        fclose(f);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
 
     char *buf = malloc(filesize + 1);
     if (!buf)
@@ -643,7 +652,7 @@ static esp_err_t load_pid_auto_config_handler(httpd_req_t *req)
     // Seek to the end of the file to determine its size
     fseek(fd, 0, SEEK_END);
     long file_size = ftell(fd);
-    rewind(fd);
+    rewind(fd); // NOLINT(bugprone-unsafe-functions) -- fd verified non-NULL above
 
     if (file_size <= 0)
     {
@@ -1042,7 +1051,7 @@ char *config_server_get_status_json(bool remove_sensitive_info)
         cJSON_AddNumberToObject(
             root,
             "battery_temp_age_ms",
-            (esp_timer_get_time() - temperature.updated_at_us) / 1000
+            (esp_timer_get_time() - temperature.updated_at_us) / 1000 // NOLINT(bugprone-integer-division) -- integer ms intended
         );
 	} else {
         cJSON_AddBoolToObject(root, "battery_temp_valid", false);
@@ -1123,7 +1132,7 @@ char *config_server_get_status_json(bool remove_sensitive_info)
  * and internal socket fd in order
  * to use out of request send
  */
-typedef  struct _async_resp_arg {
+typedef  struct _async_resp_arg { // NOLINT(bugprone-reserved-identifier)
     httpd_handle_t hd;
     int fd;
 }async_resp_arg_t;
@@ -1332,7 +1341,7 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     {
 //        ESP_LOGI(TAG, "Remaining size : %d", remaining);
         /* Receive the file part by part into a buffer */
-        if ((received = httpd_req_recv(req, buf, MIN(remaining, SCRATCH_BUFSIZE))) <= 0)
+        if ((received = httpd_req_recv(req, buf, MIN(remaining, SCRATCH_BUFSIZE))) <= 0) // NOLINT(bugprone-assignment-in-if-condition) -- recv idiom
         {
             if (received == HTTPD_SOCK_ERR_TIMEOUT)
             {
@@ -1394,7 +1403,7 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     /* Close file upon upload completion */
     ESP_LOGI(TAG, "File reception complete: %lu", total_size);
 
-    if ((received = httpd_req_recv(req, buf, SCRATCH_BUFSIZE)) <= 0)
+    if ((received = httpd_req_recv(req, buf, SCRATCH_BUFSIZE)) <= 0) // NOLINT(clang-analyzer-deadcode.DeadStores, bugprone-assignment-in-if-condition) -- value only used in condition
     {
         ESP_LOGE(TAG, "File reception failed!");
         esp_ota_abort(update_handle);
@@ -1497,7 +1506,7 @@ static esp_err_t upload_car_data_handler(httpd_req_t *req)
     {
 //        ESP_LOGI(TAG, "Remaining size : %d", remaining);
         /* Receive the file part by part into a buffer */
-        if ((received = httpd_req_recv(req, buf, MIN(remaining, SCRATCH_BUFSIZE))) <= 0)
+        if ((received = httpd_req_recv(req, buf, MIN(remaining, SCRATCH_BUFSIZE))) <= 0) // NOLINT(bugprone-assignment-in-if-condition) -- recv idiom
         {
             if (received == HTTPD_SOCK_ERR_TIMEOUT)
             {
@@ -2382,6 +2391,12 @@ config_error:
         // Delete it if it exists
         unlink(FS_MOUNT_POINT"/config.json");
 		FILE* f = fopen(FS_MOUNT_POINT"/config.json", "w");
+		if (f == NULL)
+		{
+			ESP_LOGE(TAG, "Failed to restore default config.json");
+			cJSON_Delete(root);
+			return;
+		}
 		// sprintf(device_config_default, device_id, device_id);
 		fprintf(f, device_config_default, (char*)device_id, (char*)device_id, (char*)device_id);
 		fclose(f);
@@ -2480,10 +2495,20 @@ static httpd_handle_t config_server_init(void)
 		{
 			ESP_LOGI(TAG, "Config file does not exist, load default");
 			f = fopen(FS_MOUNT_POINT"/config.json", "w");
+			if (f == NULL)
+			{
+				ESP_LOGE(TAG, "Failed to create config.json");
+				return NULL;
+			}
 //			fwrite(device_config_default , 1 , sizeof(device_config_default) , f );
 			fprintf(f, device_config_default, (char*)device_id, (char*)device_id, (char*)device_id);
 			fclose(f);
 			f = fopen(FS_MOUNT_POINT"/config.json", "r");
+			if (f == NULL)
+			{
+				ESP_LOGE(TAG, "Failed to open config.json after creating default");
+				return NULL;
+			}
 		}
 		fseek(f, 0, SEEK_END);
 		int filesize = ftell(f);
@@ -2495,6 +2520,7 @@ static httpd_handle_t config_server_init(void)
 		fread(device_config_file, sizeof(char), filesize, f);
 		device_config_file[filesize] = 0;
 		fseek(f, 0, SEEK_SET);
+		fclose(f);
 		ESP_LOGI(TAG, "config.json: %s", device_config_file);
 		config_server_load_cfg(device_config_file);
 		

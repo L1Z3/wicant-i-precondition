@@ -479,7 +479,7 @@ static fwd_result_t stopping_display_fwd(sm_t *sm, twai_message_t *to_send, can_
 
 // a start attempt timed out: retry the burst, or give up
 static void start_timeout(sm_t *sm) {
-    if (requested.kind == ATTEMPT_PERIODIC || requested.kind == ATTEMPT_BMU_RESTART) {
+    if (requested.kind == ATTEMPT_PERIODIC || requested.kind == ATTEMPT_BMU_RESTART) { // NOLINT(bugprone-branch-clone) -- shared body, distinct intent
         // Periodic bursts and BMU-observed restarts are one-shot: go back to
         // waiting in MANAGED without issuing an immediate retry.
         sm_transition(sm, &S_MANAGED);
@@ -743,7 +743,7 @@ static bool wait_started_event(sm_t *sm, sm_event_t ev) {
         case EV_STATUS_STARTED:
             sm_transition(sm, &S_ACTIVE);
             return true;
-        case EV_STATUS_STARTING:
+        case EV_STATUS_STARTING: // NOLINT(bugprone-branch-clone) -- keep waiting either way
             // still starting; keep waiting
             return true;
         case EV_STATUS_IDLE:

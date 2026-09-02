@@ -400,7 +400,7 @@ static void can_rx_task(void *pvParameters)
 
         	if(config_server_ws_connected() && rx_bus == CAN_BUS_0)
         	{
-        		ucTCP_TX_Buffer.usLen = slcan_parse_frame(ucTCP_TX_Buffer.ucElement, &rx_msg);
+        		ucTCP_TX_Buffer.usLen = slcan_parse_frame(ucTCP_TX_Buffer.ucElement, &rx_msg); // NOLINT(bugprone-signed-char-misuse) -- returns 0/1 only
 				if(config_server_ws_connected())
 				{
 					xQueueSend( xmsg_ws_tx_queue, ( void * ) &ucTCP_TX_Buffer, pdMS_TO_TICKS(0) );
@@ -416,7 +416,7 @@ static void can_rx_task(void *pvParameters)
 				{
 					if(rx_bus == CAN_BUS_0)
 					{
-						ucTCP_TX_Buffer.usLen = slcan_parse_frame(ucTCP_TX_Buffer.ucElement, &rx_msg);
+						ucTCP_TX_Buffer.usLen = slcan_parse_frame(ucTCP_TX_Buffer.ucElement, &rx_msg); // NOLINT(bugprone-signed-char-misuse) -- returns 0/1 only
 					}
 				}
 				else if(protocol == REALDASH)
@@ -428,7 +428,7 @@ static void can_rx_task(void *pvParameters)
 				}
 				else if(protocol == SAVVYCAN)
 				{
-					ucTCP_TX_Buffer.usLen = gvret_parse_can_frame(ucTCP_TX_Buffer.ucElement, &rx_msg, rx_bus);
+					ucTCP_TX_Buffer.usLen = gvret_parse_can_frame(ucTCP_TX_Buffer.ucElement, &rx_msg, rx_bus); // NOLINT(bugprone-signed-char-misuse) -- max 20 bytes
 				}
 				else if(protocol == OBD_ELM327 || protocol == AUTO_PID)
 				{
