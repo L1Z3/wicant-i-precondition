@@ -6,7 +6,7 @@ if ! command -v nmcli >/dev/null 2>&1; then
   exit 1
 fi
 
-BIN=$(ls -t build.custom/*.bin build.v300/*.bin 2>/dev/null | head -1 || true)
+BIN=$(ls -t "$(dirname "${BASH_SOURCE[0]}")"/../build.custom/wican-fw_*.bin "$(dirname "${BASH_SOURCE[0]}")"/../build.v300/wican-fw_*.bin 2>/dev/null | head -1 || true)
 OTA_URL="http://192.168.80.1/upload/ota.bin"
 PAGE_URL="http://192.168.80.1/"
 WIFI_PASS="@meatpi#"
@@ -65,7 +65,7 @@ wait_for_http() {
 get_ssids() {
   nmcli dev wifi rescan >/dev/null 2>&1 || true
   sleep 2
-  nmcli -t -f SSID dev wifi list | grep -E '^${WICAN_SEARCH_STRING}' | sort -u
+  nmcli -t -f SSID dev wifi list | grep -E -- "${WICAN_SEARCH_STRING}" | sort -u || true
 }
 
 flash_one() {
@@ -148,11 +148,11 @@ verify_one() {
   return 1
 }
 
-echo "Scanning for WiCAN_4* networks..."
+echo "Scanning for WiCAN_* networks..."
 SSIDS=$(get_ssids)
 
 if [[ -z "$SSIDS" ]]; then
-  echo "No WiCAN_4* networks found."
+  echo "No WiCAN_* networks found."
   exit 0
 fi
 
