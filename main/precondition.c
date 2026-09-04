@@ -171,6 +171,7 @@ static bool activation_is_release(const message_payload_t *msg, const twai_messa
 #define PRECONDITION_MAX_RETRIES 4U
 #define PRECONDITION_STARTED_TIMEOUT_US 70000000U  // 70 seconds
 #define PRECONDITION_CAR_START_DELAY_US 8000000U  // wait 8 seconds after READY before startup actions
+#define REPEATING_MODE_COOL_WAIT_US (3LL * 60LL * 1000000LL)  // continuously below cutoff before first re-nudge
 #define REPEATING_MODE_RETRY_INTERVAL_US (5LL * 60LL * 1000000LL)  // 5 minutes between re-nudges
 
 #define BATTERY_TEMPERATURE_FRAME_ID 0x152U
@@ -228,6 +229,7 @@ enum {
     EV_STATUS_STARTED,  // car reports preconditioning fully running
     EV_CAR_READY,       // car power entered READY (0x038 edge)
     EV_CAR_NOT_READY,   // car power left READY (0x038 edge)
+    EV_TEMPERATURE_FRAME, // valid battery temperature sample received
     EV_SOC_BECAME_LOW,  // HV battery SoC crossed below the start cutoff
 };
 
@@ -303,8 +305,8 @@ static struct {
 // owned by MANAGED: scheduling for periodic start bursts while a repeating
 // mode is enabled but preconditioning is inactive
 static struct {
-    // start of the current nudge interval
-    int64_t nudge_base_ts;
+    // next nudge (i.e. start burst) deadline; zero means no nudge is scheduled
+    int64_t nudge_at_us;
 } managed;
 
 // owned by STOPPING and its children
@@ -974,12 +976,16 @@ static bool active_event(sm_t *sm, sm_event_t ev) {
 // due to restrictions on SoC/temp/etc.
 
 static void managed_enter(sm_t *sm) {
-    managed.nudge_base_ts = sm_now(sm);
+    // Already cold (or temperature unknown): use the normal retry interval.
+    // Warm: wait for a cool frame to start the 3 minute wait.
+    managed.nudge_at_us = (precon_blockers & PRECONDITION_BLOCK_BATTERY_WARM)
+                         ? 0 : sm_now(sm) + REPEATING_MODE_RETRY_INTERVAL_US;
 }
 
 static void managed_tick(sm_t *sm) {
-    if (platform.car_in_ready
-            && ts_elapsed(sm_now(sm), managed.nudge_base_ts) > REPEATING_MODE_RETRY_INTERVAL_US) {
+    if (platform.car_in_ready && managed.nudge_at_us != 0
+            && precon_blockers == PRECONDITION_BLOCK_NONE
+            && sm_now(sm) >= managed.nudge_at_us) {
         // targets the parent, so REQUESTED exits and re-enters: fresh attempt
         // ctx, kind set from the entry argument, descend into START_BURST
         sm_transition_arg(sm, &S_REQUESTED, ATTEMPT_PERIODIC);
@@ -988,6 +994,15 @@ static void managed_tick(sm_t *sm) {
 
 static bool managed_event(sm_t *sm, sm_event_t ev) {
     switch (ev) {
+        case EV_TEMPERATURE_FRAME:
+            if (precon_blockers & PRECONDITION_BLOCK_BATTERY_WARM) {
+                // Battery warm => don't do any retries
+                managed.nudge_at_us = 0;
+            } else if (managed.nudge_at_us == 0) {
+                // Battery became cool => wait 3 minutes, then do periodic retries
+                managed.nudge_at_us = sm_now(sm) + REPEATING_MODE_COOL_WAIT_US;
+            }
+            return true;
         case EV_STATUS_IDLE:
             return true;
         case EV_STATUS_STARTING:
@@ -1255,6 +1270,7 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
             PRECONDITION_BLOCK_BATTERY_WARM,
             temperature.min_c >= PRECONDITION_BATTERY_TEMPERATURE_CUTOFF_C
         );
+        sm_send_event(sm, EV_TEMPERATURE_FRAME);
     }
 
     if (IS_BATTERY_SOC_FRAME(to_push->identifier)
