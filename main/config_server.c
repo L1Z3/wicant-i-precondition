@@ -156,6 +156,7 @@ const char device_config_default[] = R"json({
 "mqtt_tx_topic":"wican/%s/can/tx",
 "mqtt_rx_topic":"wican/%s/can/rx",
 "mqtt_status_topic":"wican/%s/can/status",
+"battery_temp_unit":"c",
 "precon_mode":"once",
 "precon_button":"sw_star",
 "precon_press":"short"
@@ -1032,6 +1033,9 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 		cJSON_AddStringToObject(root, "batt_mqtt_user", device_config.batt_mqtt_user);
 		cJSON_AddStringToObject(root, "batt_mqtt_pass", device_config.batt_mqtt_pass);
 	}
+
+    cJSON_AddStringToObject(root, "battery_temp_unit",
+                            config_server_temperature_fahrenheit() ? "f" : "c");
 
 	precondition_temperature_t temperature;
 	
@@ -2105,6 +2109,10 @@ static void config_server_load_cfg(char *cfg)
 	//*****
 
 	//*****
+    key = cJSON_GetObjectItem(root, "battery_temp_unit");
+    strcpy(device_config.battery_temp_unit,
+           cJSON_IsString(key) && strcmp(key->valuestring, "f") == 0 ? "f" : "c");
+
 	key = cJSON_GetObjectItem(root,"precon_mode");
 	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.precon_mode)))
 	{
@@ -3120,6 +3128,11 @@ int8_t config_server_precon_button(void)
 		return BUTTON_DISABLED;
 	}
 	return SW_STAR;
+}
+
+bool config_server_temperature_fahrenheit(void)
+{
+    return strcmp(device_config.battery_temp_unit, "f") == 0;
 }
 
 int8_t config_server_precon_mode(void)

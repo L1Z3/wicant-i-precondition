@@ -60,6 +60,9 @@ BaseType_t xQueueReceive(QueueHandle_t qh, void *item, TickType_t w) {
     return 1;
 }
 
+static bool cfg_fahrenheit = false;
+bool config_server_temperature_fahrenheit(void) { return cfg_fahrenheit; }
+
 static int8_t cfg_button = SW_STAR;
 static int8_t cfg_mode = ONCE;
 static int8_t cfg_press = PRESS_SHORT;
@@ -486,7 +489,7 @@ static void run_battery_temperature_cutoff(void) {
     CHECK(stopping.reason == STOP_REASON_START_BLOCKED);
     CHECK(stopping.retries == PRECONDITION_MAX_RETRIES);
     CHECK(popup_show_count == 1);
-    CHECK(strcmp(popup_text, "‼ Once: temp too high: 21°C ≥ 21°C") == 0);
+    CHECK(strcmp(popup_text, cfg_fahrenheit ? "‼ Once: temp too high: 70°F ≥ 70°F" : "‼ Once: temp too high: 21°C ≥ 21°C") == 0);
     CHECK(sent_count == 0);
     for (int i = 0; i < 6; i++) tick1();
     expect_state("idle");
@@ -503,7 +506,7 @@ static void run_battery_temperature_cutoff(void) {
     CHECK(sent_count == 1);
     CHECK(sent[0].msg.data[3] == 0x40 && sent[0].msg.data[4] == 0x03);
     CHECK(popup_show_count == 2);
-    CHECK(strcmp(popup_text, "ⓘ Once: starting (20°C now)") == 0);
+    CHECK(strcmp(popup_text, cfg_fahrenheit ? "ⓘ Once: starting (68°F now)" : "ⓘ Once: starting (20°C now)") == 0);
 
     // A newly hot reading also aborts an in-flight manual attempt before a
     // status confirmation can move it into ACTIVE.
@@ -515,7 +518,7 @@ static void run_battery_temperature_cutoff(void) {
     expect_state("stop-burst");
     CHECK(stopping.reason == STOP_REASON_START_BLOCKED);
     CHECK(popup_show_count == 3);
-    CHECK(strcmp(popup_text, "‼ Once: temp too high: 21°C ≥ 21°C") == 0);
+    CHECK(strcmp(popup_text, cfg_fahrenheit ? "‼ Once: temp too high: 70°F ≥ 70°F" : "‼ Once: temp too high: 21°C ≥ 21°C") == 0);
 }
 
 static void run_battery_soc(void) {
@@ -1435,6 +1438,111 @@ static void run_once_ignores_stored_latch(void) {
     CHECK(precondition_display().active);
 }
 
+// Expected strings also catch truncation in each production snprintf buffer.
+static void expect_temperature_popup(const char *expected) {
+    CHECK(strcmp(popup_text, expected) == 0);
+    size_t code_units = 0;
+    for (const unsigned char *p = (const unsigned char *)popup_text; *p; p++) {
+        // These messages contain only BMP characters, one UTF-16 unit each.
+        if ((*p & 0xc0) != 0x80) code_units++;
+    }
+    CHECK(code_units <= TRACK_POPUP_MAX_TEXT_CODE_UNITS);
+}
+
+static void run_temperature_display(void) {
+    precondition_init();
+    int previous = -1000;
+    for (int c = INT8_MIN; c <= INT8_MAX; c++) {
+        cfg_fahrenheit = false;
+        CHECK(display_temperature(c) == c);
+        char text[TEMPERATURE_TEXT_SIZE];
+        char expected[32];
+        snprintf(expected, sizeof(expected), "%d°C", c);
+        CHECK(format_temperature(c, text) == text);
+        CHECK(strcmp(text, expected) == 0);
+        cfg_fahrenheit = true;
+        int f = display_temperature(c);
+        // Compare in fifths of a degree against the exact conversion.
+        CHECK(abs(5 * f - (9 * c + 160)) <= 2);
+        if (c != INT8_MIN) CHECK(f - previous == 1 || f - previous == 2);
+        previous = f;
+        snprintf(expected, sizeof(expected), "%d°F", f);
+        CHECK(strcmp(format_temperature(c, text), expected) == 0);
+    }
+    CHECK(display_temperature(-40) == -40);
+    CHECK(display_temperature(-18) == 0);
+    CHECK(display_temperature(0) == 32);
+    CHECK(display_temperature(21) == 70);
+    CHECK(display_temperature(37) == 99);
+    CHECK(display_temperature(38) == 100);
+
+    // Exercise every formatter across the full input range in both units,
+    // independently finding the nearest integer for the expected message.
+    char expected[128];
+    for (int fahrenheit = 0; fahrenheit <= 1; fahrenheit++) {
+        cfg_fahrenheit = fahrenheit;
+        const char *unit = fahrenheit ? "°F" : "°C";
+        int target = fahrenheit ? 70 : 21;
+        show_once_blocker_notice(PRECONDITION_BLOCK_BATTERY_WARM);
+        snprintf(expected, sizeof(expected), "‼ Once: temp too high: ≥ %d%s", target, unit);
+        expect_temperature_popup(expected);
+        show_stopping_notice(STOP_REASON_TEMPERATURE_REACHED);
+        snprintf(expected, sizeof(expected), "ⓘ Once: stopping (reached %d%s)", target, unit);
+        expect_temperature_popup(expected);
+        requested.kind = ATTEMPT_MANUAL;
+        show_request_started_notice();
+        expect_temperature_popup("ⓘ Once: starting");
+
+        for (int mode = CONTINUOUS; mode <= PERSISTENT; mode++) {
+            precon_config.mode = mode;
+            show_repeating_maintaining_notice();
+            snprintf(expected, sizeof(expected), "ⓘ %s: maintaining %d%s",
+                     mode == PERSISTENT ? "Persistent" : "Continuous", target, unit);
+            expect_temperature_popup(expected);
+        }
+        for (int c = INT8_MIN; c <= INT8_MAX; c++) {
+            int value = c;
+            if (fahrenheit) {
+                value = -200;
+                for (int candidate = -199; candidate <= 261; candidate++) {
+                    if (abs(candidate * 5 - (9 * c + 160)) < abs(value * 5 - (9 * c + 160))) {
+                        value = candidate;
+                    }
+                }
+            }
+            precondition_temperature_t sample = {.min_c = c, .max_c = c};
+            xQueueOverwrite(battery_temperature_queue, &sample);
+            precon_config.mode = ONCE;
+            show_once_blocker_notice(PRECONDITION_BLOCK_BATTERY_WARM);
+            snprintf(expected, sizeof(expected), "‼ Once: temp too high: %d%s ≥ %d%s", value, unit, target, unit);
+            expect_temperature_popup(expected);
+            show_request_started_notice();
+            snprintf(expected, sizeof(expected), "ⓘ Once: starting (%d%s now)", value, unit);
+            expect_temperature_popup(expected);
+            for (int mode = CONTINUOUS; mode <= PERSISTENT; mode++) {
+                precon_config.mode = mode;
+                show_repeating_maintaining_notice();
+                snprintf(expected, sizeof(expected), "ⓘ %s: maintaining %d%s (%d%s now)",
+                         mode == PERSISTENT ? "Pers." : "Cont.", target, unit, value, unit);
+                expect_temperature_popup(expected);
+            }
+        }
+        precon_config.mode = ONCE;
+        precondition_temperature_t discarded;
+        xQueueReceive(battery_temperature_queue, &discarded, 0);
+    }
+}
+
+static void run_fahrenheit_cutoff(void) {
+    cfg_fahrenheit = true;
+    run_battery_temperature_cutoff();
+}
+
+static void run_fahrenheit_automatic_cutoff(void) {
+    cfg_fahrenheit = true;
+    run_automatic_temperature_cutoff();
+}
+
 // ---- suite table ----
 // each suite runs in its own forked process: the config snapshot, repeating
 // latch, fake NVS, and platform discovery flags all live in process statics
@@ -1446,6 +1554,10 @@ typedef struct {
 } suite_t;
 
 static const suite_t suites[] = {
+    {"temperature display rounding and popup bounds", ONCE, PRESS_SHORT, run_temperature_display},
+    {"fahrenheit once cutoff", ONCE, PRESS_SHORT, run_fahrenheit_cutoff},
+    {"fahrenheit continuous cutoff", CONTINUOUS, PRESS_SHORT, run_fahrenheit_automatic_cutoff},
+    {"fahrenheit persistent cutoff", PERSISTENT, PRESS_SHORT, run_fahrenheit_automatic_cutoff},
     {"precondition short-press once", ONCE, PRESS_SHORT, run_short_press},
     {"precondition long-press once", ONCE, PRESS_LONG, run_long_press},
     {"precondition battery temperature cutoff", ONCE, PRESS_SHORT, run_battery_temperature_cutoff},
