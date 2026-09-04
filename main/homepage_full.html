@@ -1401,6 +1401,15 @@
                         </select>
                     </td>
                 </tr>
+                <tr>
+                    <td>Battery Temperature Units:</td>
+                    <td>
+                        <select id="battery_temp_unit" name="battery_temp_unit" onchange="submit_enable();">
+                            <option value="c">Celsius (°C)</option>
+                            <option value="f">Fahrenheit (°F)</option>
+                        </select>
+                    </td>
+                </tr>
             </table>
         </div>
 
@@ -2539,7 +2548,11 @@ function loadAutoTable(jsonData) {
 	}
 	document.getElementById("defaultOpen").click();
 
-	function formatAge(ageMs) {
+	function formatBatteryTemperature(celsius, unit) {
+        return unit === "f" ? `${Math.round(celsius * 9 / 5 + 32)}°F` : `${celsius}°C`;
+    }
+
+    function formatAge(ageMs) {
         const seconds = Math.max(0, Math.round(ageMs / 1000));
         if (seconds < 60) return `${seconds}s`;
      	
@@ -2598,7 +2611,7 @@ function loadAutoTable(jsonData) {
 				document.getElementById("battery_soc_status").textContent = "Waiting for CAN data";
 			}
 			if (obj.battery_temp_valid) {
-				document.getElementById("battery_temp_status").textContent = `Min: ${obj.battery_temp_min_c} °C; Max: ${obj.battery_temp_max_c} °C; (${formatAge(obj.battery_temp_age_ms)} ago)`;
+				document.getElementById("battery_temp_status").textContent = `Min: ${formatBatteryTemperature(obj.battery_temp_min_c, obj.battery_temp_unit)}; Max: ${formatBatteryTemperature(obj.battery_temp_max_c, obj.battery_temp_unit)}; (${formatAge(obj.battery_temp_age_ms)} ago)`;
 			} else {
 				document.getElementById("battery_temp_status").textContent = "Waiting for CAN data";
 			}
@@ -2916,6 +2929,7 @@ function loadAutoTable(jsonData) {
         }
 		obj["mqtt_status_topic"] = document.getElementById("mqtt_status_topic").value;
 		obj["mqtt_elm327_log"] = document.getElementById("mqtt_elm327_log").value;
+        obj["battery_temp_unit"] = document.getElementById("battery_temp_unit").value;
         obj["precon_mode"] = document.getElementById("precon_mode").value;
         obj["precon_button"] = document.getElementById("precon_button").value;
         obj["precon_press"] = document.getElementById("precon_press").value;
@@ -3276,6 +3290,7 @@ function loadAutoTable(jsonData) {
 			document.getElementById("mqtt_rx_topic").value = obj.mqtt_rx_topic;
 			document.getElementById("mqtt_status_topic").value = obj.mqtt_status_topic;
 			document.getElementById("mqtt_elm327_log").value = obj.mqtt_elm327_log;
+            document.getElementById("battery_temp_unit").value = obj.battery_temp_unit === "f" ? "f" : "c";
             document.getElementById("precon_mode").value = obj.precon_mode;
             document.getElementById("precon_button").value = obj.precon_button;
             // config saved by older firmware has no precon_press key
