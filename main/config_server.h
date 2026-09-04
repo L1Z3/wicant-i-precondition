@@ -138,6 +138,7 @@ typedef struct _device_config
 	char mqtt_tx_topic[64];
 	char mqtt_rx_topic[64];
 	char mqtt_status_topic[64];
+    char battery_temp_unit[2];
     char precon_mode[16];
     char precon_button[32];
     char precon_press[16];
@@ -206,5 +207,6 @@ int8_t config_server_get_keep_alive(uint32_t *keep_alive);
 
 char *config_server_get_status_json(bool remove_sensitive_info);
 int8_t config_server_precon_button(void);
+bool config_server_temperature_fahrenheit(void);
 int8_t config_server_precon_mode(void);
 int8_t config_server_precon_press(void);
