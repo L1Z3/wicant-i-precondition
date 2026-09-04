@@ -495,7 +495,15 @@ static void show_request_started_notice(void) {
     precondition_blockers_t blocker = primary_precon_blocker();
     if (precon_config.mode == ONCE) {
         if (blocker == PRECONDITION_BLOCK_NONE) {
-            track_popup_show_info("Once: starting");
+            precondition_temperature_t temperature;
+            char message[48];
+            if (precondition_get_battery_temperature(&temperature)) {
+                snprintf(message, sizeof(message),
+                         "Once: starting (%d°C now)", temperature.min_c);
+            } else {
+                snprintf(message, sizeof(message), "Once: starting");
+            }
+            track_popup_show_info(message);
         }
         // Blocked starts announce their error on entry to STOPPING.
         return;

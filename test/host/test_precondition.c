@@ -503,7 +503,7 @@ static void run_battery_temperature_cutoff(void) {
     CHECK(sent_count == 1);
     CHECK(sent[0].msg.data[3] == 0x40 && sent[0].msg.data[4] == 0x03);
     CHECK(popup_show_count == 2);
-    CHECK(strcmp(popup_text, "ⓘ Once: starting") == 0);
+    CHECK(strcmp(popup_text, "ⓘ Once: starting (20°C now)") == 0);
 
     // A newly hot reading also aborts an in-flight manual attempt before a
     // status confirmation can move it into ACTIVE.
@@ -573,7 +573,7 @@ static void run_battery_soc(void) {
     CHECK(sent_count == 1);
     CHECK(sent[0].msg.data[3] == 0x40 && sent[0].msg.data[4] == 0x03);
     CHECK(popup_show_count == 2);
-    CHECK(strcmp(popup_text, "ⓘ Once: starting") == 0);
+    CHECK(strcmp(popup_text, "ⓘ Once: starting (20°C now)") == 0);
 
     // A newly low reading aborts an in-flight attempt too. Even with status
     // available, the cleanup stop has no countdown or retries.
