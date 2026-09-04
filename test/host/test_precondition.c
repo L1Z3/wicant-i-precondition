@@ -484,7 +484,7 @@ static void run_battery_temperature_cutoff(void) {
     toggle();
     expect_state("stop-burst");
     CHECK(stopping.reason == STOP_REASON_START_BLOCKED);
-    CHECK(stopping.retries == 0);
+    CHECK(stopping.retries == PRECONDITION_MAX_RETRIES);
     CHECK(popup_show_count == 1);
     CHECK(strcmp(popup_text, "‼ Once: temp too high: 21°C ≥ 21°C") == 0);
     CHECK(sent_count == 0);
@@ -553,7 +553,7 @@ static void run_battery_soc(void) {
     toggle();
     expect_state("stop-burst");
     CHECK(stopping.reason == STOP_REASON_START_BLOCKED);
-    CHECK(stopping.retries == 0);
+    CHECK(stopping.retries == PRECONDITION_MAX_RETRIES);
     CHECK(popup_show_count == 1);
     CHECK(strcmp(popup_text, "‼ Once: SoC too low: 19.5% < 20%") == 0);
     CHECK(sent_count == 0);
@@ -575,9 +575,12 @@ static void run_battery_soc(void) {
     CHECK(popup_show_count == 2);
     CHECK(strcmp(popup_text, "ⓘ Once: starting") == 0);
 
-    // A newly low reading aborts an in-flight attempt too.
+    // A newly low reading aborts an in-flight attempt too. Even with status
+    // available, the cleanup stop has no countdown or retries.
     for (int i = 0; i < 5; i++) tick1();
     expect_state("wait-starting");
+    car_status(0x05, CAN_BUS_0);
+    expect_state("wait-started");
     battery_soc(39);
     CHECK(precon_blockers == PRECONDITION_BLOCK_BATTERY_LOW_SOC);
     tick1();
@@ -585,6 +588,19 @@ static void run_battery_soc(void) {
     CHECK(stopping.reason == STOP_REASON_START_BLOCKED);
     CHECK(popup_show_count == 3);
     CHECK(strcmp(popup_text, "‼ Once: SoC too low: 19.5% < 20%") == 0);
+    CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);
+    CHECK(fwd(0x4CC, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);
+    int base = sent_count;
+    for (int i = 0; i < 6; i++) tick1();
+    expect_state("wait-stopped");
+    CHECK(sent_count == base + 6);
+    check_stop_burst_msgs(base);
+    CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);
+    CHECK(fwd(0x4CC, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);
+    advance_us(PRECONDITION_RETRY_US + 80000);
+    expect_state("idle");
+    CHECK(sent_count == base + 6);
+    CHECK(popup_show_count == 3);
 }
 
 static void run_automatic_temperature_cutoff(void) {

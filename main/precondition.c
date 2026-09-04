@@ -759,7 +759,9 @@ static bool requested_event(sm_t *sm, sm_event_t ev) {
             }
             return true;
         case EV_SOC_BECAME_LOW:
-            if (repeating_mode()) {
+            // The delayed car-start attempt announces low SoC after restore.
+            // Keep restore silent to avoid showing the same popup twice.
+            if (repeating_mode() && requested.kind != ATTEMPT_RESTORE) {
                 show_repeating_soc_notice();
             }
             return true;
@@ -1000,12 +1002,13 @@ static bool managed_event(sm_t *sm, sm_event_t ev) {
 
 // ********************* STOPPING (superstate) *********************
 
-// The entry argument states why the stop began. Exhausted start retries use a
-// single retryless cleanup burst; normal stops use the full confirmation/retry
-// path.
+// The entry argument states why the stop began. Blocked starts and exhausted
+// start retries use one cleanup burst without retries or a stop countdown.
+// Normal stops use the full confirmation/retry path.
 static void stopping_enter(sm_t *sm) {
     stopping.reason = (stop_reason_t)sm_entry_arg(sm);
-    stopping.retries = stopping.reason == STOP_REASON_RETRIES_EXHAUSTED
+    stopping.retries = (stopping.reason == STOP_REASON_START_BLOCKED
+                       || stopping.reason == STOP_REASON_RETRIES_EXHAUSTED)
                      ? PRECONDITION_MAX_RETRIES : 0U;
     show_stopping_notice(stopping.reason);
 }
