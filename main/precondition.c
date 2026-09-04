@@ -268,7 +268,8 @@ typedef enum {
     STOP_REASON_UNEXPECTED_IDLE,
     STOP_REASON_TEMPERATURE_REACHED,
     STOP_REASON_LOW_SOC,
-    STOP_REASON_START_ABORTED,
+    STOP_REASON_START_BLOCKED,
+    STOP_REASON_RETRIES_EXHAUSTED,
 } stop_reason_t;
 
 typedef uint8_t precondition_blockers_t;
@@ -293,11 +294,6 @@ static struct {
 static struct {
     // why this attempt was launched; set on entry from the transition argument
     attempt_kind_t kind;
-    // set once this Once session reaches ACTIVE, so later blockers are stop
-    // reasons rather than start errors
-    bool was_active;
-    // blocker errors already shown during this start attempt
-    precondition_blockers_t notified_blockers;
     // timestamp of the start of the most recent start burst, used for retry timing and the countdown display
     int64_t last_attempt_ts;
     // number of times we've re-sent the start burst within the current request
@@ -500,10 +496,8 @@ static void show_request_started_notice(void) {
     if (precon_config.mode == ONCE) {
         if (blocker == PRECONDITION_BLOCK_NONE) {
             track_popup_show_info("Once: starting");
-        } else {
-            show_once_blocker_notice(blocker);
-            requested.notified_blockers |= blocker;
         }
+        // Blocked starts announce their error on entry to STOPPING.
         return;
     }
 
@@ -543,7 +537,13 @@ static void show_stopping_notice(stop_reason_t reason) {
             track_popup_show_info(message);
             break;
         case STOP_REASON_UNEXPECTED_IDLE:
-            track_popup_show_warning("Once: stopping");
+            // TODO(ejones): Consider the situation that preconditioning was stopped
+            // by the BMU due to temperature or SoC. It's possible that we process
+            // the BMU's precon idle signal before we process the temp/SoC reason,
+            // leading to this message appearing spuriously. If we want to address this,
+            // we could delay the popup for some fixed interval in this case to see if
+            // we can retroactively learn the reason the BMU stopped preconditioning.
+            track_popup_show_warning("Once: stopping (unknown reason)");
             break;
         case STOP_REASON_TEMPERATURE_REACHED:
             snprintf(message, sizeof(message),
@@ -557,10 +557,11 @@ static void show_stopping_notice(stop_reason_t reason) {
                      PRECONDITION_BATTERY_SOC_CUTOFF_PCT);
             track_popup_show_warning(message);
             break;
-        case STOP_REASON_START_ABORTED:
-            // The start error was already displayed, or the retry exhaustion
-            // is intentionally silent.
-            // TODO(ejones): reconsider if we want a message in this case
+        case STOP_REASON_START_BLOCKED:
+            show_once_blocker_notice(primary_precon_blocker());
+            break;
+        case STOP_REASON_RETRIES_EXHAUSTED:
+            track_popup_show_error("Once: start failed (out of retries)");
             break;
     }
 }
@@ -642,7 +643,7 @@ static fwd_result_t stopping_display_fwd(sm_t *sm, twai_message_t *to_send, can_
         return FWD_PASSTHROUGH;
     }
     // only display when we can actually confirm/retry the stop, and hide it
-    // once retries are exhausted (including the silent give-up stop)
+    // once retries are exhausted (including the retryless cleanup stop)
     if (!precon_status_available() || stopping.retries >= PRECONDITION_MAX_RETRIES) {
         return FWD_PASSTHROUGH;
     }
@@ -679,8 +680,8 @@ static void start_timeout(sm_t *sm) {
         // retries exhausted in a repeating mode => go back to waiting in MANAGED
         sm_transition(sm, &S_MANAGED);
     } else {
-        // retries exhausted in once mode => send silent stop request (then IDLE)
-        sm_transition_arg(sm, &S_STOPPING, STOP_REASON_START_ABORTED);
+        // retries exhausted in once mode => send stop request w/o retrying (then IDLE)
+        sm_transition_arg(sm, &S_STOPPING, STOP_REASON_RETRIES_EXHAUSTED);
     }
 }
 
@@ -806,7 +807,7 @@ static void car_start_delay_tick(sm_t *sm) {
 
 // ********************* REQUESTED / START_BURST *********************
 
-// Abort an in-progress start attempt when its highest-priority blocker is active.
+// Abort an in-progress start attempt when precon is known to be blocked.
 static bool abort_start_if_blocked(sm_t *sm) {
     precondition_blockers_t blocker = primary_precon_blocker();
     if (blocker == PRECONDITION_BLOCK_NONE) {
@@ -827,16 +828,8 @@ static bool abort_start_if_blocked(sm_t *sm) {
     }
 
     if (precon_config.mode == ONCE) {
-        // TODO(ejones): can we make this logic simpler/combine with stopping logic?
-        if (requested.was_active) {
-            sm_transition_arg(sm, &S_STOPPING, once_stop_reason());
-        } else {
-            if (!(requested.notified_blockers & blocker)) {
-                show_once_blocker_notice(blocker);
-                requested.notified_blockers |= blocker;
-            }
-            sm_transition_arg(sm, &S_STOPPING, STOP_REASON_START_ABORTED);
-        }
+        // Popup message handled by stopping_enter
+        sm_transition_arg(sm, &S_STOPPING, STOP_REASON_START_BLOCKED);
     } else {
         sm_transition(sm, &S_MANAGED);
     }
@@ -941,10 +934,6 @@ static bool wait_started_event(sm_t *sm, sm_event_t ev) {
 // ********************* REQUESTED / ACTIVE *********************
 // Preconditioning is currently enabled.
 
-static void active_enter(sm_t *sm) {
-    requested.was_active = true;
-}
-
 static bool active_event(sm_t *sm, sm_event_t ev) {
     switch (ev) {
         case EV_STATUS_STARTED:
@@ -1021,11 +1010,12 @@ static bool managed_event(sm_t *sm, sm_event_t ev) {
 
 // ********************* STOPPING (superstate) *********************
 
-// The entry argument states why the stop began. Failed starts use a single
-// silent cleanup burst; normal stops retain the full confirmation/retry path.
+// The entry argument states why the stop began. Exhausted start retries use a
+// single retryless cleanup burst; normal stops use the full confirmation/retry
+// path.
 static void stopping_enter(sm_t *sm) {
     stopping.reason = (stop_reason_t)sm_entry_arg(sm);
-    stopping.retries = stopping.reason == STOP_REASON_START_ABORTED
+    stopping.retries = stopping.reason == STOP_REASON_RETRIES_EXHAUSTED
                      ? PRECONDITION_MAX_RETRIES : 0U;
     show_stopping_notice(stopping.reason);
 }
@@ -1147,7 +1137,6 @@ static const sm_state_t S_WAIT_STARTED = {
 static const sm_state_t S_ACTIVE = {
     .name = "active",
     .parent = &S_REQUESTED,
-    .enter = active_enter,
     .event = active_event,
 };
 

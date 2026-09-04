@@ -309,7 +309,7 @@ static void run_short_press(void) {
     // "complete" in ONCE mode -> real stop
     car_status(0x01, CAN_BUS_0);
     expect_state("stop-burst");
-    CHECK(strcmp(popup_text, "⚠ Once: stopping") == 0);
+    CHECK(strcmp(popup_text, "⚠ Once: stopping (unknown reason)") == 0);
     CHECK(!precondition_display().active);
     CHECK(!precondition_display().starting);
     car_status(0x01, CAN_BUS_0);               // stop confirm ignored during burst
@@ -345,7 +345,7 @@ static void run_short_press(void) {
     car_status(0x01, CAN_BUS_0);
     expect_state("idle");
 
-    // --- start retries, then give-up with silent stop ---
+    // --- start retries, then report failure and send a retryless cleanup stop ---
     toggle();
     sent_count = 0;
     for (int i = 0; i < 6; i++) tick1();
@@ -362,13 +362,17 @@ static void run_short_press(void) {
     CHECK(sent_count == 5 * 6);
     CHECK(fwd(0x4E8, CAN_BUS_0, &m) == FWD_MODIFIED);
     CHECK((m.data[0] >> 4) == 4);               // retry count in tenths digit
-    // retries exhausted: give up with a silent stop
+    // retries exhausted: report the error and give up with one cleanup burst
     int base = sent_count;
+    int popup_count_before_give_up = popup_show_count;
     advance_until_state("stop-burst", 11000000);
+    CHECK(stopping.reason == STOP_REASON_RETRIES_EXHAUSTED);
     CHECK(stopping.retries == 4);
+    CHECK(popup_show_count == popup_count_before_give_up + 1);
+    CHECK(strcmp(popup_text, "‼ Once: start failed (out of retries)") == 0);
     CHECK(!precondition_display().starting);
     CHECK(!precondition_display().active);
-    CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);  // silent stop: no display
+    CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);  // no stop countdown
     for (int i = 0; i < 6; i++) tick1();
     expect_state("wait-stopped");
     CHECK(sent_count == base + 6);
@@ -477,6 +481,8 @@ static void run_battery_temperature_cutoff(void) {
     sent_count = 0;
     toggle();
     expect_state("stop-burst");
+    CHECK(stopping.reason == STOP_REASON_START_BLOCKED);
+    CHECK(stopping.retries == 0);
     CHECK(popup_show_count == 1);
     CHECK(strcmp(popup_text, "‼ Once: temp too high: 21°C ≥ 21°C") == 0);
     CHECK(sent_count == 0);
@@ -505,6 +511,7 @@ static void run_battery_temperature_cutoff(void) {
     CHECK(precon_blockers == PRECONDITION_BLOCK_BATTERY_WARM);
     tick1();
     expect_state("stop-burst");
+    CHECK(stopping.reason == STOP_REASON_START_BLOCKED);
     CHECK(popup_show_count == 3);
     CHECK(strcmp(popup_text, "‼ Once: temp too high: 21°C ≥ 21°C") == 0);
 }
@@ -543,6 +550,8 @@ static void run_battery_soc(void) {
     sent_count = 0;
     toggle();
     expect_state("stop-burst");
+    CHECK(stopping.reason == STOP_REASON_START_BLOCKED);
+    CHECK(stopping.retries == 0);
     CHECK(popup_show_count == 1);
     CHECK(strcmp(popup_text, "‼ Once: SoC too low: 19.5% < 20%") == 0);
     CHECK(sent_count == 0);
@@ -571,6 +580,7 @@ static void run_battery_soc(void) {
     CHECK(precon_blockers == PRECONDITION_BLOCK_BATTERY_LOW_SOC);
     tick1();
     expect_state("stop-burst");
+    CHECK(stopping.reason == STOP_REASON_START_BLOCKED);
     CHECK(popup_show_count == 3);
     CHECK(strcmp(popup_text, "‼ Once: SoC too low: 19.5% < 20%") == 0);
 }
@@ -707,7 +717,6 @@ static void run_once_stopping_notices(void) {
     for (int i = 0; i < 6; i++) tick1();
     car_status(0x15, CAN_BUS_0);
     expect_state("active");
-    CHECK(requested.was_active);
     int popup_count_before_limit = popup_show_count;
     battery_temperature(21, 24);
     CHECK(popup_show_count == popup_count_before_limit);
@@ -753,10 +762,10 @@ static void run_once_stopping_notices(void) {
     expect_state("stop-burst");
     CHECK(stopping.reason == STOP_REASON_UNEXPECTED_IDLE);
     CHECK(popup_show_count == popup_count_before_idle + 1);
-    CHECK(strcmp(popup_text, "⚠ Once: stopping") == 0);
+    CHECK(strcmp(popup_text, "⚠ Once: stopping (unknown reason)") == 0);
     battery_temperature(21, 24);
     CHECK(popup_show_count == popup_count_before_idle + 1);
-    CHECK(strcmp(popup_text, "⚠ Once: stopping") == 0);
+    CHECK(strcmp(popup_text, "⚠ Once: stopping (unknown reason)") == 0);
 }
 
 typedef enum {
