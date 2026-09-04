@@ -100,9 +100,49 @@ static void rx(uint32_t id, const uint8_t data[8], can_bus_t bus) {
 
 static void test_before_init(void) {
     CHECK(!track_popup_show("not initialized"));
+    CHECK(!track_popup_show_info("not initialized"));
+    CHECK(!track_popup_show_warning("not initialized"));
+    CHECK(!track_popup_show_error("not initialized"));
     twai_message_t media;
     CHECK(fwd(TRACK_POPUP_MEDIA_FRAME_ID, TRACK_POPUP_TARGET_BUS, &media)
           == FWD_PASSTHROUGH);
+}
+
+static void expect_queued_text(const char *expected_text) {
+    track_popup_request_t expected = {0};
+    track_popup_request_t actual = {0};
+    CHECK(encode_text(expected_text, &expected));
+    CHECK(xQueueReceive(popup.queue, &actual, 0) == pdTRUE);
+    CHECK(actual.size == expected.size);
+    CHECK(memcmp(actual.data, expected.data, expected.size) == 0);
+}
+
+static void test_severity_wrappers(void) {
+    track_popup_init();
+
+    CHECK(!track_popup_show_info(NULL));
+    CHECK(!track_popup_show_warning(""));
+
+    CHECK(track_popup_show_info("Ready"));
+    expect_queued_text("ⓘ Ready");
+    CHECK(track_popup_show_warning("Careful"));
+    expect_queued_text("⚠ Careful");
+    CHECK(track_popup_show_error("Stopped"));
+    expect_queued_text("‼ Stopped");
+
+    // The two-character prefix counts against the popup's 50-character cap.
+    char max_message[TRACK_POPUP_MAX_TEXT_CODE_UNITS - 1U];
+    memset(max_message, 'x', sizeof(max_message) - 1U);
+    max_message[sizeof(max_message) - 1U] = '\0';
+    CHECK(track_popup_show_info(max_message));
+    track_popup_request_t request;
+    CHECK(xQueueReceive(popup.queue, &request, 0) == pdTRUE);
+    CHECK(request.size == TRACK_POPUP_MAX_TEXT_BYTES);
+
+    char oversized[TRACK_POPUP_MAX_TEXT_CODE_UNITS];
+    memset(oversized, 'x', sizeof(oversized) - 1U);
+    oversized[sizeof(oversized) - 1U] = '\0';
+    CHECK(!track_popup_show_info(oversized));
 }
 
 static void test_popup_flow(void) {
@@ -397,6 +437,7 @@ static void test_fallbacks(void) {
 
 int main(void) {
     test_before_init();
+    test_severity_wrappers();
     test_popup_flow();
     test_media_transport_map();
     test_known_media();

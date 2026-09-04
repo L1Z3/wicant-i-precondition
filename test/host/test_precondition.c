@@ -87,6 +87,21 @@ bool track_popup_show(const char *utf8_text) {
     snprintf(popup_text, sizeof(popup_text), "%s", utf8_text);
     return true;
 }
+static bool track_popup_show_prefixed(const char *prefix,
+                                      const char *utf8_text) {
+    char message[sizeof(popup_text)];
+    snprintf(message, sizeof(message), "%s%s", prefix, utf8_text);
+    return track_popup_show(message);
+}
+bool track_popup_show_info(const char *utf8_text) {
+    return track_popup_show_prefixed("ⓘ ", utf8_text);
+}
+bool track_popup_show_warning(const char *utf8_text) {
+    return track_popup_show_prefixed("⚠ ", utf8_text);
+}
+bool track_popup_show_error(const char *utf8_text) {
+    return track_popup_show_prefixed("‼ ", utf8_text);
+}
 
 #include "persistent_settings.c"
 #include "precondition.c"
@@ -113,6 +128,10 @@ static void car_power(bool ready) { uint8_t d[8] = {0}; d[0] = ready ? 0x04 : 0x
 static void battery_temperature(int8_t min_c, int8_t max_c) {
     uint8_t d[8] = {(uint8_t)min_c, (uint8_t)max_c};
     rx_frame(0x152, d, CAN_BUS_0);
+}
+static void battery_soc(uint8_t raw) {
+    uint8_t d[8] = {[7] = raw};
+    rx_frame(0x2FC, d, CAN_BUS_0);
 }
 
 // Model the two firmware workers in deterministic order: the timing task runs
@@ -211,6 +230,8 @@ static void run_short_press(void) {
     sent_count = 0;
     toggle();
     expect_state("start-burst");
+    CHECK(popup_show_count == 1);
+    CHECK(strcmp(popup_text, "ⓘ Once: starting") == 0);
     for (int i = 0; i < 6; i++) tick1();
     CHECK(sent_count == 6);
     check_start_burst_msgs(0);
@@ -237,7 +258,8 @@ static void run_short_press(void) {
     fake_now += 2000000;
     toggle();
     expect_state("stop-burst");
-    CHECK(popup_show_count == 0);                // ONCE mode has no mode-specific popup
+    CHECK(popup_show_count == 2);
+    CHECK(strcmp(popup_text, "ⓘ Once: stopping") == 0);
     CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);
     sent_count = 0;
     for (int i = 0; i < 6; i++) tick1();
@@ -272,21 +294,24 @@ static void run_short_press(void) {
     expect_state("active");
     CHECK(precondition_display().active);
     CHECK(!precondition_display().starting);
-    // Once-mode downgrade stays within the original request and retains its
-    // retry budget.
-    requested.retries = 2;
+    // A later "starting" report does not reopen startup or its retry timer.
+    int sent_before_starting = sent_count;
+    int popups_before_starting = popup_show_count;
     car_status(0x05, CAN_BUS_0);
-    expect_state("wait-started");
-    CHECK(requested.kind == ATTEMPT_MANUAL);
-    CHECK(requested.retries == 2);
-    CHECK(precondition_display().starting);
-    CHECK(!precondition_display().active);
+    expect_state("active");
+    CHECK(!precondition_display().starting);
+    CHECK(precondition_display().active);
+    advance_us(PRECONDITION_STARTED_TIMEOUT_US + 80000);
+    expect_state("active");
+    CHECK(sent_count == sent_before_starting);
+    CHECK(popup_show_count == popups_before_starting);
     car_status(0x15, CAN_BUS_0);
     expect_state("active");
     CHECK(precondition_display().active);
     // "complete" in ONCE mode -> real stop
     car_status(0x01, CAN_BUS_0);
     expect_state("stop-burst");
+    CHECK(strcmp(popup_text, "⚠ Once: stopping (unknown reason)") == 0);
     CHECK(!precondition_display().active);
     CHECK(!precondition_display().starting);
     car_status(0x01, CAN_BUS_0);               // stop confirm ignored during burst
@@ -322,7 +347,7 @@ static void run_short_press(void) {
     car_status(0x01, CAN_BUS_0);
     expect_state("idle");
 
-    // --- start retries, then give-up with silent stop ---
+    // --- start retries, then report failure and send a retryless cleanup stop ---
     toggle();
     sent_count = 0;
     for (int i = 0; i < 6; i++) tick1();
@@ -339,13 +364,17 @@ static void run_short_press(void) {
     CHECK(sent_count == 5 * 6);
     CHECK(fwd(0x4E8, CAN_BUS_0, &m) == FWD_MODIFIED);
     CHECK((m.data[0] >> 4) == 4);               // retry count in tenths digit
-    // retries exhausted: give up with a silent stop
+    // retries exhausted: report the error and give up with one cleanup burst
     int base = sent_count;
+    int popup_count_before_give_up = popup_show_count;
     advance_until_state("stop-burst", 11000000);
+    CHECK(stopping.reason == STOP_REASON_RETRIES_EXHAUSTED);
     CHECK(stopping.retries == 4);
+    CHECK(popup_show_count == popup_count_before_give_up + 1);
+    CHECK(strcmp(popup_text, "‼ Once: start failed (out of retries)") == 0);
     CHECK(!precondition_display().starting);
     CHECK(!precondition_display().active);
-    CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);  // silent stop: no display
+    CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);  // no stop countdown
     for (int i = 0; i < 6; i++) tick1();
     expect_state("wait-stopped");
     CHECK(sent_count == base + 6);
@@ -454,8 +483,10 @@ static void run_battery_temperature_cutoff(void) {
     sent_count = 0;
     toggle();
     expect_state("stop-burst");
+    CHECK(stopping.reason == STOP_REASON_START_BLOCKED);
+    CHECK(stopping.retries == PRECONDITION_MAX_RETRIES);
     CHECK(popup_show_count == 1);
-    CHECK(strcmp(popup_text, "Once: temp too high: 21°C ≥ 21°C") == 0);
+    CHECK(strcmp(popup_text, "‼ Once: temp too high: 21°C ≥ 21°C") == 0);
     CHECK(sent_count == 0);
     for (int i = 0; i < 6; i++) tick1();
     expect_state("idle");
@@ -471,7 +502,8 @@ static void run_battery_temperature_cutoff(void) {
     tick1();
     CHECK(sent_count == 1);
     CHECK(sent[0].msg.data[3] == 0x40 && sent[0].msg.data[4] == 0x03);
-    CHECK(popup_show_count == 1);
+    CHECK(popup_show_count == 2);
+    CHECK(strcmp(popup_text, "ⓘ Once: starting (20°C now)") == 0);
 
     // A newly hot reading also aborts an in-flight manual attempt before a
     // status confirmation can move it into ACTIVE.
@@ -481,7 +513,9 @@ static void run_battery_temperature_cutoff(void) {
     CHECK(precon_blockers == PRECONDITION_BLOCK_BATTERY_WARM);
     tick1();
     expect_state("stop-burst");
-    CHECK(popup_show_count == 2);
+    CHECK(stopping.reason == STOP_REASON_START_BLOCKED);
+    CHECK(popup_show_count == 3);
+    CHECK(strcmp(popup_text, "‼ Once: temp too high: 21°C ≥ 21°C") == 0);
 }
 
 static void run_battery_soc(void) {
@@ -507,6 +541,66 @@ static void run_battery_soc(void) {
     CHECK(soc.raw == 127);
     CHECK(soc.raw * BATTERY_SOC_SCALE == 63.5f);
     CHECK(soc.updated_at_us == fake_now);
+    CHECK(precon_blockers == PRECONDITION_BLOCK_NONE);
+
+    // The low-SoC cutoff is exclusive. It takes display priority over a warm
+    // battery and sends the attempt down the stop path without start frames.
+    battery_temperature(21, 24);
+    battery_soc(39);
+    CHECK(precon_blockers
+          == (PRECONDITION_BLOCK_BATTERY_WARM | PRECONDITION_BLOCK_BATTERY_LOW_SOC));
+    sent_count = 0;
+    toggle();
+    expect_state("stop-burst");
+    CHECK(stopping.reason == STOP_REASON_START_BLOCKED);
+    CHECK(stopping.retries == PRECONDITION_MAX_RETRIES);
+    CHECK(popup_show_count == 1);
+    CHECK(strcmp(popup_text, "‼ Once: SoC too low: 19.5% < 20%") == 0);
+    CHECK(sent_count == 0);
+    for (int i = 0; i < 6; i++) tick1();
+    expect_state("idle");
+    CHECK(sent_count == 6);
+    check_stop_burst_msgs(0);
+
+    // Exactly 20% clears the blocker and permits the normal start sequence.
+    battery_temperature(20, 24);
+    battery_soc(40);
+    CHECK(precon_blockers == PRECONDITION_BLOCK_NONE);
+    sent_count = 0;
+    toggle();
+    expect_state("start-burst");
+    tick1();
+    CHECK(sent_count == 1);
+    CHECK(sent[0].msg.data[3] == 0x40 && sent[0].msg.data[4] == 0x03);
+    CHECK(popup_show_count == 2);
+    CHECK(strcmp(popup_text, "ⓘ Once: starting (20°C now)") == 0);
+
+    // A newly low reading aborts an in-flight attempt too. Even with status
+    // available, the cleanup stop has no countdown or retries.
+    for (int i = 0; i < 5; i++) tick1();
+    expect_state("wait-starting");
+    car_status(0x05, CAN_BUS_0);
+    expect_state("wait-started");
+    battery_soc(39);
+    CHECK(precon_blockers == PRECONDITION_BLOCK_BATTERY_LOW_SOC);
+    tick1();
+    expect_state("stop-burst");
+    CHECK(stopping.reason == STOP_REASON_START_BLOCKED);
+    CHECK(popup_show_count == 3);
+    CHECK(strcmp(popup_text, "‼ Once: SoC too low: 19.5% < 20%") == 0);
+    CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);
+    CHECK(fwd(0x4CC, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);
+    int base = sent_count;
+    for (int i = 0; i < 6; i++) tick1();
+    expect_state("wait-stopped");
+    CHECK(sent_count == base + 6);
+    check_stop_burst_msgs(base);
+    CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);
+    CHECK(fwd(0x4CC, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);
+    advance_us(PRECONDITION_RETRY_US + 80000);
+    expect_state("idle");
+    CHECK(sent_count == base + 6);
+    CHECK(popup_show_count == 3);
 }
 
 static void run_automatic_temperature_cutoff(void) {
@@ -529,6 +623,172 @@ static void run_automatic_temperature_cutoff(void) {
     CHECK(sent_count == 0);
     CHECK(popup_show_count == popup_count_before_periodic);
     CHECK(repeating_mode_enabled());
+}
+
+static void run_automatic_soc_cutoff(void) {
+    precondition_init();
+    battery_soc(40);
+    car_power(true);
+    toggle();
+    for (int i = 0; i < 6; i++) tick1();
+    car_status(0x15, CAN_BUS_0);
+    expect_state("active");
+
+    // The falling edge is announced immediately, even if the active context
+    // came from a silent BMU restart. Repeated low frames and periodic attempts
+    // remain silent.
+    car_status(0x01, CAN_BUS_0);
+    expect_state("managed");
+    car_status(0x05, CAN_BUS_0);
+    car_status(0x15, CAN_BUS_0);
+    CHECK(requested.kind == ATTEMPT_BMU_RESTART);
+    int popup_count_before_low_soc = popup_show_count;
+    battery_soc(39);
+    CHECK(popup_show_count == popup_count_before_low_soc + 1);
+    CHECK(strcmp(popup_text, "⚠ Cont.: resuming when SoC ≥ 20%") == 0);
+    battery_soc(39);
+    CHECK(popup_show_count == popup_count_before_low_soc + 1);
+    car_status(0x01, CAN_BUS_0);
+    sent_count = 0;
+    advance_us(REPEATING_MODE_RETRY_INTERVAL_US + 80000);
+    expect_state("managed");
+    CHECK(sent_count == 0);
+    CHECK(popup_show_count == popup_count_before_low_soc + 1);
+    CHECK(repeating_mode_enabled());
+
+    // Recovery rearms the edge notice, including while already MANAGED.
+    battery_soc(40);
+    battery_soc(39);
+    CHECK(popup_show_count == popup_count_before_low_soc + 2);
+    CHECK(strcmp(popup_text, "⚠ Cont.: resuming when SoC ≥ 20%") == 0);
+}
+
+static void run_repeating_soc_cutoff_message(void) {
+    precondition_init();
+    battery_temperature(21, 24);
+    battery_soc(39);
+    CHECK(precon_blockers
+          == (PRECONDITION_BLOCK_BATTERY_WARM | PRECONDITION_BLOCK_BATTERY_LOW_SOC));
+
+    sent_count = 0;
+    toggle();
+    expect_state("managed");
+    CHECK(sent_count == 0);
+    CHECK(repeating_mode_enabled());
+    CHECK(popup_show_count == 1);
+
+    const char *expected = cfg_mode == PERSISTENT
+                         ? "⚠ Pers.: resuming when SoC ≥ 20%"
+                         : "⚠ Cont.: resuming when SoC ≥ 20%";
+    CHECK(strcmp(popup_text, expected) == 0);
+
+    if (cfg_mode == PERSISTENT) {
+        // A later car restart is another user-visible resume attempt.
+        car_power(true);
+        expect_state("car-start-delay");
+        advance_us(PRECONDITION_CAR_START_DELAY_US - 40000);
+        tick1();
+        expect_state("managed");
+        CHECK(requested.kind == ATTEMPT_CAR_START);
+        CHECK(sent_count == 0);
+        CHECK(popup_show_count == 2);
+        CHECK(strcmp(popup_text, expected) == 0);
+    }
+}
+
+static void run_repeating_temperature_notice(void) {
+    precondition_init();
+    battery_temperature(23, 24);
+    battery_soc(40);
+
+    sent_count = 0;
+    toggle();
+    expect_state("managed");
+    CHECK(sent_count == 0);
+    CHECK(repeating_mode_enabled());
+    CHECK(popup_show_count == 1);
+
+    const char *expected = cfg_mode == PERSISTENT
+                         ? "ⓘ Pers.: maintaining 21°C (23°C now)"
+                         : "ⓘ Cont.: maintaining 21°C (23°C now)";
+    CHECK(strcmp(popup_text, expected) == 0);
+
+    if (cfg_mode == PERSISTENT) {
+        car_power(true);
+        expect_state("car-start-delay");
+        advance_us(PRECONDITION_CAR_START_DELAY_US - 40000);
+        tick1();
+        expect_state("managed");
+        CHECK(requested.kind == ATTEMPT_CAR_START);
+        CHECK(sent_count == 0);
+        CHECK(popup_show_count == 2);
+        CHECK(strcmp(popup_text, expected) == 0);
+    }
+}
+
+static void run_once_stopping_notices(void) {
+    precondition_init();
+    battery_temperature(20, 24);
+    battery_soc(40);
+
+    // A temperature reading received before the idle status gives the
+    // best-effort reached-target reason.
+    toggle();
+    for (int i = 0; i < 6; i++) tick1();
+    car_status(0x15, CAN_BUS_0);
+    expect_state("active");
+    int popup_count_before_limit = popup_show_count;
+    battery_temperature(21, 24);
+    car_status(0x05, CAN_BUS_0);
+    tick1();
+    expect_state("active");
+    CHECK(popup_show_count == popup_count_before_limit);
+    car_status(0x01, CAN_BUS_0);
+    expect_state("stop-burst");
+    CHECK(stopping.reason == STOP_REASON_TEMPERATURE_REACHED);
+    CHECK(popup_show_count == popup_count_before_limit + 1);
+    CHECK(strcmp(popup_text, "ⓘ Once: stopping (reached 21°C)") == 0);
+    for (int i = 0; i < 6; i++) tick1();
+    car_status(0x01, CAN_BUS_0);
+    expect_state("idle");
+
+    // SoC wins when both known limits are active after the session was active.
+    battery_temperature(20, 24);
+    battery_soc(40);
+    toggle();
+    for (int i = 0; i < 6; i++) tick1();
+    car_status(0x15, CAN_BUS_0);
+    expect_state("active");
+    popup_count_before_limit = popup_show_count;
+    battery_temperature(21, 24);
+    battery_soc(39);
+    CHECK(popup_show_count == popup_count_before_limit);
+    car_status(0x01, CAN_BUS_0);
+    expect_state("stop-burst");
+    CHECK(stopping.reason == STOP_REASON_LOW_SOC);
+    CHECK(popup_show_count == popup_count_before_limit + 1);
+    CHECK(strcmp(popup_text, "⚠ Once: stopping (<20% SoC)") == 0);
+    for (int i = 0; i < 6; i++) tick1();
+    car_status(0x01, CAN_BUS_0);
+    expect_state("idle");
+
+    // If idle arrives before the measurement that explains it, fall back to
+    // the generic notice and do not replace it with a late temperature frame.
+    battery_temperature(20, 24);
+    battery_soc(40);
+    toggle();
+    for (int i = 0; i < 6; i++) tick1();
+    car_status(0x15, CAN_BUS_0);
+    expect_state("active");
+    int popup_count_before_idle = popup_show_count;
+    car_status(0x01, CAN_BUS_0);
+    expect_state("stop-burst");
+    CHECK(stopping.reason == STOP_REASON_UNEXPECTED_IDLE);
+    CHECK(popup_show_count == popup_count_before_idle + 1);
+    CHECK(strcmp(popup_text, "⚠ Once: stopping (unknown reason)") == 0);
+    battery_temperature(21, 24);
+    CHECK(popup_show_count == popup_count_before_idle + 1);
+    CHECK(strcmp(popup_text, "⚠ Once: stopping (unknown reason)") == 0);
 }
 
 typedef enum {
@@ -602,7 +862,7 @@ static void run_continuous(void) {
     toggle();
     expect_state("start-burst");
     CHECK(strcmp(popup_text,
-                 "Continuous: maintaining 21°C (-5°C)") == 0);
+                 "ⓘ Cont.: maintaining 21°C (-5°C now)") == 0);
     twai_message_t m;
     CHECK(fwd(0x4E8, CAN_BUS_0, &m) == FWD_MODIFIED);
     for (int i = 0; i < 6; i++) tick1();
@@ -621,26 +881,22 @@ static void run_continuous(void) {
     CHECK(m.data[5] == 0x10 && m.data[6] == 0xA0 && m.data[7] == 0x00);
     CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);
 
-    // A downgrade while a repeating session is active is a fresh, silent BMU
-    // restart rather than a continuation of the old attempt.
-    requested.retries = 3;
-    int sent_before_bmu_restart = sent_count;
+    // A later "starting" report leaves the running session and display alone.
+    int popups_before_starting = popup_show_count;
     car_status(0x05, CAN_BUS_0);
-    expect_state("wait-started");
-    CHECK(requested.kind == ATTEMPT_BMU_RESTART);
-    CHECK(requested.retries == 0);
-    CHECK(requested.last_attempt_ts == fake_now);
-    CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);
-    CHECK(sent_count == sent_before_bmu_restart);
-    car_status(0x15, CAN_BUS_0);
     expect_state("active");
+    CHECK(precondition_display().active);
+    CHECK(!precondition_display().starting);
+    CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);
 
-    // while the BMU reports running, no re-requests ever fire
+    // Neither a lingering "starting" nor "started" report triggers retries.
     sent_count = 0;
     advance_us(310000000LL);
+    expect_state("active");
     car_status(0x15, CAN_BUS_0);
     advance_us(310000000LL);
     CHECK(sent_count == 0);
+    CHECK(popup_show_count == popups_before_starting);
     expect_state("active");
 
     // BMU stops: enter MANAGED and arm the 5-minute re-nudge on this idle edge
@@ -729,7 +985,7 @@ static void run_continuous(void) {
     toggle();
     expect_state("stop-burst");
     CHECK(!precondition_display().active);
-    CHECK(strcmp(popup_text, "Continuous mode: stopping") == 0);
+    CHECK(strcmp(popup_text, "ⓘ Continuous: stopping") == 0);
     for (int i = 0; i < 6; i++) tick1();
     check_stop_burst_msgs(0);
     expect_state("wait-stopped");
@@ -773,7 +1029,7 @@ static void run_continuous(void) {
     CHECK(!idle.continuous_disabled_by_car_off);
     CHECK(popup_show_count == popup_count_before_car_off + 1);
     CHECK(strcmp(popup_text,
-                 "Continuous: disabled by car restart") == 0);
+                 "ⓘ Continuous: disabled by car restart") == 0);
     car_status(0x01, CAN_BUS_0);
     advance_us(310000000LL);
     CHECK(sent_count == 0);
@@ -808,7 +1064,7 @@ static void run_persistent(void) {
     toggle();
     expect_state("start-burst");
     CHECK(strcmp(popup_text,
-                 "Persistent: maintaining 21°C (7°C)") == 0);
+                 "ⓘ Pers.: maintaining 21°C (7°C now)") == 0);
     CHECK(!fake_nvs_exists);
     fake_now += 40000;
     precondition_tick();
@@ -839,6 +1095,7 @@ static void run_persistent(void) {
     // car back to READY: leave time for the car to finish coming up before the
     // relaunch, then show the countdown as a reminder
     sent_count = 0;
+    int popup_count_before_restart = popup_show_count;
     car_power(true);
     expect_state("car-start-delay");
     CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);
@@ -848,6 +1105,9 @@ static void run_persistent(void) {
     tick1();
     expect_state("start-burst");
     CHECK(requested.kind == ATTEMPT_CAR_START);
+    CHECK(popup_show_count == popup_count_before_restart + 1);
+    CHECK(strcmp(popup_text,
+                 "ⓘ Pers.: maintaining 21°C (7°C now)") == 0);
     CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_MODIFIED);
     for (int i = 0; i < 6; i++) tick1();
     CHECK(sent_count == 6);
@@ -878,6 +1138,7 @@ static void run_persistent(void) {
     expect_state("stop-burst");
     CHECK(!precondition_display().active);
     CHECK(!repeating_mode_enabled());
+    CHECK(strcmp(popup_text, "ⓘ Persistent: stopping") == 0);
     tick1();
     CHECK(fake_nvs_value == 0);                 // lower-priority worker flushed the clear
     for (int i = 0; i < 5; i++) tick1();
@@ -897,6 +1158,8 @@ static void run_persistent_restore(void) {
     fake_nvs_value = 1;
     precondition_init();
     expect_state("managed");                    // restored latch parks in MANAGED
+    CHECK(requested.kind == ATTEMPT_RESTORE);
+    CHECK(popup_show_count == 0);                // parked restore is not an attempt yet
     CHECK(!precondition_display().active);             // car not ready at boot: no session
     CHECK(fwd(0x0C7, CAN_BUS_0, NULL) == FWD_BLOCK);  // MITM guards the latch from boot
     // A late status report moves a restored session into ACTIVE, then its
@@ -912,6 +1175,7 @@ static void run_persistent_restore(void) {
     advance_us(310000000LL);
     CHECK(sent_count == 0);
     expect_state("managed");
+    int popup_count_before_restart = popup_show_count;
     car_power(true);
     expect_state("car-start-delay");            // first ready edge starts the delay
     CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);  // no countdown before the try
@@ -921,6 +1185,8 @@ static void run_persistent_restore(void) {
     tick1();
     expect_state("start-burst");
     CHECK(requested.kind == ATTEMPT_CAR_START);
+    CHECK(popup_show_count == popup_count_before_restart + 1);
+    CHECK(strcmp(popup_text, "ⓘ Persistent: maintaining 21°C") == 0);
     CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_MODIFIED);  // countdown shown
     for (int i = 0; i < 6; i++) tick1();
     car_status(0x05, CAN_BUS_0);
@@ -1036,6 +1302,13 @@ static const suite_t suites[] = {
     {"precondition battery temperature cutoff", ONCE, PRESS_SHORT, run_battery_temperature_cutoff},
     {"precondition battery state of charge", ONCE, PRESS_SHORT, run_battery_soc},
     {"precondition automatic temperature cutoff", CONTINUOUS, PRESS_SHORT, run_automatic_temperature_cutoff},
+    {"precondition persistent temperature cutoff", PERSISTENT, PRESS_SHORT, run_automatic_temperature_cutoff},
+    {"precondition automatic SoC cutoff", CONTINUOUS, PRESS_SHORT, run_automatic_soc_cutoff},
+    {"precondition continuous SoC cutoff message", CONTINUOUS, PRESS_SHORT, run_repeating_soc_cutoff_message},
+    {"precondition persistent SoC cutoff message", PERSISTENT, PRESS_SHORT, run_repeating_soc_cutoff_message},
+    {"precondition continuous temperature notice", CONTINUOUS, PRESS_SHORT, run_repeating_temperature_notice},
+    {"precondition persistent temperature notice", PERSISTENT, PRESS_SHORT, run_repeating_temperature_notice},
+    {"precondition once stopping notices", ONCE, PRESS_SHORT, run_once_stopping_notices},
     {"precondition concurrent dispatch", ONCE, PRESS_LONG, run_concurrent_dispatch},
     {"precondition continuous", CONTINUOUS, PRESS_SHORT, run_continuous},
     {"precondition persistent", PERSISTENT, PRESS_SHORT, run_persistent},
