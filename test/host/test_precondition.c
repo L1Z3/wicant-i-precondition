@@ -294,15 +294,17 @@ static void run_short_press(void) {
     expect_state("active");
     CHECK(precondition_display().active);
     CHECK(!precondition_display().starting);
-    // Once-mode downgrade stays within the original request and retains its
-    // retry budget.
-    requested.retries = 2;
+    // A later "starting" report does not reopen startup or its retry timer.
+    int sent_before_starting = sent_count;
+    int popups_before_starting = popup_show_count;
     car_status(0x05, CAN_BUS_0);
-    expect_state("wait-started");
-    CHECK(requested.kind == ATTEMPT_MANUAL);
-    CHECK(requested.retries == 2);
-    CHECK(precondition_display().starting);
-    CHECK(!precondition_display().active);
+    expect_state("active");
+    CHECK(!precondition_display().starting);
+    CHECK(precondition_display().active);
+    advance_us(PRECONDITION_STARTED_TIMEOUT_US + 80000);
+    expect_state("active");
+    CHECK(sent_count == sent_before_starting);
+    CHECK(popup_show_count == popups_before_starting);
     car_status(0x15, CAN_BUS_0);
     expect_state("active");
     CHECK(precondition_display().active);
@@ -619,6 +621,8 @@ static void run_automatic_soc_cutoff(void) {
     // The falling edge is announced immediately, even if the active context
     // came from a silent BMU restart. Repeated low frames and periodic attempts
     // remain silent.
+    car_status(0x01, CAN_BUS_0);
+    expect_state("managed");
     car_status(0x05, CAN_BUS_0);
     car_status(0x15, CAN_BUS_0);
     CHECK(requested.kind == ATTEMPT_BMU_RESTART);
@@ -719,6 +723,9 @@ static void run_once_stopping_notices(void) {
     expect_state("active");
     int popup_count_before_limit = popup_show_count;
     battery_temperature(21, 24);
+    car_status(0x05, CAN_BUS_0);
+    tick1();
+    expect_state("active");
     CHECK(popup_show_count == popup_count_before_limit);
     car_status(0x01, CAN_BUS_0);
     expect_state("stop-burst");
@@ -858,26 +865,22 @@ static void run_continuous(void) {
     CHECK(m.data[5] == 0x10 && m.data[6] == 0xA0 && m.data[7] == 0x00);
     CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);
 
-    // A downgrade while a repeating session is active is a fresh, silent BMU
-    // restart rather than a continuation of the old attempt.
-    requested.retries = 3;
-    int sent_before_bmu_restart = sent_count;
+    // A later "starting" report leaves the running session and display alone.
+    int popups_before_starting = popup_show_count;
     car_status(0x05, CAN_BUS_0);
-    expect_state("wait-started");
-    CHECK(requested.kind == ATTEMPT_BMU_RESTART);
-    CHECK(requested.retries == 0);
-    CHECK(requested.last_attempt_ts == fake_now);
-    CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);
-    CHECK(sent_count == sent_before_bmu_restart);
-    car_status(0x15, CAN_BUS_0);
     expect_state("active");
+    CHECK(precondition_display().active);
+    CHECK(!precondition_display().starting);
+    CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);
 
-    // while the BMU reports running, no re-requests ever fire
+    // Neither a lingering "starting" nor "started" report triggers retries.
     sent_count = 0;
     advance_us(310000000LL);
+    expect_state("active");
     car_status(0x15, CAN_BUS_0);
     advance_us(310000000LL);
     CHECK(sent_count == 0);
+    CHECK(popup_show_count == popups_before_starting);
     expect_state("active");
 
     // BMU stops: enter MANAGED and arm the 5-minute re-nudge on this idle edge

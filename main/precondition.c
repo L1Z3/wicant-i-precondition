@@ -937,19 +937,9 @@ static bool wait_started_event(sm_t *sm, sm_event_t ev) {
 static bool active_event(sm_t *sm, sm_event_t ev) {
     switch (ev) {
         case EV_STATUS_STARTED:
-            // still started; all is well.
-            return true;
         case EV_STATUS_STARTING:
-            // preconditioning was previously fully active, but now it's only showing as starting.
-            if (repeating_mode()) {
-                // The BMU is presumably restarting on its own, so monitor it 
-                // with a fresh silent attempt context.
-                sm_transition_arg(sm, &S_REQUESTED, ATTEMPT_BMU_RESTART);
-            } else {
-                // Once mode: keep retrying with original retry budget.
-                requested.last_attempt_ts = sm_now(sm);
-                sm_transition(sm, &S_WAIT_STARTED);
-            }
+            // Once running, wait for an explicit idle status to end the run.
+            // (EV_STATUS_STARTING here should never actually happen here afaik)
             return true;
         case EV_STATUS_IDLE:
             if (repeating_mode()) {
