@@ -2,6 +2,9 @@
 // surface. the constants must stay in sync with the real header.
 #pragma once
 #include <stdint.h>
+#include <stdbool.h>
+
+bool config_server_temperature_fahrenheit(void);
 
 #define ONCE 0
 #define CONTINUOUS 1
