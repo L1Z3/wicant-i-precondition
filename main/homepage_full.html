@@ -570,6 +570,14 @@
                     <td><div id="precondition_active_status">Loading...</div></td>
                 </tr>
                 <tr>
+                    <td>Charge AC Limit:</td>
+                    <td><div id="charge_ac_status">Waiting for CAN data</div></td>
+                </tr>
+                <tr>
+                    <td>Charge DC Limit:</td>
+                    <td><div id="charge_dc_status">Waiting for CAN data</div></td>
+                </tr>
+                <tr>
                     <td><input id="check_status_button" name="check_status_button" type="button" onclick="checkStatus()"
                             value="Check status" /></td>
                     <td>&nbsp;</td>
@@ -1391,6 +1399,44 @@
                         <input id="track_popup_button" name="track_popup_button" type="button"
                             onclick="showTrackPopup()" value="Show Popup" />
                     </td>
+                </tr>
+                <tr>
+                    <td colspan="2"><div class="section-title" style="margin-top:1rem; margin-bottom:0.5rem;">Charge Limits</div></td>
+                </tr>
+                <tr>
+                    <td>AC Charge Limit:</td>
+                    <td class="slider-container">
+                        <input type="range"
+                               id="charge_ac_limit"
+                               name="charge_ac_limit"
+                               value="100"
+                               min="50"
+                               max="100"
+                               step="10"
+                               oninput="onChargeAcInput(this.value)"
+                               onchange="applyChargeLimit()">
+                        <span id="charge_ac_value">100</span>%
+                    </td>
+                </tr>
+                <tr>
+                    <td>DC Charge Limit:</td>
+                    <td class="slider-container">
+                        <input type="range"
+                               id="charge_dc_limit"
+                               name="charge_dc_limit"
+                               value="100"
+                               min="50"
+                               max="100"
+                               step="10"
+                               oninput="onChargeDcInput(this.value)"
+                               onchange="applyChargeLimit()">
+                        <span id="charge_dc_value">100</span>%
+                    </td>
+                </tr>
+                <tr>
+                    <td></td>
+                    <td><input id="charge_apply_button" type="button" onclick="applyChargeLimit()" value="Apply Limits (no reboot)" />
+                        <input id="charge_refresh_button" type="button" onclick="refreshChargeLimit()" value="Refresh from Car" /></td>
                 </tr>
                 <tr class="can1_row" style="display:none">
                     <td>CAN Connection Mode:</td>
@@ -2606,6 +2652,14 @@ function loadAutoTable(jsonData) {
 			document.getElementById("precondition_active_status").textContent = obj.precondition_starting ? "Starting" : (obj.precondition_active ? "Yes" : "No");
 			// the button toggles, so label it with the action it will take
 			document.getElementById("precon_activate_button").value = obj.precondition_requested ? "Stop Preconditioning" : "Activate";
+			// Charge limits: last 0x1F9 car-side reply
+			if (obj.charge_last_valid) {
+				document.getElementById("charge_ac_status").textContent = obj.charge_last_ac_percent + "% (" + formatAge(obj.charge_last_age_ms) + " ago)";
+				document.getElementById("charge_dc_status").textContent = obj.charge_last_dc_percent + "% (" + formatAge(obj.charge_last_age_ms) + " ago)";
+			} else {
+				document.getElementById("charge_ac_status").textContent = "Waiting for CAN data";
+				document.getElementById("charge_dc_status").textContent = "Waiting for CAN data";
+			}
 			document.getElementById("port_status").innerHTML = obj.port;
 			document.getElementById("fw_version").innerHTML = obj.fw_version;
 			document.getElementById("hw_version").innerHTML = obj.hw_version;
@@ -2919,6 +2973,8 @@ function loadAutoTable(jsonData) {
         obj["precon_mode"] = document.getElementById("precon_mode").value;
         obj["precon_button"] = document.getElementById("precon_button").value;
         obj["precon_press"] = document.getElementById("precon_press").value;
+        obj["charge_ac_limit"] = document.getElementById("charge_ac_limit").value;
+        obj["charge_dc_limit"] = document.getElementById("charge_dc_limit").value;
 		var configJSON = JSON.stringify(obj);
 		const xhttp = new XMLHttpRequest();
 		xhttp.onload = function() {
@@ -2994,6 +3050,62 @@ function loadAutoTable(jsonData) {
 		xhttp.open("POST", "/track_popup");
 		xhttp.setRequestHeader("Content-Type", "text/plain; charset=UTF-8");
 		xhttp.send(textInput.value);
+	}
+	function setChargeLimitDisplay(prefix, percent) {
+		const el = document.getElementById(prefix + 'limit');
+		if (!el) return;
+		el.value = percent;
+		document.getElementById(prefix + 'value').textContent = percent;
+	}
+	function onChargeAcInput(val) {
+		setChargeLimitDisplay('charge_ac_', val);
+		submit_enable();
+	}
+	function onChargeDcInput(val) {
+		setChargeLimitDisplay('charge_dc_', val);
+		submit_enable();
+	}
+	function applyChargeLimit() {
+		const ac = parseInt(document.getElementById('charge_ac_limit').value);
+		const dc = parseInt(document.getElementById('charge_dc_limit').value);
+		if (isNaN(ac) || isNaN(dc) || ac < 50 || ac > 100 || dc < 50 || dc > 100) {
+			showNotification('AC/DC must be 50-100', 'red');
+			return;
+		}
+		fetch('/charge_limit', {
+			method: 'POST',
+			headers: {'Content-Type': 'application/json'},
+			body: JSON.stringify({
+				ac: ac,
+				dc: dc
+			})
+		}).then(r => {
+			if (!r.ok) throw new Error('HTTP ' + r.status);
+			return r.json();
+		}).then(obj => {
+			showNotification('Charge limits applied: AC ' + obj.ac + '% DC ' + obj.dc + '%', 'green');
+			setTimeout(checkStatus, 200);
+		}).catch(e => showNotification('Failed to apply charge limits: ' + e.message, 'red'));
+	}
+
+	// Sync the sliders with the last 0x1F9 car reply (configured target stays
+	// untouched until Apply is pressed).
+	function refreshChargeLimit() {
+		fetch('/charge_limit')
+			.then(r => {
+				if (!r.ok) throw new Error('HTTP ' + r.status);
+				return r.json();
+			}).then(obj => {
+				if (!obj.last_seen_valid) {
+					showNotification('No charge limit reply from the car seen yet', 'yellow');
+					return;
+				}
+				const ac = obj.actual_ac;
+				const dc = obj.actual_dc;
+				setChargeLimitDisplay('charge_ac_', ac);
+				setChargeLimitDisplay('charge_dc_', dc);
+				showNotification('Refreshed from car: AC ' + ac + '% DC ' + dc + '%', 'green');
+			}).catch(e => showNotification('Failed to refresh charge limits: ' + e.message, 'red'));
 	}
 
     function send_system_command(command) {
@@ -3281,6 +3393,9 @@ function loadAutoTable(jsonData) {
             // config saved by older firmware has no precon_press key
             document.getElementById("precon_press").value = obj.precon_press || "short";
             syncPreconButtonToggle();
+			// charge limits: old configs lack these keys, default to 100
+			setChargeLimitDisplay("charge_ac_", obj.charge_ac_limit || "100");
+			setChargeLimitDisplay("charge_dc_", obj.charge_dc_limit || "100");
 			if(obj.batt_alert_time == "1") {
 				document.getElementById("batt_alert_time").selectedIndex = "0";
 			} else if(obj.batt_alert_time == "6") {

@@ -55,6 +55,7 @@
 #include "hw_config.h"
 #include "dev_status.h"
 #include "precondition.h"
+#include "car_settings.h"
 #include "debug_logs.h"
 #include "debug_logs_config.h"
 
@@ -261,6 +262,7 @@ static void precondition_task(void *arg)
 		if(dev_status_is_bit_set(DEV_AWAKE_BIT))
 		{
 			precondition_tick();
+			car_settings_tick();
 		}
 		// Doing it this way (rather than a periodic 40ms timer) has the advantage
 		// of ensuring at least 40ms elapse between each tick, even if the task
@@ -346,6 +348,7 @@ static void can_rx_task(void *pvParameters)
             // the single-bus protocols (slcan/realdash/elm327/mqtt) see
             // CAN_BUS_0 traffic only.
             precondition_can_rx_hook(&rx_msg, rx_bus);
+            car_settings_can_rx_hook(&rx_msg, rx_bus);
             {
                 twai_message_t fwd_msg = rx_msg;
                 can_bus_t fwd_bus;
@@ -377,7 +380,12 @@ static void can_rx_task(void *pvParameters)
                     // CAR_BUS-bound frames, so bus 1 traffic is left alone.
                     fwd_bus = rx_bus;
                     fwd_result = precondition_fwd_hook(&fwd_msg, fwd_bus);
-                    fwd_wanted = (fwd_result == FWD_MODIFIED);
+                    // parallel mode can't pull a frame that's already on the
+                    // wire, so precondition's FWD_BLOCK just means "skip the
+                    // duplicate"; otherwise forward a duplicate only if
+                    // precondition modified the frame
+                    fwd_wanted = (fwd_result != FWD_BLOCK)
+                              && (fwd_result == FWD_MODIFIED);
                     fwd_wait = 1;
                 }
                 if (fwd_wanted && can_send(fwd_bus, &fwd_msg, fwd_wait) != ESP_OK)
@@ -542,6 +550,10 @@ void app_main(void)
 	// must run after config_server_start: entering the initial state reads the
 	// precon mode from the config
 	precondition_init();
+	car_settings_init();
+	// Elicit a 0x1F9 status echo to populate the charge-limit display; the
+	// tick emits the frames once CAN is up.
+	car_settings_probe_status();
 	slcan_init(&send_to_host);
 
 	int8_t can_datarate = config_server_get_can_rate();
@@ -611,17 +623,20 @@ void app_main(void)
 		}
 
 		can_enable(CAN_BUS_0);
+		car_settings_bus_up();
 	}
 	else if(protocol == SAVVYCAN)
 	{
 		gvret_init(&send_to_host);
 		can_enable(CAN_BUS_0);
+		car_settings_bus_up();
 	}
 	else if(protocol == OBD_ELM327)
 	{
 //		can_init(CAN_500K);
 		can_set_bitrate(CAN_BUS_0, can_datarate);
 		can_enable(CAN_BUS_0);
+		car_settings_bus_up();
 		xmsg_obd_rx_queue = xQueueCreate(32, sizeof( twai_message_t) );
 		
 		if(config_server_mqtt_en_config() && config_server_mqtt_elm327_log())
@@ -637,18 +652,20 @@ void app_main(void)
 	else if(protocol == AUTO_PID)
 	{
 		can_set_bitrate(CAN_BUS_0, can_datarate);
-		can_enable(CAN_BUS_0);
+can_enable(CAN_BUS_0);
+		car_settings_bus_up();
 		xmsg_obd_rx_queue = xQueueCreate(32, sizeof( twai_message_t) );
 		
 		elm327_init(&autopid_parser, &xmsg_obd_rx_queue, NULL);
 		autopid_init((char*)&uid[0]);
 	}
-
+	
 	if(config_server_mqtt_en_config())
 	{
 		can_set_bitrate(CAN_BUS_0, can_datarate);
 		xmsg_mqtt_rx_queue = xQueueCreate(32, sizeof(mqtt_can_message_t) );
 		can_enable(CAN_BUS_0);
+		car_settings_bus_up();
 		mqtt_init((char*)&uid[0], CONNECTED_LED_GPIO_NUM, &xmsg_mqtt_rx_queue);
 	}
 //	else if(protocol == MQTT)
