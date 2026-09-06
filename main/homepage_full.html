@@ -1413,9 +1413,8 @@
                                min="50"
                                max="100"
                                step="10"
-                               oninput="onChargeAcInput(this.value)"
-                               onchange="applyChargeLimit()">
-                        <span id="charge_ac_value">100</span>%
+                               oninput="onChargeAcInput(this.value)">
+                        <span id="charge_ac_value">Reading from car...</span>%
                     </td>
                 </tr>
                 <tr>
@@ -1428,9 +1427,8 @@
                                min="50"
                                max="100"
                                step="10"
-                               oninput="onChargeDcInput(this.value)"
-                               onchange="applyChargeLimit()">
-                        <span id="charge_dc_value">100</span>%
+                               oninput="onChargeDcInput(this.value)">
+                        <span id="charge_dc_value">Reading from car...</span>%
                     </td>
                 </tr>
                 <tr>
@@ -2656,9 +2654,23 @@ function loadAutoTable(jsonData) {
 			if (obj.charge_last_valid) {
 				document.getElementById("charge_ac_status").textContent = obj.charge_last_ac_percent + "% (" + formatAge(obj.charge_last_age_ms) + " ago)";
 				document.getElementById("charge_dc_status").textContent = obj.charge_last_dc_percent + "% (" + formatAge(obj.charge_last_age_ms) + " ago)";
+				// Populate the sliders from the car's actual limit, so the init
+				// probe seeds them after a power cycle - but not once the user
+				// has moved/committed a value (chargeLimitEdited).
+				if (!chargeLimitEdited) {
+					setChargeLimitDisplay("charge_ac_", obj.charge_last_ac_percent);
+					setChargeLimitDisplay("charge_dc_", obj.charge_last_dc_percent);
+				}
 			} else {
 				document.getElementById("charge_ac_status").textContent = "Waiting for CAN data";
 				document.getElementById("charge_dc_status").textContent = "Waiting for CAN data";
+				// Probe not seen yet: retry until the 0x1F9 reply arrives (bounded).
+				if (!chargeLimitEdited) {
+					window._chargeLimitPoll = (window._chargeLimitPoll || 0) + 1;
+					if (window._chargeLimitPoll <= 30) {
+						setTimeout(checkStatus, 2000);
+					}
+				}
 			}
 			document.getElementById("port_status").innerHTML = obj.port;
 			document.getElementById("fw_version").innerHTML = obj.fw_version;
@@ -3051,6 +3063,11 @@ function loadAutoTable(jsonData) {
 		xhttp.setRequestHeader("Content-Type", "text/plain; charset=UTF-8");
 		xhttp.send(textInput.value);
 	}
+	// True once the user moves a slider or commits via Apply: from then on the
+	// live car echo must NOT overwrite the slider (the car's reported value can
+	// lag behind, e.g. while it refuses to move). Until it is true, checkStatus
+	// keeps the slider in sync with the car's actual limit.
+	let chargeLimitEdited = false;
 	function setChargeLimitDisplay(prefix, percent) {
 		const el = document.getElementById(prefix + 'limit');
 		if (!el) return;
@@ -3059,10 +3076,12 @@ function loadAutoTable(jsonData) {
 	}
 	function onChargeAcInput(val) {
 		setChargeLimitDisplay('charge_ac_', val);
+		chargeLimitEdited = true;
 		submit_enable();
 	}
 	function onChargeDcInput(val) {
 		setChargeLimitDisplay('charge_dc_', val);
+		chargeLimitEdited = true;
 		submit_enable();
 	}
 	function applyChargeLimit() {
@@ -3084,6 +3103,9 @@ function loadAutoTable(jsonData) {
 			return r.json();
 		}).then(obj => {
 			showNotification('Charge limits applied: AC ' + obj.ac + '% DC ' + obj.dc + '%', 'green');
+			// Committed target: don't let a lagging car echo snap the slider
+			// back to the old value after a successful apply.
+			chargeLimitEdited = true;
 			setTimeout(checkStatus, 200);
 		}).catch(e => showNotification('Failed to apply charge limits: ' + e.message, 'red'));
 	}
@@ -3104,6 +3126,8 @@ function loadAutoTable(jsonData) {
 				const dc = obj.actual_dc;
 				setChargeLimitDisplay('charge_ac_', ac);
 				setChargeLimitDisplay('charge_dc_', dc);
+				// Explicit "Refresh from Car": resume tracking the live echo.
+				chargeLimitEdited = false;
 				showNotification('Refreshed from car: AC ' + ac + '% DC ' + dc + '%', 'green');
 			}).catch(e => showNotification('Failed to refresh charge limits: ' + e.message, 'red'));
 	}
@@ -3393,9 +3417,10 @@ function loadAutoTable(jsonData) {
             // config saved by older firmware has no precon_press key
             document.getElementById("precon_press").value = obj.precon_press || "short";
             syncPreconButtonToggle();
-			// charge limits: old configs lack these keys, default to 100
-			setChargeLimitDisplay("charge_ac_", obj.charge_ac_limit || "100");
-			setChargeLimitDisplay("charge_dc_", obj.charge_dc_limit || "100");
+			// Charge-limit sliders are intentionally NOT set from /load_config:
+			// that endpoint serves the saved config file (stale "100" until the
+			// form is saved), which is what reads as 100/100 after a power cycle.
+			// checkStatus populates them from the live 0x1F9 car reply instead.
 			if(obj.batt_alert_time == "1") {
 				document.getElementById("batt_alert_time").selectedIndex = "0";
 			} else if(obj.batt_alert_time == "6") {
