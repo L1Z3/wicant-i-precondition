@@ -4,8 +4,6 @@
 #include "esp_timer.h"
 #include <string.h>
 #include "freertos/semphr.h"
-// todo(TRH): fix population from defaults
-// choose between refresh and slider onchange
 
 #define TAG __func__
 
@@ -69,6 +67,11 @@ static int64_t s_boot_us = 0;
 // turns it into a passive burst once idle, eliciting a 0x1F9 reply that
 // seeds the status display.
 static bool s_probe_pending = false;
+
+// Armed when the probe burst first fires; the first valid 0x1F9 reply after
+// that is adopted as the configured charge limit (one-shot). Separate from
+// s_probe_pending, which clears as soon as the burst is armed.
+static bool s_probe_await_reply = false;
 
 // Tracks whether CAN bus is enabled; quiet timer only starts after bus-up.
 static bool s_bus_up = false;
@@ -166,10 +169,11 @@ bool charge_limit_set(uint8_t ac_percent, uint8_t dc_percent) {
     if (xSemaphoreTake(s_mutex, portMAX_DELAY)) {
         s_ac_limit = ac_percent;
         s_dc_limit = dc_percent;
-        // New target: reset the conflict latch so the next disagreeing reply
-        // is answered again.
-        s_conflict_target_ac = s_ac_limit;
-        s_conflict_target_dc = s_dc_limit;
+        // Leave the conflict latch (s_conflict_ac/dc, s_conflict_target_ac/dc)
+        // untouched: it records the last (actual, target) pair we ANSWERED.
+        // The tick compares the live reply against it, so a changed target is
+        // what re-arms the burst. Resetting the latch here would make the first
+        // post-apply reply look unchanged and the injection would never fire.
         xSemaphoreGive(s_mutex);
     }
     ESP_LOGI(TAG, "charge limit set AC %u%% DC %u%%", ac_percent, dc_percent);
@@ -239,6 +243,7 @@ void car_settings_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
     if (rx_bus != CAR_BUS) {
         return;
     }
+    uint8_t adopted_ac = 0, adopted_dc = 0;
     if (xSemaphoreTake(s_mutex, portMAX_DELAY)) {
         if (to_push->identifier == CHARGE_LIMIT_FRAME_ID) {
             if (to_push->data_length_code >= 6U) {
@@ -264,9 +269,30 @@ void car_settings_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
                 s_dc = charge_limit_raw_to_percent(to_push->data[3]);
                 s_reply_seen_us = esp_timer_get_time();
                 s_reply_seen_valid = true;
+                // One-shot: the first valid reply after the startup probe burst
+                // is adopted as the configured target, matching what the car
+                // already has rather than fighting it. Cleared so later ~200 ms
+                // periodic replies never re-adopt.
+                if (s_probe_await_reply) {
+                    s_probe_await_reply = false;
+                    s_ac_limit = s_ac;
+                    s_dc_limit = s_dc;
+                    s_conflict_ac = s_ac;
+                    s_conflict_dc = s_dc;
+                    s_conflict_target_ac = s_ac_limit;
+                    s_conflict_target_dc = s_dc_limit;
+                    adopted_ac = s_ac;
+                    adopted_dc = s_dc;
+                }
             }
         }
         xSemaphoreGive(s_mutex);
+    }
+    // Persisted-config RAM strings (no save_cfg: lock-free writes like
+    // charge_limit_set() does after releasing the mutex; a reboot re-adopts).
+    if (adopted_ac != 0 || adopted_dc != 0) {
+        config_server_set_charge_ac_limit(adopted_ac);
+        config_server_set_charge_dc_limit(adopted_dc);
     }
 }
 
@@ -366,6 +392,9 @@ void car_settings_tick(void) {
         if (s_burst_remaining == 0 && s_passive_remaining == 0 && !s_gap_tick) {
             s_probe_pending = false;
             s_passive_remaining = CAR_SETTINGS_BURST_COUNT;
+            // Arm adoption: the first valid 0x1F9 reply after this burst seeds
+            // the configured limit (see car_settings_can_rx_hook).
+            s_probe_await_reply = true;
         }
         xSemaphoreGive(s_mutex);
     }
