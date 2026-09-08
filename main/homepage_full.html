@@ -559,7 +559,16 @@
                 </tr>
                 <tr>
                     <td>HV Battery Temperature:</td>
-                    <td><div id="battery_temp_status">Waiting for CAN data</div></td>
+                    <td>
+                        <div style="display: flex; align-items: center; gap: 0.5rem;">
+                            <div id="battery_temp_status">Waiting for CAN data</div>
+                            <select id="battery_temp_unit" name="battery_temp_unit" onchange="postConfig();"
+                                style="width: auto; padding: 0.25rem 0.5rem; font-size: 0.85rem;">
+                                <option value="c">°C</option>
+                                <option value="f">°F</option>
+                            </select>
+                        </div>
+                    </td>
                 </tr>
                 <tr>
                     <td>Preconditioning Requested:</td>
@@ -1398,15 +1407,6 @@
                         <select id="can_fwd_mode" name="can_fwd_mode" onchange="submit_enable();">
                             <option value="mitm">MITM (forward between buses)</option>
                             <option value="parallel">Parallel (no forwarding)</option>
-                        </select>
-                    </td>
-                </tr>
-                <tr>
-                    <td>Battery Temperature Units:</td>
-                    <td>
-                        <select id="battery_temp_unit" name="battery_temp_unit" onchange="submit_enable();">
-                            <option value="c">Celsius (°C)</option>
-                            <option value="f">Fahrenheit (°F)</option>
                         </select>
                     </td>
                 </tr>
