@@ -191,6 +191,22 @@ static bool activation_is_release(const message_payload_t *msg, const twai_messa
 
 #define IS_BATTERY_SOC_FRAME(frame_id) ((frame_id) == BATTERY_SOC_FRAME_ID)
 
+// Battery conditioning mode is a latched vehicle setting. The car broadcasts
+// it on 0x25D D6 bit 7, so the check needs no probe: 0x80 = enabled,
+// 0x40 = disabled
+#define CONDITIONING_MODE_FRAME_ID 0x25DU
+#define CONDITIONING_MODE_INDEX 5U
+#define CONDITIONING_MODE_DATA_LENGTH 6U
+#define CONDITIONING_MODE_ENABLED_MASK 0x80U
+
+// Enabling the mode is a 0x0C7 command pair, the same shape and cadence as the
+// preconditioning start burst.
+#define CONDITIONING_MODE_PHASE1_TICKS 3U // F007 message
+#define CONDITIONING_MODE_PHASE2_TICKS 3U // E007 message
+#define CONDITIONING_MODE_TICKS (CONDITIONING_MODE_PHASE1_TICKS + CONDITIONING_MODE_PHASE2_TICKS)
+
+#define IS_CONDITIONING_MODE_FRAME(frame_id) ((frame_id) == CONDITIONING_MODE_FRAME_ID)
+
 #define CAR_BUS CAN_BUS_0
 #define HEAD_UNIT_BUS CAN_BUS_1
 
@@ -211,7 +227,7 @@ static int64_t ts_elapsed(int64_t now, int64_t old) {
 // IDLE                       Preconditioning is not requested.
 // REQUESTED                  Owns an enabled session and prevents the car from cancelling it.
 // +- CAR_START_DELAY         Waits briefly after READY before a persistent-mode relaunch.
-// +- START_BURST (initial)   Sends the start command sequence.
+// +- START_BURST (initial)   Sends the start command sequence
 // +- WAIT_STARTING           Waits for the car to begin starting.
 // +- WAIT_STARTED            Waits for preconditioning to become fully active.
 // +- ACTIVE                  Monitors active preconditioning in every mode.
@@ -252,6 +268,13 @@ typedef enum {
     PRECON_STATUS_STARTING,
     PRECON_STATUS_STARTED,
 } precon_status_t;
+
+// Battery conditioning mode as most recently reported by the car on 0x25D.
+typedef enum {
+    CONDITIONING_MODE_UNKNOWN = 0, // no 0x25D seen yet
+    CONDITIONING_MODE_DISABLED,
+    CONDITIONING_MODE_ENABLED,
+} conditioning_mode_t;
 
 // why the current start attempt was launched. MANUAL must be zero: it is the
 // entry argument plain sm_transition supplies
@@ -300,6 +323,10 @@ static struct {
     int64_t last_attempt_ts;
     // number of times we've re-sent the start burst within the current request
     uint8_t retries;
+    // does this attempt have to turn battery conditioning mode on before the
+    // start command? latched on entry to START_BURST so the car's own reply to
+    // the enable burst cannot cut that burst short
+    bool conditioning_mode_first;
 } requested;
 
 // owned by MANAGED: scheduling for periodic start bursts while a repeating
@@ -326,10 +353,20 @@ static struct {
     // is the car in READY? tracked from 0x038 edges; stays false on platforms
     // where that frame is unavailable
     bool car_in_ready;
+    // most recent battery conditioning mode reported by the car
+    conditioning_mode_t conditioning_mode;
 } platform;
 
 static bool precon_status_available(void) {
     return platform.precon_status != PRECON_STATUS_UNKNOWN;
+}
+
+// Does a start attempt have to turn battery conditioning mode on first? Only a
+// confirmed "enabled" reading skips the enable burst: with no 0x25D yet (or a
+// platform that never broadcasts one) it is sent anyway, since the command is
+// idempotent and preconditioning depends on the mode being on.
+static bool conditioning_mode_enable_needed(void) {
+    return platform.conditioning_mode != CONDITIONING_MODE_ENABLED;
 }
 
 // activation button edge tracking, owned by the global hooks
@@ -577,6 +614,22 @@ static void show_stopping_notice(stop_reason_t reason) {
 }
 
 // ********************* CAN tx helpers *********************
+
+// burst_tick counts up from 0 within the burst
+static void send_conditioning_mode_enable_msg(uint32_t burst_tick) {
+    twai_message_t packet = {0};
+    packet.identifier = 0x0C7U;
+    packet.data_length_code = 8U;
+    if (burst_tick < CONDITIONING_MODE_PHASE1_TICKS) {
+        // send 000000F007000000 to 0x0C7
+        packet.data[3] = 0xF0U;
+    } else {
+        // send 000000E007000000 to 0x0C7
+        packet.data[3] = 0xE0U;
+    }
+    packet.data[4] = 0x07U;
+    can_send(CAR_BUS, &packet, 1);
+}
 
 // burst_tick counts up from 0 within the burst
 static void send_precondition_start_msg(uint32_t burst_tick) {
@@ -851,6 +904,10 @@ static bool abort_start_if_blocked(sm_t *sm) {
 // retry timers and the countdown display measure from the moment the burst began
 static void start_burst_enter(sm_t *sm) {
     requested.last_attempt_ts = sm_now(sm);
+    // Latch the conditioning-mode check for the whole burst: the car's reply to
+    // our own enable command flips 0x25D within one frame period, and that must
+    // not truncate the burst still in flight.
+    requested.conditioning_mode_first = conditioning_mode_enable_needed();
     abort_start_if_blocked(sm);
 }
 
@@ -859,6 +916,16 @@ static void start_burst_tick(sm_t *sm) {
         return;
     }
     uint32_t t = sm_ticks_in_state(sm);
+    // turn the car's battery conditioning mode on before asking it to start
+    // preconditioning; the enable burst keeps the check's pace, one frame per
+    // tick
+    if (requested.conditioning_mode_first) {
+        if (t < CONDITIONING_MODE_TICKS) {
+            send_conditioning_mode_enable_msg(t);
+            return;
+        }
+        t -= CONDITIONING_MODE_TICKS;
+    }
     send_precondition_start_msg(t);
     // Status events deliberately do not cut the burst short. After all start
     // messages are sent, route using the car's latest reported status.
@@ -1289,6 +1356,17 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
         if (became_low) {
             sm_send_event(sm, EV_SOC_BECAME_LOW);
         }
+    }
+
+    // 0x25D D6 bit 7: the car's latched battery conditioning mode. The frame is
+    // broadcast, so the check needs no probe; only the car's own copy is
+    // trusted.
+    if (IS_CONDITIONING_MODE_FRAME(to_push->identifier)
+            && rx_bus == CAR_BUS
+            && to_push->data_length_code >= CONDITIONING_MODE_DATA_LENGTH) {
+        platform.conditioning_mode =
+            (to_push->data[CONDITIONING_MODE_INDEX] & CONDITIONING_MODE_ENABLED_MASK) != 0U
+            ? CONDITIONING_MODE_ENABLED : CONDITIONING_MODE_DISABLED;
     }
 
     int8_t precon_button_type = precon_config.button_type;

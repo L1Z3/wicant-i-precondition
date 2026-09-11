@@ -112,12 +112,16 @@ static void expect_state(const char *name) {
               "expected state %s, got %s", name, precon_sm.current->name);
 }
 
-static void rx_frame(uint32_t id, const uint8_t d[8], can_bus_t bus) {
+static void rx_frame_len(uint32_t id, const uint8_t *d, uint8_t len, can_bus_t bus) {
     twai_message_t f = {0};
     f.identifier = id;
-    f.data_length_code = 8;
+    f.data_length_code = len;
     memcpy(f.data, d, 8);
     precondition_can_rx_hook(&f, bus);
+}
+
+static void rx_frame(uint32_t id, const uint8_t d[8], can_bus_t bus) {
+    rx_frame_len(id, d, 8, bus);
 }
 
 static void press(void)   { uint8_t d[8] = {0}; d[5] = 0x10; rx_frame(0x448, d, CAN_BUS_0); }
@@ -133,6 +137,13 @@ static void battery_soc(uint8_t raw) {
     uint8_t d[8] = {[7] = raw};
     rx_frame(0x2FC, d, CAN_BUS_0);
 }
+// the car's latched battery conditioning mode, as its 200 ms 0x25D broadcast
+// reports it (0x80 = enabled, 0x40 = disabled)
+static void conditioning_mode_d6(uint8_t d6, can_bus_t bus) {
+    uint8_t d[8] = {[5] = d6};
+    rx_frame(0x25D, d, bus);
+}
+static void conditioning_mode(uint8_t d6) { conditioning_mode_d6(d6, CAN_BUS_0); }
 
 // Model the two firmware workers in deterministic order: the timing task runs
 // the state machine, then the lower-priority persistence task gets CPU time.
@@ -180,6 +191,25 @@ static void check_start_burst_msgs(int base) {
             expected[3] = 0xE0;
             expected[4] = 0x07;
         }
+        CHECK(sent[base + i].bus == CAR_BUS);
+        CHECK(sent[base + i].msg.identifier == 0x0C7);
+        CHECK(sent[base + i].msg.data_length_code == 8);
+        CHECK(memcmp(sent[base + i].msg.data, expected, sizeof(expected)) == 0);
+    }
+}
+
+static void check_conditioning_mode_burst_msgs(int base) {
+    bool recorded = base >= 0
+                    && base + (int)CONDITIONING_MODE_TICKS <= sent_count
+                    && base + (int)CONDITIONING_MODE_TICKS <= (int)(sizeof(sent) / sizeof(sent[0]));
+    CHECK(recorded);
+    if (!recorded) {
+        return;
+    }
+    for (int i = 0; i < (int)CONDITIONING_MODE_TICKS; i++) {
+        uint8_t expected[8] = {0};
+        expected[3] = (i < (int)CONDITIONING_MODE_PHASE1_TICKS) ? 0xF0 : 0xE0;
+        expected[4] = 0x07;
         CHECK(sent[base + i].bus == CAR_BUS);
         CHECK(sent[base + i].msg.identifier == 0x0C7);
         CHECK(sent[base + i].msg.data_length_code == 8);
@@ -601,6 +631,86 @@ static void run_battery_soc(void) {
     expect_state("idle");
     CHECK(sent_count == base + 6);
     CHECK(popup_show_count == 3);
+}
+
+static void run_conditioning_mode_check(void) {
+    precondition_init();
+    platform.conditioning_mode = CONDITIONING_MODE_UNKNOWN;  // no 0x25D yet
+    expect_state("idle");
+
+    // Neither the head unit's copy nor a truncated frame is the car's report.
+    conditioning_mode_d6(0x80, CAN_BUS_1);
+    CHECK(platform.conditioning_mode == CONDITIONING_MODE_UNKNOWN);
+    uint8_t short_frame[8] = {0};
+    short_frame[5] = 0x80;
+    rx_frame_len(0x25D, short_frame, CONDITIONING_MODE_DATA_LENGTH - 1, CAN_BUS_0);
+    CHECK(platform.conditioning_mode == CONDITIONING_MODE_UNKNOWN);
+
+    // Unknown means "not confirmed enabled": the enable burst goes out first
+    // anyway, then the normal start burst.
+    sent_count = 0;
+    toggle();
+    expect_state("start-burst");
+    for (int i = 0; i < (int)CONDITIONING_MODE_TICKS; i++) tick1();
+    CHECK(sent_count == (int)CONDITIONING_MODE_TICKS);
+    check_conditioning_mode_burst_msgs(0);
+    for (int i = 0; i < (int)PRECONDITION_START_TICKS; i++) tick1();
+    CHECK(sent_count == (int)(CONDITIONING_MODE_TICKS + PRECONDITION_START_TICKS));
+    check_start_burst_msgs((int)CONDITIONING_MODE_TICKS);
+    expect_state("wait-starting");
+
+    // A disabled report gets the same treatment. The car's own reply lands
+    // mid-burst and must not truncate it.
+    fake_now += 2000000;                        // clear the start/stop debounce
+    toggle();
+    for (int i = 0; i < (int)PRECONDITION_STOP_TICKS; i++) tick1();
+    expect_state("idle");                       // no status frames: no stop retries
+    conditioning_mode(0x40);
+    CHECK(platform.conditioning_mode == CONDITIONING_MODE_DISABLED);
+    sent_count = 0;
+    toggle();
+    expect_state("start-burst");
+    for (int i = 0; i < (int)CONDITIONING_MODE_PHASE1_TICKS; i++) tick1();
+    CHECK(sent_count == (int)CONDITIONING_MODE_PHASE1_TICKS);
+    conditioning_mode(0x80);                    // car confirms the enable mid-burst
+    CHECK(platform.conditioning_mode == CONDITIONING_MODE_ENABLED);
+    for (int i = 0; i < (int)CONDITIONING_MODE_PHASE2_TICKS; i++) tick1();
+    CHECK(sent_count == (int)CONDITIONING_MODE_TICKS);
+    check_conditioning_mode_burst_msgs(0);
+    for (int i = 0; i < (int)PRECONDITION_START_TICKS; i++) tick1();
+    CHECK(sent_count == (int)(CONDITIONING_MODE_TICKS + PRECONDITION_START_TICKS));
+    check_start_burst_msgs((int)CONDITIONING_MODE_TICKS);
+    expect_state("wait-starting");
+
+    // An enabled report needs no enable burst, and the 10 s start retry
+    // re-checks the mode: the retry burst is bare.
+    car_status(0x01, CAN_BUS_0);                // status frames arm the retry path
+    sent_count = 0;
+    advance_until_state("start-burst", 11000000);
+    CHECK(requested.retries == 1);
+    for (int i = 0; i < (int)PRECONDITION_START_TICKS; i++) tick1();
+    CHECK(sent_count == (int)PRECONDITION_START_TICKS);
+    check_start_burst_msgs(0);
+    expect_state("wait-starting");
+
+    // A blocked attempt never turns the mode on: no frames at all.
+    car_power(true);
+    car_power(false);
+    expect_state("idle");
+    battery_soc(39);
+    conditioning_mode(0x40);
+    CHECK(precon_blockers == PRECONDITION_BLOCK_BATTERY_LOW_SOC);
+    sent_count = 0;
+    toggle();
+    expect_state("stop-burst");
+    CHECK(stopping.reason == STOP_REASON_START_BLOCKED);
+    CHECK(sent_count == 0);
+    for (int i = 0; i < (int)PRECONDITION_STOP_TICKS; i++) tick1();
+    CHECK(sent_count == (int)PRECONDITION_STOP_TICKS);
+    check_stop_burst_msgs(0);
+    expect_state("wait-stopped");
+    car_status(0x01, CAN_BUS_0);
+    expect_state("idle");
 }
 
 static void run_automatic_temperature_cutoff(void) {
@@ -1450,6 +1560,7 @@ static const suite_t suites[] = {
     {"precondition long-press once", ONCE, PRESS_LONG, run_long_press},
     {"precondition battery temperature cutoff", ONCE, PRESS_SHORT, run_battery_temperature_cutoff},
     {"precondition battery state of charge", ONCE, PRESS_SHORT, run_battery_soc},
+    {"precondition conditioning mode check", ONCE, PRESS_SHORT, run_conditioning_mode_check},
     {"precondition automatic temperature cutoff", CONTINUOUS, PRESS_SHORT, run_automatic_temperature_cutoff},
     {"precondition persistent temperature cutoff", PERSISTENT, PRESS_SHORT, run_automatic_temperature_cutoff},
     {"precondition continuous cool wait", CONTINUOUS, PRESS_SHORT, run_managed_cool_wait},
@@ -1477,6 +1588,11 @@ static const suite_t suites[] = {
 static int run_suite(const suite_t *s) {
     cfg_mode = s->mode;
     cfg_press = s->press;
+    // Steady-state model: the car broadcasts 0x25D every 200 ms, so by the time
+    // a button is pressed the battery conditioning mode is always known. Default
+    // to "enabled" so the other suites exercise the plain start burst; the
+    // conditioning-mode suite seeds its own reading instead.
+    platform.conditioning_mode = CONDITIONING_MODE_ENABLED;
     s->fn();
     return test_report(s->name);
 }
