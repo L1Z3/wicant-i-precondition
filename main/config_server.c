@@ -1011,8 +1011,8 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	cJSON_AddStringToObject(root, "git_version", GIT_SHA);
 	cJSON_AddStringToObject(root, "protocol", device_config.protocol);
 
-	cJSON_AddBoolToObject(root, "hw_has_pwr2", (bool)HW_HAS_PWR2);
-	cJSON_AddNumberToObject(root, "car_on_voltage", CAR_ON_VOLTAGE);
+	cJSON_AddBoolToObject(root, "has_car_on_sense", (bool)HW_HAS_CAR_ON_SENSE);
+	cJSON_AddNumberToObject(root, "car_on_threshold_v", CAR_ON_THRESHOLD_V);
 	cJSON_AddStringToObject(root, "sleep_status", device_config.sleep_status);
 	cJSON_AddStringToObject(root, "sleep_volt", device_config.sleep_volt);
 	cJSON_AddStringToObject(root, "sleep_time", device_config.sleep_time);
@@ -1082,18 +1082,18 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	}
 
 	{
-		char on_volt[12] = {0};
-		float on_voltage = 0;
-		if (sleep_mode_get_on_voltage(&on_voltage) == 1)
-			snprintf(on_volt, sizeof(on_volt), "%.1fV", on_voltage);
+		char car_on_sense_voltage_str[12] = {0};
+		float car_on_sense_voltage = 0;
+		if (sleep_mode_get_car_on_sense_voltage(&car_on_sense_voltage) == 1)
+			snprintf(car_on_sense_voltage_str, sizeof(car_on_sense_voltage_str), "%.1fV", car_on_sense_voltage);
 		else
-			strlcpy(on_volt, "N/A", sizeof(on_volt));
-		cJSON_AddStringToObject(root, "on_voltage", on_volt);
+			strlcpy(car_on_sense_voltage_str, "N/A", sizeof(car_on_sense_voltage_str));
+		cJSON_AddStringToObject(root, "car_on_sense_voltage", car_on_sense_voltage_str);
 	}
 
 	// CAN-derived READY state (0x038 power status); shown by the web UI in
 	// place of the car-on voltage on boards without the car-on sense pin.
-	cJSON_AddStringToObject(root, "car_power", car_in_ready() ? "Ready" : "Not Ready");
+	cJSON_AddStringToObject(root, "can_ready_state", car_in_ready() ? "Ready" : "Not Ready");
 
 	char uptime_str[32];
 	dev_status_format_uptime(uptime_str, sizeof(uptime_str));
@@ -2736,12 +2736,12 @@ int8_t config_server_get_sleep_volt(float *sleep_volt)
 		return -1;
 	}
 
-	// The UI slider only produces 12-15V. CAR_ON_VOLTAGE (5V) is also accepted
+	// The UI slider only produces 12-15V. CAR_ON_THRESHOLD_V (5V) is also accepted
 	// on boards with the car-on sense pin: car-off sleep there persists the
 	// fixed 5V threshold (the slider is ignored and disabled in that mode). On
 	// boards without the pin the 12V battery never reads near 5V, so a 5V
 	// value would silently disable sleep, and is rejected.
-	if((*sleep_volt >= 12.0f && *sleep_volt <= 15.0f) || (HW_HAS_PWR2 && *sleep_volt == CAR_ON_VOLTAGE))
+	if((*sleep_volt >= 12.0f && *sleep_volt <= 15.0f) || (HW_HAS_CAR_ON_SENSE && *sleep_volt == CAR_ON_THRESHOLD_V))
 	{
 		return 1;
 	}

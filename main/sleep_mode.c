@@ -74,17 +74,17 @@
 #define PUB_SUCCESS_BIT     		BIT1
 
 static adc_channel_t voltage_adc_ch = VBAT_ADC_CHANNEL;
-#if HW_HAS_PWR2
-static adc_channel_t v_car_on_adc_ch = V_CAR_ON_ADC_CHANNEL;
+#if HW_HAS_CAR_ON_SENSE
+static adc_channel_t car_on_sense_adc_ch = V_CAR_ON_ADC_CHANNEL;
 #endif
 static EventGroupHandle_t s_mqtt_event_group = NULL;
 static float sleep_voltage = 13.1f;
 static uint8_t enable_sleep = 0;
 static QueueHandle_t voltage_queue = NULL;
-static QueueHandle_t on_voltage_queue = NULL;
+static QueueHandle_t car_on_sense_voltage_queue = NULL;
 adc_oneshot_unit_handle_t adc_handle;
 static adc_cali_handle_t adc1_cali_chan0_handle = NULL;
-#if HW_HAS_PWR2
+#if HW_HAS_CAR_ON_SENSE
 static adc_cali_handle_t adc1_cali_chan1_handle = NULL;
 #endif
 
@@ -95,10 +95,10 @@ static adc_cali_handle_t adc1_cali_chan1_handle = NULL;
 // gate only applies in car-off sleep mode; low-voltage sleep keeps its
 // original voltage-only behavior.
 static bool car_off_gate_ok(void) {
-#if HW_HAS_PWR2
+#if HW_HAS_CAR_ON_SENSE
     // The car-on pin already distinguishes car-on from car-off (12V vs 0V),
     // so there is nothing extra to gate on: the voltage comparison alone
-    // decides. This is why CAR_ON_VOLTAGE is a fixed 5V threshold.
+    // decides. This is why CAR_ON_THRESHOLD_V is a fixed 5V threshold.
     return true;
 #else
     // No car-on pin: require the car to be confirmed not-ready (the negation
@@ -269,12 +269,12 @@ void oneshot_adc_init(void)
 
     calibration_init(&adc1_cali_chan0_handle, voltage_adc_ch);
 
-#if HW_HAS_PWR2
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, v_car_on_adc_ch, &config));
+#if HW_HAS_CAR_ON_SENSE
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, car_on_sense_adc_ch, &config));
 
-    ESP_LOGI(TAG, "ADC channel: %d, Attenuation: %d", v_car_on_adc_ch, ADC_ATTEN);
+    ESP_LOGI(TAG, "ADC channel: %d, Attenuation: %d", car_on_sense_adc_ch, ADC_ATTEN);
 
-    calibration_init(&adc1_cali_chan1_handle, v_car_on_adc_ch);
+    calibration_init(&adc1_cali_chan1_handle, car_on_sense_adc_ch);
 #endif
 }
 
@@ -292,8 +292,8 @@ esp_err_t read_ss_adc_voltage(float *voltage_out, adc_channel_t adc_ch)
     int sum_voltage = 0;
 
     adc_cali_handle_t cali_handle = adc1_cali_chan0_handle;
-#if HW_HAS_PWR2
-    if (adc_ch == v_car_on_adc_ch)
+#if HW_HAS_CAR_ON_SENSE
+    if (adc_ch == car_on_sense_adc_ch)
     {
         cali_handle = adc1_cali_chan1_handle;
     }
@@ -392,8 +392,8 @@ static void adc_task(void *pvParameters)
     while(1)
     {
 		float battery_voltage;
-#if HW_HAS_PWR2
-        float on_voltage;
+#if HW_HAS_CAR_ON_SENSE
+        float car_on_sense_voltage;
 #endif
         float sleep_test_voltage;
 
@@ -405,15 +405,15 @@ static void adc_task(void *pvParameters)
 			continue;
 		}
     	
-#if HW_HAS_PWR2
-    	ret = read_ss_adc_voltage(&on_voltage, v_car_on_adc_ch);
+#if HW_HAS_CAR_ON_SENSE
+		ret = read_ss_adc_voltage(&car_on_sense_voltage, car_on_sense_adc_ch);
 		if(ret != ESP_OK)
 		{
 			ESP_LOGE(TAG, "read_ss_adc_voltage error");
 			vTaskDelay(pdMS_TO_TICKS(1000));
 			continue;
 		}
-    	xQueueOverwrite( on_voltage_queue, &on_voltage );
+		xQueueOverwrite( car_on_sense_voltage_queue, &car_on_sense_voltage );
 #endif
     	
     	battery_voltage += VBAT_READ_OFFSET_V;
@@ -424,9 +424,9 @@ static void adc_task(void *pvParameters)
             sleep_test_voltage = battery_voltage;
         } else if(enable_sleep == 2) {
             // in this case, use the hot-when-on voltage
-            // it will be compared against CAR_ON_VOLTAGE
-#if HW_HAS_PWR2
-            sleep_test_voltage = on_voltage;
+            // it will be compared against CAR_ON_THRESHOLD_V
+#if HW_HAS_CAR_ON_SENSE
+            sleep_test_voltage = car_on_sense_voltage;
 #else
             // fallback: no car-on sense pin, so compare the battery voltage
             // against the setpoint, gated by the car-not-ready signal below
@@ -580,11 +580,11 @@ int8_t sleep_mode_get_voltage(float *val)
 	return -1;
 }
 
-int8_t sleep_mode_get_on_voltage(float *val)
+int8_t sleep_mode_get_car_on_sense_voltage(float *val)
 {
-	if(on_voltage_queue != NULL)
+	if(car_on_sense_voltage_queue != NULL)
 	{
-		if(xQueuePeek( on_voltage_queue, val, 0 ))
+		if(xQueuePeek( car_on_sense_voltage_queue, val, 0 ))
 		{
 			return 1;
 		}
@@ -596,14 +596,14 @@ int8_t sleep_mode_get_on_voltage(float *val)
 int8_t sleep_mode_init(uint8_t enable, float sleep_volt)
 {
 	enable_sleep = enable;
-#if HW_HAS_PWR2
+#if HW_HAS_CAR_ON_SENSE
 	// Car-off sleep reads the hot-when-on pin (VBAT when on, 0 when off),
-	// so it must use the fixed CAR_ON_VOLTAGE threshold, not the
+	// so it must use the fixed CAR_ON_THRESHOLD_V threshold, not the
 	// configurable battery low-voltage cutoff.
-	sleep_voltage = (enable == 2) ? CAR_ON_VOLTAGE : sleep_volt;
+	sleep_voltage = (enable == 2) ? CAR_ON_THRESHOLD_V : sleep_volt;
 #else
 	// No car-on pin: car-off sleep compares the 12V battery against this same
-	// setpoint (CAR_ON_VOLTAGE is meant for the 0V/12V sense pin and would
+	// setpoint (CAR_ON_THRESHOLD_V is meant for the 0V/12V sense pin and would
 	// never trip on battery voltage), gated by car_off_gate_ok. The setpoint
 	// also becomes the wake threshold: while asleep the CAN buses are disabled
 	// so car_in_ready() can't update, leaving battery voltage as the only wake
@@ -614,7 +614,7 @@ int8_t sleep_mode_init(uint8_t enable, float sleep_volt)
 	ESP_LOGW(TAG, "sleep_volt: %2.2f", sleep_voltage);
 	s_mqtt_event_group = xEventGroupCreate();
 	voltage_queue = xQueueCreate(1, sizeof( float) );
-	on_voltage_queue = xQueueCreate(1, sizeof( float) );
+	car_on_sense_voltage_queue = xQueueCreate(1, sizeof( float) );
 	xTaskCreate(adc_task, "adc_task", 4096, (void*)AF_INET, 5, NULL);
 
 	return 1;
