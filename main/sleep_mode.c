@@ -88,28 +88,6 @@ static adc_cali_handle_t adc1_cali_chan0_handle = NULL;
 static adc_cali_handle_t adc1_cali_chan1_handle = NULL;
 #endif
 
-// Car-off sleep reads the car-on sense pin (V_CAR_ON) when the hardware has
-// it. Without that pin there's no electrical way to tell "car off" from "flat
-// battery", so the fallback gates sleep on the CAN-derived car-not-ready state
-// (0x038 power status) instead: only sleep once the car is confirmed off. The
-// gate only applies in car-off sleep mode; low-voltage sleep keeps its
-// original voltage-only behavior.
-static bool car_off_gate_ok(void) {
-#if HW_HAS_CAR_ON_SENSE
-    // The car-on pin already distinguishes car-on from car-off (12V vs 0V),
-    // so there is nothing extra to gate on: the voltage comparison alone
-    // decides. This is why CAR_ON_THRESHOLD_V is a fixed 5V threshold.
-    return true;
-#else
-    // No car-on pin: require the car to be confirmed not-ready (the negation
-    // of EV_CAR_NOT_READY) before sleeping. car_in_ready() is tracked in
-    // precondition.c from 0x038 power-status edges and stays false until a
-    // 0x038 frame has been seen. Once asleep the CAN buses are disabled, so
-    // this value can no longer change; see sleep_mode_init for the wake path.
-    return (enable_sleep != 2) || !car_in_ready();  // EV_CAR_NOT_READY
-#endif
-}
-
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     ESP_LOGD(TAG, "Event dispatched from event loop base=%s, event_id=%ld", base, event_id);
@@ -395,7 +373,11 @@ static void adc_task(void *pvParameters)
 #if HW_HAS_CAR_ON_SENSE
         float car_on_sense_voltage;
 #endif
-        float sleep_test_voltage;
+        // Should the sleep detector start counting down, and is it time to come
+        // back up? Both are false exactly at a threshold, which leaves the
+        // current state alone (the pre-existing behaviour).
+        bool sleep_wanted = false;
+        bool awake_wanted = false;
 
     	ret = read_ss_adc_voltage(&battery_voltage, voltage_adc_ch);
 		if(ret != ESP_OK)
@@ -419,19 +401,43 @@ static void adc_task(void *pvParameters)
     	battery_voltage += VBAT_READ_OFFSET_V;
 
     	xQueueOverwrite( voltage_queue, &battery_voltage );
-        if(enable_sleep == 1) {
-            // in this case, use the actual battery voltage
-            sleep_test_voltage = battery_voltage;
-        } else if(enable_sleep == 2) {
-            // in this case, use the hot-when-on voltage
-            // it will be compared against CAR_ON_THRESHOLD_V
+
+        // Car-off sleep (mode 2) uses the same setpoint as low-voltage sleep,
+        // but a car that looks "on" inhibits sleeping and forces a wake. The
+        // car looks on if either the hot-when-on sense pin is above the fixed
+        // CAR_ON_THRESHOLD_V (pin-equipped boards only), or the CAN-derived
+        // READY state (0x038 power status) is set.
+        //
+        // NOTE: neither signal is guaranteed to be reachable today, so this
+        // condition may never fire on some setups. Without the sense pin the
+        // first term is constant false; car_in_ready() stays false until a
+        // 0x038 frame is seen, which the bus may never carry; and once asleep
+        // the CAN buses are disabled, so car_in_ready() can no longer change
+        // and the wake path falls back to the battery voltage crossing the
+        // setpoint. Keep the condition anyway: it is the correct one wherever
+        // those signals do exist.
+        //
+        // The two signals are not completely equivalent. The car-on sense pin
+        // uses MODULE5 voltage, which is `HOT IN ON OR START`, so lower power 
+        // states than READY are accepted, whereas car_in_ready() only looks 
+        // for ready. This distinction probably isn't that important but could 
+        // be fixed later.
 #if HW_HAS_CAR_ON_SENSE
-            sleep_test_voltage = car_on_sense_voltage;
+        bool car_awake = (car_on_sense_voltage > CAR_ON_THRESHOLD_V)
+                || car_in_ready();
 #else
-            // fallback: no car-on sense pin, so compare the battery voltage
-            // against the setpoint, gated by the car-not-ready signal below
-            sleep_test_voltage = battery_voltage;
+        bool car_awake = car_in_ready();
 #endif
+
+        if(enable_sleep == 1) {
+            // Low-voltage sleep: the battery alone, against the setpoint.
+            sleep_wanted = battery_voltage < sleep_voltage;
+            awake_wanted = battery_voltage > sleep_voltage;
+        } else if(enable_sleep == 2) {
+            // Car-off sleep: same setpoint, but never sleep while the car
+            // looks on, and wake up as soon as it does.
+            sleep_wanted = (battery_voltage < sleep_voltage) && !car_awake;
+            awake_wanted = (battery_voltage > sleep_voltage) || car_awake;
         }
     	if(enable_sleep == 1 || enable_sleep == 2)
     	{
@@ -439,9 +445,13 @@ static void adc_task(void *pvParameters)
 			{
 				case RUN_STATE:
 				{
-					if(sleep_test_voltage < sleep_voltage && car_off_gate_ok())
+					if(sleep_wanted)
 					{
-						ESP_LOGI(TAG, "low voltage: %f", sleep_test_voltage);
+#if HW_HAS_CAR_ON_SENSE
+						ESP_LOGI(TAG, "sleep condition met: vbatt=%.2f car_on_sense=%.2f", battery_voltage, car_on_sense_voltage);
+#else
+						ESP_LOGI(TAG, "sleep condition met: vbatt=%.2f", battery_voltage);
+#endif
 						sleep_detect_time = esp_timer_get_time();
 						sleep_state++;
 					}
@@ -449,9 +459,9 @@ static void adc_task(void *pvParameters)
 				}
 				case SLEEP_DETECTED:
 				{
-					if(sleep_test_voltage > sleep_voltage || !car_off_gate_ok())
+					if(awake_wanted)
 					{
-						ESP_LOGI(TAG, "high voltage: %f", sleep_test_voltage);
+						ESP_LOGI(TAG, "sleep condition cleared: vbatt=%.2f", battery_voltage);
 						sleep_state = RUN_STATE;
 					}
 					else if((esp_timer_get_time() - sleep_detect_time) > sleep_time)
@@ -464,18 +474,18 @@ static void adc_task(void *pvParameters)
 				case SLEEP_STATE:
 				{
 					ESP_LOGI(TAG, "Go to sleep");
-					if(sleep_test_voltage > sleep_voltage || !car_off_gate_ok())
+					if(awake_wanted)
 					{
 						wakeup_detect_time = esp_timer_get_time();
-						ESP_LOGI(TAG, "wake up, voltage: %f", sleep_test_voltage);
+						ESP_LOGI(TAG, "wake up: vbatt=%.2f", battery_voltage);
 						sleep_state = WAKEUP_STATE;
 					}
 
 					if(config_server_get_battery_alert_config())
 					{
 						// Always alert on the actual battery voltage; in car-off
-						// mode sleep_test_voltage is the hot-when-on pin, which is
-						// 0V whenever the car is off and would false-alert.
+						// mode the hot-when-on pin sits at 0V whenever the car
+						// is off, which would false-alert.
 						if(battery_voltage < alert_voltage)
 						{
 							ESP_LOGW(TAG, "battery alert!");
@@ -522,7 +532,7 @@ static void adc_task(void *pvParameters)
 				}
 				case WAKEUP_STATE:
 				{
-					if(sleep_test_voltage > sleep_voltage || !car_off_gate_ok())
+					if(awake_wanted)
 					{
 						if((esp_timer_get_time() - wakeup_detect_time) > WAKEUP_TIME_DELAY)
 						{
@@ -533,8 +543,8 @@ static void adc_task(void *pvParameters)
 					}
 					else
 					{
-						// gate is ok here (failure is handled above); at or
-						// below the setpoint again, so go back to sleep
+						// back at or below the threshold before the delay
+						// elapsed, so go back to sleep
 						dev_status_clear_bits(DEV_AWAKE_BIT);
 						dev_status_set_bits(DEV_SLEEP_BIT);
 						sleep_state = SLEEP_STATE;
@@ -596,21 +606,15 @@ int8_t sleep_mode_get_car_on_sense_voltage(float *val)
 int8_t sleep_mode_init(uint8_t enable, float sleep_volt)
 {
 	enable_sleep = enable;
-#if HW_HAS_CAR_ON_SENSE
-	// Car-off sleep reads the hot-when-on pin (VBAT when on, 0 when off),
-	// so it must use the fixed CAR_ON_THRESHOLD_V threshold, not the
-	// configurable battery low-voltage cutoff.
-	sleep_voltage = (enable == 2) ? CAR_ON_THRESHOLD_V : sleep_volt;
-#else
-	// No car-on pin: car-off sleep compares the 12V battery against this same
-	// setpoint (CAR_ON_THRESHOLD_V is meant for the 0V/12V sense pin and would
-	// never trip on battery voltage), gated by car_off_gate_ok. The setpoint
-	// also becomes the wake threshold: while asleep the CAN buses are disabled
-	// so car_in_ready() can't update, leaving battery voltage as the only wake
-	// signal. A setpoint above the running-car charging voltage (~14V) would
-	// therefore keep the device asleep indefinitely.
+	// The configured setpoint is the battery sleep threshold in every mode.
+	// Car-off sleep additionally consults the fixed CAR_ON_THRESHOLD_V, but
+	// only to decide whether the car looks on (see adc_task); the threshold is
+	// never a setpoint. Note the setpoint is also the wake threshold: while
+	// asleep the CAN buses are disabled, so on boards without the sense pin
+	// battery voltage is the only wake signal, and a setpoint above the
+	// running car's charging voltage (~14V) would keep the device asleep
+	// indefinitely.
 	sleep_voltage = sleep_volt;
-#endif
 	ESP_LOGW(TAG, "sleep_volt: %2.2f", sleep_voltage);
 	s_mqtt_event_group = xEventGroupCreate();
 	voltage_queue = xQueueCreate(1, sizeof( float) );
