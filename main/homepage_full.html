@@ -1299,7 +1299,7 @@
             <div class="section-title">Firmware Update</div>
             <form id="ota_form" action="/upload/ota.bin" method="post" enctype="multipart/form-data">
                 <table class="form-table">
-                    <tr>
+                   <tr>
                         <td><input id="ota_file" name="ota_file" type="file" accept=".bin" /></td>
                         <td><input id="ota_submit_button" type="button" value="Update" onclick="otaClick()" class="system-button" /></td>
                     </tr>
@@ -1432,13 +1432,10 @@
             toggleSleepVoltageEnabled();
         });
 
-        // Client-side only: the sleep voltage slider sets the battery
-        // threshold for low-voltage sleep, and for car-off sleep on boards
-        // without the car-on sense pin (where car-off sleep falls back to the
-        // CAN car-not-ready signal + battery voltage vs the setpoint). Boards
-        // with the car-on pin ignore the slider in car-off mode and use the
-        // fixed car-on threshold; show that in the readout without clobbering
-        // the user's battery threshold.
+        // Client-side only: Enable the battery threshold slider when the
+        // selected mode uses it. For car-off sleep with a sense pin, display
+        // the fixed threshold while preserving the slider's battery cutoff
+        // for switching back later.
         function toggleSleepVoltageEnabled() {
             const sleepStatus = document.getElementById("sleep_status").value;
             const sleepVolt = document.getElementById("sleep_volt");
@@ -2636,6 +2633,8 @@ function loadAutoTable(jsonData) {
             // CAN READY state instead.
             has_car_on_sense = !!obj.has_car_on_sense;
             if(has_car_on_sense) {
+			    // The HTML's data-car-on-threshold-v="5.0" is an initial fallback.
+			    // Replace it with the threshold reported by the firmware.
 			    document.getElementById("sleep_volt").dataset.carOnThresholdV = obj.car_on_threshold_v;
                 document.getElementById("car_on_sense_voltage_row").style.display = "";
                 document.getElementById("car_on_sense_voltage").innerHTML = obj.car_on_sense_voltage;
