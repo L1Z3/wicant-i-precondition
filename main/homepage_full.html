@@ -2868,8 +2868,9 @@ function loadAutoTable(jsonData) {
 		var obj = {};
         await new Promise(resolve => setTimeout(resolve, 1000)); // Add 1 second delay
         
-        const storeResult = await storeAutoTableData();
-        if (!storeResult) {
+        // Do client-side validation before posting the config.
+        submit_enable();
+        if (document.getElementById("submit_button").disabled) {
             return;
         }
 		obj["wifi_mode"] = document.getElementById("wifi_mode").value;
@@ -2934,6 +2935,10 @@ function loadAutoTable(jsonData) {
         obj["precon_button"] = document.getElementById("precon_button").value;
         obj["precon_press"] = document.getElementById("precon_press").value;
 		var configJSON = JSON.stringify(obj);
+        const storeResult = await storeAutoTableData();
+        if (!storeResult) {
+            return;
+        }
 		const xhttp = new XMLHttpRequest();
 		xhttp.onload = function() {
             showNotification(this.responseText, "green");
