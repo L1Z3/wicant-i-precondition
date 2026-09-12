@@ -553,16 +553,18 @@
                         <div id="batt_voltage">12.8V&nbsp;</div>
                     </td>
                 </tr>
-                <tr id="car_on_voltage_row" style="display:none">
-                    <td>Car-On Voltage:</td>
+                <!-- Only shown on custom WiCAN -->
+                <tr id="car_on_sense_voltage_row" style="display:none">
+                    <td>Car-On Sense Voltage:</td>
                     <td>
-                        <div id="car_on_voltage">N/A&nbsp;</div>
+                        <div id="car_on_sense_voltage">N/A&nbsp;</div>
                     </td>
                 </tr>
-                <tr id="car_power_row" style="display:none">
-                    <td>Car Power:</td>
+                <!-- Only shown on V300 WiCAN -->
+                <tr id="can_ready_state_row" style="display:none">
+                    <td>Car Power Status (CAN):</td>
                     <td>
-                        <div id="car_power">Unknown&nbsp;</div>
+                        <div id="can_ready_state">Unknown&nbsp;</div>
                     </td>
                 </tr>
                 <tr>
@@ -1173,7 +1175,7 @@
                                value="13.2" 
                                min="12.0" 
                                max="15.0" 
-                               data-car-on-voltage="5.0"
+                               data-car-on-threshold-v="5.0"
                                step="0.1"
                                oninput="document.getElementById('sleep_volt_value').textContent = this.value;submit_enable();">
                         <span id="sleep_volt_value">13.2</span>V
@@ -1441,12 +1443,12 @@
             const sleepStatus = document.getElementById("sleep_status").value;
             const sleepVolt = document.getElementById("sleep_volt");
             const sliderApplies = (sleepStatus == 'enable')
-                || (sleepStatus == 'car_off' && !hw_has_pwr2);
+                || (sleepStatus == 'car_off' && !has_car_on_sense);
             sleepVolt.disabled = !sliderApplies;
             document.getElementById("sleep_time").disabled = (sleepStatus == 'disable');
 
-            if (sleepStatus == 'car_off' && hw_has_pwr2) {
-                document.getElementById("sleep_volt_value").textContent = sleepVolt.dataset.carOnVoltage;
+            if (sleepStatus == 'car_off' && has_car_on_sense) {
+                document.getElementById("sleep_volt_value").textContent = sleepVolt.dataset.carOnThresholdV;
             } else {
                 document.getElementById("sleep_volt_value").textContent = sleepVolt.value;
             }
@@ -1475,7 +1477,7 @@
 		let latest_car_models = null;
 		// does this board have the car-on sense pin? read from /check_status;
 		// car-off sleep shows the live car-on voltage only when it does
-		let hw_has_pwr2 = false;
+		let has_car_on_sense = false;
         function loadCarModels(data) {
             const carModelSelect = document.getElementById("car_model");
             if (data && Array.isArray(data.supported)) {
@@ -2630,16 +2632,16 @@ function loadAutoTable(jsonData) {
             // car-off sleep is available on every board. Boards with the
             // car-on sense pin detect car-off electrically and show the live
             // car-on voltage; the rest fall back to the CAN car-not-ready
-            // signal + battery voltage vs the setpoint, so show the CAN
-            // car-power state instead.
-            hw_has_pwr2 = !!obj.hw_has_pwr2;
-            if(hw_has_pwr2) {
-			    document.getElementById("sleep_volt").dataset.carOnVoltage = obj.car_on_voltage;
-                document.getElementById("car_on_voltage_row").style.display = "";
-                document.getElementById("car_on_voltage").innerHTML = obj.on_voltage;
+            // signal + battery voltage vs the setpoint, so show the
+            // CAN READY state instead.
+            has_car_on_sense = !!obj.has_car_on_sense;
+            if(has_car_on_sense) {
+			    document.getElementById("sleep_volt").dataset.carOnThresholdV = obj.car_on_threshold_v;
+                document.getElementById("car_on_sense_voltage_row").style.display = "";
+                document.getElementById("car_on_sense_voltage").innerHTML = obj.car_on_sense_voltage;
             } else {
-                document.getElementById("car_power").innerHTML = obj.car_power;
-                document.getElementById("car_power_row").style.display = "";
+                document.getElementById("can_ready_state").innerHTML = obj.can_ready_state;
+                document.getElementById("can_ready_state_row").style.display = "";
             }
             toggleSleepVoltageEnabled();
 			if(obj.port_type == "tcp") {
@@ -2934,12 +2936,12 @@ function loadAutoTable(jsonData) {
 		obj["ble_status"] = document.getElementById("ble_status").value;
 		obj["sleep_status"] = document.getElementById("sleep_status").value;
 		let sleepVolt = document.getElementById("sleep_volt").value;
-		if (document.getElementById("sleep_status").value == "car_off" && hw_has_pwr2) {
+		if (document.getElementById("sleep_status").value == "car_off" && has_car_on_sense) {
 			// Pin-equipped boards ignore the slider in car-off mode and use the
 			// fixed car-on threshold; persist that so /load_config agrees with
 			// the UI readout instead of a stale battery voltage. Sent as a
 			// string: the config server stores sleep_volt as a string.
-			sleepVolt = String(document.getElementById("sleep_volt").dataset.carOnVoltage);
+			sleepVolt = String(document.getElementById("sleep_volt").dataset.carOnThresholdV);
 		}
 		obj["sleep_volt"] = sleepVolt;
         obj["sleep_time"] = document.getElementById("sleep_time").value;
