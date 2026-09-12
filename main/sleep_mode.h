@@ -24,12 +24,12 @@
 
 int8_t sleep_mode_init(uint8_t enable, float sleep_volt);
 int8_t sleep_mode_get_voltage(float *val);
-int8_t sleep_mode_get_on_voltage(float *val);
+int8_t sleep_mode_get_car_on_sense_voltage(float *val);
 
+// PWR_12V_7 on/off threshold in harness volts, after ADC divider scaling.
+// Used by car-off sleep on boards with the car-on sense pin.
 // todo (trh): needs testing, but should be safe
 // a car with <5V on a 12V bus is dead or off
-// PWR_12V_7 voltage threshold for deciding if car is off/on
-// (only used when sleep_status = "car_off")
-#define CAR_ON_VOLTAGE    5.0f
+#define CAR_ON_THRESHOLD_V    5.0f
 
 #endif

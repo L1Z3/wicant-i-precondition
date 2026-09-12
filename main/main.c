@@ -724,7 +724,7 @@ void app_main(void)
     // same state machine in sleep_mode.c and differ only in the test voltage
     // and the car-off gating (car_off_gate_ok).
     uint8_t sleep_config = config_server_get_sleep_config();
-	if(sleep_config == 1 || sleep_config == 2)
+	if(sleep_config == 1 || sleep_config == 2) // "enable" or "car_off"
 	{
 		float sleep_voltage = 0;
 

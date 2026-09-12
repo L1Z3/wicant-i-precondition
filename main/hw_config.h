@@ -49,7 +49,7 @@
 
 // Indicates whether the hardware has a second voltage divider
 // to read a second (hot-when-car-on) power pin.
-#define HW_HAS_PWR2                 1
+#define HW_HAS_CAR_ON_SENSE          1
 // GPIO5 (ADC1 ch4) reads the voltage on harness "PWR_12V_7"
 // which is MODULE5 power, i.e. hot in on or start
 // V_CAR_ON sense: R1=62K, R2=6.2K divider (x11) to ADC1 ch4
@@ -109,7 +109,7 @@
 #define RX_GPIO_NUM             	3
 #define CAN_STDBY_GPIO_NUM			6
 
-#define HW_HAS_PWR2                  0
+#define HW_HAS_CAR_ON_SENSE          0
 
 #define HW_HAS_MCP2515              0
 #define CAN_BUS_COUNT               1
