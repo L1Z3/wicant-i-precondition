@@ -612,8 +612,8 @@ static void run_automatic_temperature_cutoff(void) {
     car_status(0x15, CAN_BUS_0);
     expect_state("active");
 
-    // A periodic attempt at the cutoff is dropped silently and leaves the
-    // repeating-mode latch enabled.
+    // No periodic attempt is scheduled at the cutoff; the repeating-mode
+    // latch stays enabled.
     int popup_count_before_periodic = popup_show_count;
     battery_temperature(21, 24);
     car_status(0x01, CAN_BUS_0);
@@ -623,6 +623,155 @@ static void run_automatic_temperature_cutoff(void) {
     CHECK(sent_count == 0);
     CHECK(popup_show_count == popup_count_before_periodic);
     CHECK(repeating_mode_enabled());
+}
+
+// Check the tick immediately before and at a deadline without rounding the
+// fake clock up to the regular 40 ms tick interval.
+static void expect_managed_until(int64_t deadline) {
+    CHECK(fake_now < deadline);
+    int before = sent_count;
+    fake_now = deadline - 1;
+    precondition_tick();
+    expect_state("managed");
+    CHECK(sent_count == before);
+    fake_now = deadline;
+    precondition_tick();
+}
+
+static void run_managed_cool_wait(void) {
+    precondition_init();
+    battery_temperature(20, 24);
+    battery_soc(40);
+    car_power(true);
+    toggle();
+    for (int i = 0; i < 6; i++) tick1();
+    car_status(0x15, CAN_BUS_0);
+    battery_temperature(21, 24);
+    car_status(0x01, CAN_BUS_0);
+    expect_state("managed");
+    int popups = popup_show_count;
+    sent_count = 0;
+
+    // Cooling starts well away from the old five-minute schedule.
+    advance_us(REPEATING_MODE_RETRY_INTERVAL_US + 60000000LL);
+    expect_state("managed");
+    CHECK(sent_count == 0);
+    battery_temperature(20, 24);
+    int64_t cooled_at = fake_now;
+    advance_us(REPEATING_MODE_COOL_WAIT_US / 2);
+    battery_temperature(19, 24); // repeated cold samples do not postpone it
+    car_status(0x01, CAN_BUS_0); // repeated idle reports do not postpone it
+    expect_managed_until(cooled_at + REPEATING_MODE_COOL_WAIT_US);
+    expect_state("start-burst");
+    CHECK(requested.kind == ATTEMPT_PERIODIC);
+    for (int i = 0; i < 6; i++) tick1();
+    check_start_burst_msgs(0);
+    CHECK(sent_count == 6);
+    advance_until_state("managed", PRECONDITION_RETRY_US + 80000);
+
+    // Returning to MANAGED already cold starts the normal five-minute wait.
+    int64_t managed_at = fake_now;
+    battery_temperature(20, 24);
+    expect_managed_until(managed_at + REPEATING_MODE_RETRY_INTERVAL_US);
+    expect_state("start-burst");
+    for (int i = 0; i < 6; i++) tick1();
+    check_start_burst_msgs(6);
+    CHECK(sent_count == 12);
+    car_status(0x05, CAN_BUS_0);
+    advance_until_state("managed", PRECONDITION_STARTED_TIMEOUT_US + 80000);
+    managed_at = fake_now;
+    expect_managed_until(managed_at + REPEATING_MODE_RETRY_INTERVAL_US);
+    expect_state("start-burst");
+    for (int i = 0; i < 6; i++) tick1();
+    CHECK(sent_count == 18);
+    car_status(0x15, CAN_BUS_0);
+    expect_state("active");
+
+    // Entering MANAGED already cold also uses five minutes after a successful
+    // session, regardless of how the session started or how long it ran.
+    advance_us(REPEATING_MODE_RETRY_INTERVAL_US);
+    car_status(0x01, CAN_BUS_0);
+    managed_at = fake_now;
+    expect_managed_until(managed_at + REPEATING_MODE_RETRY_INTERVAL_US);
+    expect_state("start-burst");
+    CHECK(popup_show_count == popups);
+}
+
+static void run_managed_cool_wait_reset(void) {
+    precondition_init();
+    car_status(0x01, CAN_BUS_0);
+    battery_temperature(21, 24);
+    battery_soc(40);
+    car_power(true);
+    toggle();
+    expect_state("managed");
+    sent_count = 0;
+    battery_temperature(20, 24);
+    advance_us(REPEATING_MODE_COOL_WAIT_US - 40000);
+
+    // Even a warm sample and recooling between consecutive ticks must reset
+    // the full wait. Exactly 21 C counts as warm.
+    battery_temperature(21, 24);
+    battery_temperature(20, 24);
+    int64_t cooled_at = fake_now;
+    expect_managed_until(cooled_at + REPEATING_MODE_COOL_WAIT_US);
+    expect_state("start-burst");
+    for (int i = 0; i < 6; i++) tick1();
+    advance_until_state("managed", PRECONDITION_RETRY_US + 80000);
+
+    // Warming during the retry interval returns to waiting for a new cool
+    // episode, with the initial three-minute delay instead of five minutes.
+    battery_temperature(21, 24);
+    advance_us(REPEATING_MODE_RETRY_INTERVAL_US);
+    expect_state("managed");
+    CHECK(sent_count == 6);
+    battery_temperature(20, 24);
+    battery_soc(39);
+    advance_us(REPEATING_MODE_COOL_WAIT_US + 40000);
+    expect_state("managed");
+    CHECK(sent_count == 6); // a completed cool wait cannot bypass low SoC
+    battery_soc(40);
+    tick1();
+    expect_state("start-burst");
+    for (int i = 0; i < 6; i++) tick1();
+    advance_until_state("managed", PRECONDITION_RETRY_US + 80000);
+
+    // A BMU restart during the cool wait cancels the pending manual attempt.
+    battery_temperature(21, 24);
+    battery_temperature(20, 24);
+    advance_us(REPEATING_MODE_COOL_WAIT_US / 2);
+    int before = sent_count;
+    car_status(0x05, CAN_BUS_0);
+    expect_state("wait-started");
+    car_status(0x15, CAN_BUS_0);
+    expect_state("active");
+    advance_us(REPEATING_MODE_RETRY_INTERVAL_US);
+    CHECK(sent_count == before);
+    car_status(0x01, CAN_BUS_0);
+    int64_t managed_at = fake_now;
+    expect_managed_until(managed_at + REPEATING_MODE_RETRY_INTERVAL_US);
+    expect_state("start-burst");
+}
+
+static void run_managed_unknown_temperature(void) {
+    precondition_init();
+    car_power(true);
+    toggle();
+    for (int i = 0; i < 6; i++) tick1();
+    car_status(0x15, CAN_BUS_0);
+    car_status(0x01, CAN_BUS_0);
+    int64_t idle_at = fake_now;
+    sent_count = 0;
+    expect_managed_until(idle_at + REPEATING_MODE_RETRY_INTERVAL_US);
+    expect_state("start-burst"); // original fallback without temperature data
+    for (int i = 0; i < 6; i++) tick1();
+    advance_until_state("managed", PRECONDITION_RETRY_US + 80000);
+    int64_t managed_at = fake_now;
+    advance_us(REPEATING_MODE_RETRY_INTERVAL_US - 60000000LL);
+    // A first cold sample is not a warm-to-cold crossing: keep the timer.
+    battery_temperature(20, 24);
+    expect_managed_until(managed_at + REPEATING_MODE_RETRY_INTERVAL_US);
+    expect_state("start-burst");
 }
 
 static void run_automatic_soc_cutoff(void) {
@@ -899,12 +1048,12 @@ static void run_continuous(void) {
     CHECK(popup_show_count == popups_before_starting);
     expect_state("active");
 
-    // BMU stops: enter MANAGED and arm the 5-minute re-nudge on this idle edge
+    // BMU stops while cold: enter MANAGED and start the five-minute retry wait
     car_status(0x01, CAN_BUS_0);
     expect_state("managed");
-    CHECK(managed.nudge_base_ts == fake_now);
+    CHECK(managed.nudge_at_us == fake_now + REPEATING_MODE_RETRY_INTERVAL_US);
     CHECK(!precondition_display().active);             // idle while waiting to re-nudge
-    advance_us(295000000LL);                    // just under 5 minutes
+    advance_us(REPEATING_MODE_RETRY_INTERVAL_US - 5000000LL);
     CHECK(sent_count == 0);
     expect_state("managed");
     advance_until_state("start-burst", 10000000LL);
@@ -922,7 +1071,7 @@ static void run_continuous(void) {
     sent_count = 0;
     advance_until_state("managed", 11000000LL);
     CHECK(sent_count == 0);                     // no retry bursts, no stop burst
-    CHECK(managed.nudge_base_ts == fake_now);
+    CHECK(managed.nudge_at_us == fake_now + REPEATING_MODE_RETRY_INTERVAL_US);
     CHECK(!precondition_display().starting);
     CHECK(!precondition_display().active);             // never confirmed started
 
@@ -939,7 +1088,7 @@ static void run_continuous(void) {
     sent_count = 0;
     advance_until_state("managed", 71000000LL);
     CHECK(sent_count == 0);
-    CHECK(managed.nudge_base_ts == fake_now);
+    CHECK(managed.nudge_at_us == fake_now + REPEATING_MODE_RETRY_INTERVAL_US);
 
     // An observed restart that falls back to idle keeps the same 70-second
     // confirmation window, then returns to MANAGED without sending a burst.
@@ -950,7 +1099,7 @@ static void run_continuous(void) {
     sent_count = 0;
     advance_until_state("managed", 71000000LL);
     CHECK(sent_count == 0);
-    CHECK(managed.nudge_base_ts == fake_now);
+    CHECK(managed.nudge_at_us == fake_now + REPEATING_MODE_RETRY_INTERVAL_US);
 
     // A fully-started report in MANAGED takes the same clean re-entry path,
     // then routes directly to ACTIVE without sending a start burst.
@@ -1118,7 +1267,7 @@ static void run_persistent(void) {
     CHECK(precondition_display().active);
     CHECK(!precondition_display().starting);
 
-    // BMU stops: the 5-minute re-nudge re-enters REQUESTED; neither it nor the
+    // BMU stops while cold: the five-minute re-nudge re-enters REQUESTED; neither it nor the
     // relaunch above changes the mirrored latch, so neither writes flash
     car_status(0x01, CAN_BUS_0);
     expect_state("managed");
@@ -1303,6 +1452,11 @@ static const suite_t suites[] = {
     {"precondition battery state of charge", ONCE, PRESS_SHORT, run_battery_soc},
     {"precondition automatic temperature cutoff", CONTINUOUS, PRESS_SHORT, run_automatic_temperature_cutoff},
     {"precondition persistent temperature cutoff", PERSISTENT, PRESS_SHORT, run_automatic_temperature_cutoff},
+    {"precondition continuous cool wait", CONTINUOUS, PRESS_SHORT, run_managed_cool_wait},
+    {"precondition persistent cool wait", PERSISTENT, PRESS_SHORT, run_managed_cool_wait},
+    {"precondition continuous cool wait reset", CONTINUOUS, PRESS_SHORT, run_managed_cool_wait_reset},
+    {"precondition persistent cool wait reset", PERSISTENT, PRESS_SHORT, run_managed_cool_wait_reset},
+    {"precondition unknown temperature retries", CONTINUOUS, PRESS_SHORT, run_managed_unknown_temperature},
     {"precondition automatic SoC cutoff", CONTINUOUS, PRESS_SHORT, run_automatic_soc_cutoff},
     {"precondition continuous SoC cutoff message", CONTINUOUS, PRESS_SHORT, run_repeating_soc_cutoff_message},
     {"precondition persistent SoC cutoff message", PERSISTENT, PRESS_SHORT, run_repeating_soc_cutoff_message},
