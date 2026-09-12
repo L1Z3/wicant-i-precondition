@@ -2935,15 +2935,11 @@ function loadAutoTable(jsonData) {
 		obj["ble_pass"] = document.getElementById("ble_pass_value").value;
 		obj["ble_status"] = document.getElementById("ble_status").value;
 		obj["sleep_status"] = document.getElementById("sleep_status").value;
-		let sleepVolt = document.getElementById("sleep_volt").value;
-		if (document.getElementById("sleep_status").value == "car_off" && has_car_on_sense) {
-			// Pin-equipped boards ignore the slider in car-off mode and use the
-			// fixed car-on threshold; persist that so /load_config agrees with
-			// the UI readout instead of a stale battery voltage. Sent as a
-			// string: the config server stores sleep_volt as a string.
-			sleepVolt = String(document.getElementById("sleep_volt").dataset.carOnThresholdV);
-		}
-		obj["sleep_volt"] = sleepVolt;
+		// Save the user's battery cutoff so switching back to low-voltage sleep
+		// restores their choice, including after a save/reload. On boards with
+		// the sense pin, car-off mode displays and uses a separate fixed threshold
+		// (5V); saving that readout as sleep_volt would erase the battery cutoff.
+		obj["sleep_volt"] = document.getElementById("sleep_volt").value;
         obj["sleep_time"] = document.getElementById("sleep_time").value;
 		obj["batt_alert"] = document.getElementById("batt_alert").value;
 		obj["batt_alert_ssid"] = document.getElementById("batt_alert_ssid").value;
@@ -3313,15 +3309,7 @@ function loadAutoTable(jsonData) {
 			document.getElementById("tcp_port_value").value = obj.port;
 			document.getElementById("ap_pass_value").value = obj.ap_pass;
 			document.getElementById("ble_pass_value").value = obj.ble_pass;
-			// The slider only ranges 12-15V. In car-off mode on pin-equipped
-			// boards the stored threshold is the car-on voltage (5V), which
-			// would clamp to 12 and discard the user's low-voltage threshold;
-			// only restore in-range values.
-			const storedSleepVolt = parseFloat(obj.sleep_volt);
-			if (storedSleepVolt >= 12 && storedSleepVolt <= 15) {
-				document.getElementById("sleep_volt").value = obj.sleep_volt;
-				document.getElementById("sleep_volt_value").textContent = obj.sleep_volt;
-			}
+			document.getElementById("sleep_volt").value = obj.sleep_volt;
             document.getElementById("sleep_time").value = obj.sleep_time;
             document.getElementById('sleep_time_value').textContent = obj.sleep_time;
             toggleSleepVoltageEnabled();

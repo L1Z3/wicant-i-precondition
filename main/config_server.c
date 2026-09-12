@@ -2736,12 +2736,10 @@ int8_t config_server_get_sleep_volt(float *sleep_volt)
 		return -1;
 	}
 
-	// The UI slider only produces 12-15V. CAR_ON_THRESHOLD_V (5V) is also accepted
-	// on boards with the car-on sense pin: car-off sleep there persists the
-	// fixed 5V threshold (the slider is ignored and disabled in that mode). On
-	// boards without the pin the 12V battery never reads near 5V, so a 5V
-	// value would silently disable sleep, and is rejected.
-	if((*sleep_volt >= 12.0f && *sleep_volt <= 15.0f) || (HW_HAS_CAR_ON_SENSE && *sleep_volt == CAR_ON_THRESHOLD_V))
+	// This setting always stores the 12-15V battery threshold. On boards with
+	// the car-on sense pin, sleep_mode_init() uses CAR_ON_THRESHOLD_V (5V)
+	// for car-off sleep without changing this saved battery threshold.
+	if(*sleep_volt >= 12.0f && *sleep_volt <= 15.0f)
 	{
 		return 1;
 	}
