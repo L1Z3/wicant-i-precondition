@@ -28,6 +28,8 @@ int8_t sleep_mode_get_on_voltage(float *val);
 
 // todo (trh): needs testing, but should be safe
 // a car with <5V on a 12V bus is dead or off
+// PWR_12V_7 voltage threshold for deciding if car is off/on
+// (only used when sleep_status = "car_off")
 #define CAR_ON_VOLTAGE    5.0f
 
 #endif
