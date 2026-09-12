@@ -1012,7 +1012,6 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	cJSON_AddStringToObject(root, "protocol", device_config.protocol);
 
 	cJSON_AddBoolToObject(root, "has_car_on_sense", (bool)HW_HAS_CAR_ON_SENSE);
-	cJSON_AddNumberToObject(root, "car_on_threshold_v", CAR_ON_THRESHOLD_V);
 	cJSON_AddStringToObject(root, "sleep_status", device_config.sleep_status);
 	cJSON_AddStringToObject(root, "sleep_volt", device_config.sleep_volt);
 	cJSON_AddStringToObject(root, "sleep_time", device_config.sleep_time);
@@ -1092,7 +1091,7 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	}
 
 	// CAN-derived READY state (0x038 power status); shown by the web UI in
-	// place of the car-on voltage on boards without the car-on sense pin.
+	// place of the car-on sense voltage on boards without the sense pin.
 	cJSON_AddStringToObject(root, "can_ready_state", car_in_ready() ? "Ready" : "Not Ready");
 
 	char uptime_str[32];
@@ -2736,9 +2735,9 @@ int8_t config_server_get_sleep_volt(float *sleep_volt)
 		return -1;
 	}
 
-	// This setting always stores the 12-15V battery threshold. On boards with
-	// the car-on sense pin, sleep_mode_init() uses CAR_ON_THRESHOLD_V (5V)
-	// for car-off sleep without changing this saved battery threshold.
+	// The UI slider only produces 12-15V, in every sleep mode: CAR_ON_THRESHOLD_V
+	// is the fixed car-on sense threshold used internally by car-off sleep and
+	// is never persisted as a setpoint.
 	if(*sleep_volt >= 12.0f && *sleep_volt <= 15.0f)
 	{
 		return 1;

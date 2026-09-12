@@ -721,8 +721,10 @@ void app_main(void)
     xTaskCreate(can_tx_task, "can_tx_task", 1024*3, (void*)AF_INET, 5, NULL);
 
     // sleep_config: 1 = low-voltage sleep, 2 = car-off sleep. Both run the
-    // same state machine in sleep_mode.c and differ only in the test voltage
-    // and the car-off gating (car_off_gate_ok).
+    // same state machine in sleep_mode.c and use sleep_voltage as the battery
+    // sleep threshold; car-off sleep additionally refuses to sleep while the
+    // car is awake (CAR_ON_THRESHOLD_V on the sense pin, or the CAN-derived
+    // car_in_ready()). 
     uint8_t sleep_config = config_server_get_sleep_config();
 	if(sleep_config == 1 || sleep_config == 2) // "enable" or "car_off"
 	{
