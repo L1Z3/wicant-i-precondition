@@ -474,7 +474,7 @@ void can_enable(can_bus_t bus)
 		.on_tx_done = can_on_tx_done,
 		.on_state_change = can_on_state_change,
 	};
-	err = twai_node_register_event_callbacks(can_node[bus], &cbs, (void *)(uintptr_t)bus);
+	err = twai_node_register_event_callbacks(can_node[bus], &cbs, (void *)(uintptr_t)bus); // NOLINT(performance-no-int-to-ptr) -- ctx-cast idiom
 	if (err == ESP_OK)
 	{
 		can_tx_slots_reset(bus);	// fresh node: all slots are free
