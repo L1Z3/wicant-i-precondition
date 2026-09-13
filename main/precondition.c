@@ -485,7 +485,7 @@ static char *format_temperature(int celsius, char text[TEMPERATURE_TEXT_SIZE]) {
 static void show_once_blocker_notice(precondition_blockers_t blocker) {
     char message[48];
     if (blocker == PRECONDITION_BLOCK_UTILITY_MODE) {
-        track_popup_show_info("Once: utility mode blocked start");
+        track_popup_show_error("Once: utility mode blocked start");
         return;
     }
 
@@ -872,13 +872,13 @@ static fwd_result_t requested_fwd(sm_t *sm, twai_message_t *to_send, can_bus_t f
     if (fwd_bus != CAR_BUS) {
         return FWD_PASSTHROUGH;
     }
-    // block 0x0C7 so that the head unit doesn't turn off preconditioning on us,
-    // except while the car is in utility mode, where the frame has to reach the
-    // car for the mode change to take effect
-    // TODO(ejones): handle utility mode and test
-    // (mitm 00 00 on bytes 4 and 5 to E0 07 (allows utility mode (byte 3, 80) to go through))
-    // the utility mode catch may not be needed here, but is left in to handle race conditions
-    if (to_send->identifier == 0x0C7U && !platform.car_in_utility) {
+    // Block head-unit commands that could cancel preconditioning, but always
+    // forward utility requests. Repeating modes stay under REQUESTED in MANAGED,
+    // so also allow other control frames while utility mode is tracked by READY
+    // edges. Without READY frames, the utility latch cannot be cleared.
+    if (IS_BMU_CONTROL_FRAME(to_send->identifier)
+            && !is_utility_request(to_send)
+            && !(ready_status_available() && platform.car_in_utility)) {
         return FWD_BLOCK;
     }
     // MITM 0x4ED while preconditioning is requested
@@ -1119,14 +1119,14 @@ static bool managed_event(sm_t *sm, sm_event_t ev) {
 
 // The entry argument states why the stop began. Blocked starts and exhausted
 // start retries use one cleanup burst without retries or a stop countdown.
-// Utility cancellations skip the burst; normal stops confirm and retry.
+// Utility cancellations and stops blocked by utility mode skip the burst;
+// normal stops confirm and retry.
 static void stopping_enter(sm_t *sm) {
     stopping.reason = (stop_reason_t)sm_entry_arg(sm);
     show_stopping_notice(stopping.reason);
     if (stopping.reason == STOP_REASON_UTILITY_MODE
-            || (stopping.reason == STOP_REASON_START_BLOCKED
-                && (precon_blockers & PRECONDITION_BLOCK_UTILITY_MODE))) {
-        // Stop commands would interrupt utility mode, including on a blocked start.
+            || (precon_blockers & PRECONDITION_BLOCK_UTILITY_MODE)) {
+        // Stop commands would interrupt utility mode, even for a user-requested stop.
         sm_transition(sm, &S_IDLE);
         return;
     }

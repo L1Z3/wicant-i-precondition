@@ -1602,7 +1602,7 @@ static void run_utility_mode(void) {
         toggle();
         expect_state("idle");
         CHECK(popup_show_count == notices + 1);
-        CHECK(strcmp(popup_text, "ⓘ Once: utility mode blocked start") == 0);
+        CHECK(strcmp(popup_text, "‼ Once: utility mode blocked start") == 0);
         advance_us(PRECONDITION_RETRY_US + 1000000);
         CHECK(sent_count == 0);
     }
@@ -1627,6 +1627,82 @@ static void run_utility_mode(void) {
     for (int i = 0; i < 6; i++) tick1();
     CHECK(sent_count == 6);
     check_stop_burst_msgs(0);
+}
+
+static void run_utility_mode_disable(void) {
+    precondition_init();
+    car_power(true);
+    toggle();
+    for (int i = 0; i < 6; i++) tick1();
+    car_status(0x15, CAR_BUS);
+    expect_state("active");
+
+    uint8_t utility[8] = {[2] = 0x80, [3] = 0xE0, [4] = 0x07};
+    rx_frame(0x0C7, utility, HEAD_UNIT_BUS);
+    expect_state("managed");
+    fake_now += 2000000;
+    sent_count = 0;
+    int notices = popup_show_count;
+
+    // Disabling the session must leave utility mode alone, including on retries.
+    toggle();
+    expect_state("idle");
+    CHECK(!repeating_mode_enabled());
+    CHECK(!precondition_display().requested);
+    CHECK(popup_show_count == notices + 1);
+    CHECK(precon_blockers & PRECONDITION_BLOCK_UTILITY_MODE);
+    advance_us(PRECONDITION_RETRY_US + 1000000);
+    CHECK(sent_count == 0);
+}
+
+static void run_utility_mode_without_ready(void) {
+    precondition_init();
+    toggle();
+    for (int i = 0; i < 6; i++) tick1();
+    car_status(0x15, CAR_BUS);
+    expect_state("active");
+    fake_now += 2000000;
+    sent_count = 0;
+
+    twai_message_t utility = {
+        .identifier = 0x0C7,
+        .data_length_code = 8,
+        .data = {[2] = 0x80, [3] = 0xE0, [4] = 0x07},
+    };
+    precondition_can_rx_hook(&utility, HEAD_UNIT_BUS);
+    expect_state(cfg_mode == ONCE ? "idle" : "managed");
+    CHECK(!ready_status_available());
+    CHECK(platform.car_in_utility);
+    CHECK(!(precon_blockers & PRECONDITION_BLOCK_UTILITY_MODE));
+    twai_message_t forwarded = utility;
+    CHECK(precondition_fwd_hook(&forwarded, CAR_BUS) == FWD_PASSTHROUGH);
+    CHECK(memcmp(forwarded.data, utility.data, sizeof(utility.data)) == 0);
+    advance_us(PRECONDITION_RETRY_US + 1000000);
+    CHECK(sent_count == 0);
+
+    if (repeating_mode()) {
+        toggle();
+        for (int i = 0; i < 6; i++) tick1();
+        car_status(0x01, CAR_BUS);
+        expect_state("idle");
+    }
+
+    // A fresh manual session still blocks ordinary head-unit stop commands,
+    // even though no READY edge has arrived to clear the utility latch.
+    sent_count = 0;
+    toggle();
+    for (int i = 0; i < 6; i++) tick1();
+    car_status(0x15, CAR_BUS);
+    expect_state("active");
+    CHECK(sent_count == 6);
+    check_start_burst_msgs(0);
+    CHECK(fwd(0x0C7, CAR_BUS, NULL) == FWD_BLOCK);
+
+    // Repeated utility requests stay passable without cancelling the new session.
+    precondition_can_rx_hook(&utility, HEAD_UNIT_BUS);
+    expect_state("active");
+    forwarded = utility;
+    CHECK(precondition_fwd_hook(&forwarded, CAR_BUS) == FWD_PASSTHROUGH);
 }
 
 // ---- suite table ----
@@ -1672,6 +1748,11 @@ static const suite_t suites[] = {
     {"precondition once utility mode", ONCE, PRESS_SHORT, run_utility_mode},
     {"precondition continuous utility mode", CONTINUOUS, PRESS_SHORT, run_utility_mode},
     {"precondition persistent utility mode", PERSISTENT, PRESS_SHORT, run_utility_mode},
+    {"precondition continuous utility disable", CONTINUOUS, PRESS_SHORT, run_utility_mode_disable},
+    {"precondition persistent utility disable", PERSISTENT, PRESS_SHORT, run_utility_mode_disable},
+    {"precondition once utility without READY", ONCE, PRESS_SHORT, run_utility_mode_without_ready},
+    {"precondition continuous utility without READY", CONTINUOUS, PRESS_SHORT, run_utility_mode_without_ready},
+    {"precondition persistent utility without READY", PERSISTENT, PRESS_SHORT, run_utility_mode_without_ready},
 };
 #define NUM_SUITES (sizeof(suites) / sizeof(suites[0]))
 
