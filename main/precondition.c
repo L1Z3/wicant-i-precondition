@@ -1,4 +1,5 @@
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -324,10 +325,10 @@ static struct {
     // most recent recognized preconditioning status reported by the car
     precon_status_t precon_status;
     // is the car in READY? tracked from 0x038 edges; stays false on platforms
-    // where that frame is unavailable. volatile: written from the CAN rx task
-    // and read from the adc sleep task (car_in_ready()); a single byte, so
-    // volatile (no lock) keeps the cross-task read from being cached/hoisted.
-    volatile bool car_in_ready;
+    // where that frame is unavailable. Shared with sleep/status readers;
+    // relaxed accesses suffice because this flag does not signal that other
+    // shared data is ready to read.
+    atomic_bool car_in_ready;
 } platform;
 
 static bool precon_status_available(void) {
@@ -711,7 +712,7 @@ static void idle_enter(sm_t *sm) {
 }
 
 static void idle_tick(sm_t *sm) {
-    if (idle.continuous_disabled_by_car_off && platform.car_in_ready
+    if (idle.continuous_disabled_by_car_off && car_in_ready()
             && ts_elapsed(sm_now(sm), idle.continuous_disabled_ready_at_us)
                     >= PRECONDITION_CAR_START_DELAY_US) {
         idle.continuous_disabled_by_car_off = false;
@@ -985,7 +986,7 @@ static void managed_enter(sm_t *sm) {
 }
 
 static void managed_tick(sm_t *sm) {
-    if (platform.car_in_ready && managed.nudge_at_us != 0
+    if (car_in_ready() && managed.nudge_at_us != 0
             && precon_blockers == PRECONDITION_BLOCK_NONE
             && sm_now(sm) >= managed.nudge_at_us) {
         // targets the parent, so REQUESTED exits and re-enters: fresh attempt
@@ -1230,8 +1231,8 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
             && rx_bus == CAR_BUS
             && to_push->data_length_code >= 1U) {
         bool ready = POWER_STATUS_READY(to_push->data[0]);
-        if (ready != platform.car_in_ready) {
-            platform.car_in_ready = ready;
+        if (ready != car_in_ready()) {
+            atomic_store_explicit(&platform.car_in_ready, ready, memory_order_relaxed);
             ESP_LOGI(TAG, "car power: %s", ready ? "ready" : "off");
             sm_send_event(sm, ready ? EV_CAR_READY : EV_CAR_NOT_READY);
         }
@@ -1430,5 +1431,5 @@ bool precondition_get_battery_soc(precondition_soc_t *out) {
 }
 
 bool car_in_ready(void) {
-    return platform.car_in_ready;
+    return atomic_load_explicit(&platform.car_in_ready, memory_order_relaxed);
 }
