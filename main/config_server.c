@@ -1011,6 +1011,7 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	cJSON_AddStringToObject(root, "git_version", GIT_SHA);
 	cJSON_AddStringToObject(root, "protocol", device_config.protocol);
 
+	cJSON_AddBoolToObject(root, "has_car_on_sense", (bool)HW_HAS_CAR_ON_SENSE);
 	cJSON_AddStringToObject(root, "sleep_status", device_config.sleep_status);
 	cJSON_AddStringToObject(root, "sleep_volt", device_config.sleep_volt);
 	cJSON_AddStringToObject(root, "sleep_time", device_config.sleep_time);
@@ -1078,6 +1079,20 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 			strlcpy(volt, "N/A", sizeof(volt));
 		cJSON_AddStringToObject(root, "batt_voltage", volt);
 	}
+
+	{
+		char car_on_sense_voltage_str[12] = {0};
+		float car_on_sense_voltage = 0;
+		if (sleep_mode_get_car_on_sense_voltage(&car_on_sense_voltage) == 1)
+			snprintf(car_on_sense_voltage_str, sizeof(car_on_sense_voltage_str), "%.1fV", car_on_sense_voltage);
+		else
+			strlcpy(car_on_sense_voltage_str, "N/A", sizeof(car_on_sense_voltage_str));
+		cJSON_AddStringToObject(root, "car_on_sense_voltage", car_on_sense_voltage_str);
+	}
+
+	// CAN-derived READY state (0x038 power status); shown by the web UI in
+	// place of the car-on sense voltage on boards without the sense pin.
+	cJSON_AddStringToObject(root, "can_ready_state", car_in_ready() ? "Ready" : "Not Ready");
 
 	char uptime_str[32];
 	dev_status_format_uptime(uptime_str, sizeof(uptime_str));
@@ -2698,6 +2713,10 @@ int8_t config_server_get_sleep_config(void)
 	{
 		return 1;
 	}
+	else if(strcmp(device_config.sleep_status, "car_off") == 0)
+	{
+		return 2;
+	}
 	else if(strcmp(device_config.sleep_status, "disable") == 0)
 	{
 		return 0;
@@ -2716,6 +2735,9 @@ int8_t config_server_get_sleep_volt(float *sleep_volt)
 		return -1;
 	}
 
+	// The UI slider only produces 12-15V, in every sleep mode: CAR_ON_THRESHOLD_V
+	// is the fixed car-on sense threshold used internally by car-off sleep and
+	// is never persisted as a setpoint.
 	if(*sleep_volt >= 12.0f && *sleep_volt <= 15.0f)
 	{
 		return 1;
