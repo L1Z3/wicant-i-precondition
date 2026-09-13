@@ -8,7 +8,10 @@
 #define TAG __func__
 
 #define CAR_BUS CAN_BUS_0
+#define HEAD_UNIT_BUS CAN_BUS_1
 
+// Head-unit charge-limit command (D5 = AC limit, D6 = DC limit, same factor
+// 0.5): only ever seen on the head-unit bus.
 #define CHARGE_LIMIT_FRAME_ID 0x4C5U
 
 // Car-side charge-limit status echo (BO_ 505 Charge_Limit_Status_1F9 in
@@ -237,10 +240,20 @@ void car_settings_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
     if (to_push == NULL) {
         return;
     }
-    // Trust CAR_BUS only. The head-unit side (bus 1) may carry its own
-    // 0x4C5/0x1F9 with different values; on a two-bus harness those would
-    // poison the template, the conflict reference, and the quiet timer.
-    if (rx_bus != CAR_BUS) {
+    // Each frame only ever comes from one side: 0x4C5 is the head unit's
+    // command and only appears on the head-unit bus, 0x1F9 is the car's reply
+    // and only appears on the car bus. Rejecting the other side keeps a stray
+    // same-ID frame from poisoning the injection template, the conflict
+    // reference, and the quiet timer.
+    if (to_push->identifier == CHARGE_LIMIT_FRAME_ID) {
+        if (rx_bus != HEAD_UNIT_BUS) {
+            return;
+        }
+    } else if (to_push->identifier == CHARGE_LIMIT_STATUS_FRAME_ID) {
+        if (rx_bus != CAR_BUS) {
+            return;
+        }
+    } else {
         return;
     }
     uint8_t adopted_ac = 0, adopted_dc = 0;
