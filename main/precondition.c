@@ -157,6 +157,14 @@ static bool activation_is_release(const message_payload_t *msg, const twai_messa
 #define IS_BMU_CONTROL_FRAME(frame_id) \
     ((frame_id) == 0x0C7U)
 
+static bool is_utility_request(const twai_message_t *frame) {
+    return IS_BMU_CONTROL_FRAME(frame->identifier)
+           && frame->data_length_code >= 5U
+           && frame->data[2] == 0x80U
+           && frame->data[3] == 0xE0U
+           && frame->data[4] == 0x07U;
+}
+
 // TODO(ejones): unclear if this mask/value is necessary and sufficient
 #define POWER_STATUS_MASK 0x0FU
 #define POWER_STATUS_READY(power_status_byte) \
@@ -816,6 +824,13 @@ static bool requested_event(sm_t *sm, sm_event_t ev) {
                 show_repeating_soc_notice();
             }
             return true;
+        case EV_UTILITY_MODE:
+            if (precon_config.mode == ONCE) {
+                sm_transition_arg(sm, &S_STOPPING, STOP_REASON_UTILITY_MODE);
+            } else {
+                sm_transition(sm, &S_MANAGED);
+            }
+            return true;
     }
     return false;
 }
@@ -1073,13 +1088,20 @@ static bool managed_event(sm_t *sm, sm_event_t ev) {
 
 // The entry argument states why the stop began. Blocked starts and exhausted
 // start retries use one cleanup burst without retries or a stop countdown.
-// Normal stops use the full confirmation/retry path.
+// Utility cancellations skip the burst; normal stops confirm and retry.
 static void stopping_enter(sm_t *sm) {
     stopping.reason = (stop_reason_t)sm_entry_arg(sm);
+    show_stopping_notice(stopping.reason);
+    if (stopping.reason == STOP_REASON_UTILITY_MODE
+            || (stopping.reason == STOP_REASON_START_BLOCKED
+                && (precon_blockers & PRECONDITION_BLOCK_UTILITY_MODE))) {
+        // Stop commands would interrupt utility mode, including on a blocked start.
+        sm_transition(sm, &S_IDLE);
+        return;
+    }
     stopping.retries = (stopping.reason == STOP_REASON_START_BLOCKED
                        || stopping.reason == STOP_REASON_RETRIES_EXHAUSTED)
                      ? PRECONDITION_MAX_RETRIES : 0U;
-    show_stopping_notice(stopping.reason);
 }
 
 static bool stopping_event(sm_t *sm, sm_event_t ev) {
@@ -1282,7 +1304,6 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
         platform.ready_status = ready;
         if (is_ready != was_ready) {
             ESP_LOGI(TAG, "car power: %s", is_ready ? "ready" : "off");
-            sm_send_event(sm, is_ready ? EV_CAR_READY : EV_CAR_NOT_READY);
             // definitely out of utility mode if the car power changes
             // as that's the only way to leave utility mode
             // probably there's a value here corresponding to utility mode
@@ -1290,18 +1311,14 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
             // should include utility mode
             platform.car_in_utility = false;
             update_precon_blocker(PRECONDITION_BLOCK_UTILITY_MODE, false);
+            sm_send_event(sm, is_ready ? EV_CAR_READY : EV_CAR_NOT_READY);
         }
     }
 
-    // utility mode: the head unit asserts byte 2 = 0x80 in a 0x0C7 frame to
-    // enter utility mode. only act on the rising edge: repeat frames must not
+    // Only act on the first utility request: repeat frames must not
     // revert a preconditioning request the user makes while utility mode is on
     if (rx_bus == HEAD_UNIT_BUS
-            && IS_BMU_CONTROL_FRAME(to_push->identifier)
-            && to_push->data_length_code >= 5U
-            && to_push->data[2] == 0x80U
-            && to_push->data[3] == 0xE0U
-            && to_push->data[4] == 0x07U
+            && is_utility_request(to_push)
             && !platform.car_in_utility) {
         // utility mode requested
         platform.car_in_utility = true;
@@ -1313,20 +1330,6 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
             ready_status_available()
         );
         sm_send_event(sm, EV_UTILITY_MODE);
-        if (sm_in(&precon_sm, &S_REQUESTED)) {
-            if (precon_config.mode == ONCE) {
-                // tell the user utility mode canceled preconditioning, then idle
-                // immediately; no stop burst is sent
-                show_stopping_notice(STOP_REASON_UTILITY_MODE);
-                // skipping stopping, but it has to be done either this way or with
-                // a special stopping state to avoid interrupting utility mode with
-                // stop bursts
-                sm_transition(sm, &S_IDLE);
-            } else {
-                // this seems pretty safe?
-                sm_transition(sm, &S_MANAGED);
-            }
-        }
     }
 
     // 0x2AD/0x0A82AA03 status frame: second byte indicates precondition state
