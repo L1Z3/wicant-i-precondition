@@ -154,9 +154,15 @@ static void head_unit_charge_limit(uint8_t ac_raw, uint8_t dc_raw, can_bus_t bus
     d[5] = dc_raw;
     rx_frame(0x4C5, d, bus);
 }
+// The head-unit sends below use the firmware's own HEAD_UNIT_BUS, not CAN_BUS_1:
+// with CAN_BUS_COUNT == 1 the head unit shares CAR_BUS, so the suite has to
+// follow the same fallback the firmware does (this file includes precondition.c,
+// so its macros are in scope). The "wrong bus" probes further down stay literal
+// CAN_BUS_1 -- they pin the bus gate, which exists in both configurations.
+//
 // the all-0xFF rest frames the head unit pads every change with
 static void head_unit_charge_limit_rest(void) {
-    head_unit_charge_limit(0xFF, 0xFF, CAN_BUS_1);
+    head_unit_charge_limit(0xFF, 0xFF, HEAD_UNIT_BUS);
 }
 
 // Model the two firmware workers in deterministic order: the timing task runs
@@ -183,7 +189,7 @@ static void advance_until_state(const char *name, int64_t max_us) {
 // value frames at 25 Hz, then three all-0xFF rest frames, one frame per tick.
 static void head_unit_charge_limit_write(uint8_t ac_raw, uint8_t dc_raw) {
     for (int i = 0; i < 3; i++) {
-        head_unit_charge_limit(ac_raw, dc_raw, CAN_BUS_1);
+        head_unit_charge_limit(ac_raw, dc_raw, HEAD_UNIT_BUS);
         tick1();
     }
     for (int i = 0; i < 3; i++) {
@@ -769,7 +775,7 @@ static void run_charge_limit_reassert(void) {
 
     // A value-bearing command arms the re-assertion: silent for the whole reply
     // wait, then one frame per tick.
-    head_unit_charge_limit(0xA0, 0xFF, CAN_BUS_1);          // AC 80%
+    head_unit_charge_limit(0xA0, 0xFF, HEAD_UNIT_BUS);      // AC 80%
     CHECK(charge_limit_watch.wait == CONDITIONING_MODE_REPLY_TIMEOUT_TICKS);
     CHECK(charge_limit_watch.remaining == CONDITIONING_MODE_TICKS);
     for (int i = 0; i < (int)CONDITIONING_MODE_REPLY_TIMEOUT_TICKS; i++) {
@@ -788,7 +794,7 @@ static void run_charge_limit_reassert(void) {
     // A reading from before the floor expired is still the pre-write mode: the
     // BMU takes 194-334 ms to act on a write, so it must not suppress the burst.
     sent_count = 0;
-    head_unit_charge_limit(0xA0, 0xFF, CAN_BUS_1);
+    head_unit_charge_limit(0xA0, 0xFF, HEAD_UNIT_BUS);
     conditioning_mode(0x80);                                // "enabled" too early
     CHECK(!charge_limit_watch.reply_enabled);
     advance_us((int64_t)(CONDITIONING_MODE_REPLY_TIMEOUT_TICKS
@@ -801,7 +807,7 @@ static void run_charge_limit_reassert(void) {
     // the floor, where a real reply lands, so the window has to actually be wide
     // enough to catch it.
     sent_count = 0;
-    head_unit_charge_limit(0xA0, 0xFF, CAN_BUS_1);
+    head_unit_charge_limit(0xA0, 0xFF, HEAD_UNIT_BUS);
     advance_us((int64_t)(CONDITIONING_MODE_HOLD_OFF_TICKS
                          + CONDITIONING_MODE_REPLY_PERIOD_TICKS) * 40000);
     CHECK(charge_limit_watch.wait > 0U);
@@ -816,7 +822,7 @@ static void run_charge_limit_reassert(void) {
     // A window reading that reports the mode off means the write did clear it,
     // and the newest window reading wins over an earlier one.
     sent_count = 0;
-    head_unit_charge_limit(0xA0, 0xFF, CAN_BUS_1);
+    head_unit_charge_limit(0xA0, 0xFF, HEAD_UNIT_BUS);
     advance_us((int64_t)CONDITIONING_MODE_HOLD_OFF_TICKS * 40000);
     conditioning_mode(0x80);                                // enabled...
     CHECK(charge_limit_watch.reply_enabled);
@@ -859,14 +865,16 @@ static void run_charge_limit_reassert(void) {
     CHECK(sent_count == (int)CONDITIONING_MODE_TICKS);
     check_conditioning_mode_burst_msgs(0);
 
-    // Only the head-unit bus carries the head unit's command: the car bus and
-    // truncated frames never arm it.
+    // A truncated write is not a write on either bus, and on a two-bus build a
+    // copy on the car bus is not the head unit's command either.
     sent_count = 0;
+#if CAN_BUS_COUNT > 1
     head_unit_charge_limit(0xC8, 0xFF, CAN_BUS_0);
+#endif
     uint8_t short_frame[8];
     memset(short_frame, 0xFF, sizeof(short_frame));
     short_frame[4] = 0xC8;
-    rx_frame_len(0x4C5, short_frame, 5, CAN_BUS_1);
+    rx_frame_len(0x4C5, short_frame, 5, HEAD_UNIT_BUS);
     advance_us((int64_t)(CONDITIONING_MODE_REPLY_TIMEOUT_TICKS
                          + CONDITIONING_MODE_TICKS) * 40000);
     CHECK(sent_count == 0);
@@ -881,7 +889,7 @@ static void run_charge_limit_reassert(void) {
     expect_state("start-burst");
     tick1();
     CHECK(sent_count == 1);
-    head_unit_charge_limit(0xC8, 0xFF, CAN_BUS_1);
+    head_unit_charge_limit(0xC8, 0xFF, HEAD_UNIT_BUS);
     CHECK(charge_limit_watch.wait == CONDITIONING_MODE_REPLY_TIMEOUT_TICKS);
     CHECK(charge_limit_watch.remaining == CONDITIONING_MODE_TICKS);
     for (int i = 1; i < (int)PRECONDITION_START_TICKS; i++) tick1();
@@ -900,13 +908,13 @@ static void run_charge_limit_reassert(void) {
     // so the burst cannot race the head unit's own message, but does not restart
     // the burst: the six frames stay in the documented order.
     sent_count = 0;
-    head_unit_charge_limit(0xA0, 0xFF, CAN_BUS_1);
+    head_unit_charge_limit(0xA0, 0xFF, HEAD_UNIT_BUS);
     advance_us((int64_t)CONDITIONING_MODE_REPLY_TIMEOUT_TICKS * 40000);
     CHECK(sent_count == 0);
     tick1();
     tick1();                                                // two frames are out
     CHECK(sent_count == 2);
-    head_unit_charge_limit(0x8C, 0xFF, CAN_BUS_1);          // overlapping write
+    head_unit_charge_limit(0x8C, 0xFF, HEAD_UNIT_BUS);      // overlapping write
     CHECK(charge_limit_watch.wait == CONDITIONING_MODE_REPLY_TIMEOUT_TICKS);
     CHECK(charge_limit_watch.remaining == CONDITIONING_MODE_TICKS - 2U);
     advance_us((int64_t)CONDITIONING_MODE_REPLY_TIMEOUT_TICKS * 40000);
@@ -1892,6 +1900,13 @@ static const suite_t suites[] = {
 #define NUM_SUITES (sizeof(suites) / sizeof(suites[0]))
 
 static int run_suite(const suite_t *s) {
+    // The Makefile builds this suite for both bus counts and states which one
+    // each binary is. Without this, the suite is self-consistent under either
+    // value, so a stub or -D regression could quietly run the two-bus
+    // configuration twice and leave the single-bus branches uncovered.
+#ifdef EXPECT_CAN_BUS_COUNT
+    CHECK(CAN_BUS_COUNT == EXPECT_CAN_BUS_COUNT);
+#endif
     cfg_mode = s->mode;
     cfg_press = s->press;
     // Steady-state model: the car broadcasts 0x25D every 200 ms, so by the time
