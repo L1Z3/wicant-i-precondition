@@ -1543,6 +1543,92 @@ static void run_fahrenheit_automatic_cutoff(void) {
     run_automatic_temperature_cutoff();
 }
 
+static void run_utility_mode(void) {
+    precondition_init();
+    car_power(true);
+    toggle();
+    for (int i = 0; i < 6; i++) tick1();
+    car_status(0x15, CAR_BUS);
+    expect_state("active");
+    sent_count = 0;
+    int notices = popup_show_count;
+
+    twai_message_t utility = {
+        .identifier = 0x0C7,
+        .data_length_code = 8,
+        .data = {[2] = 0x80, [3] = 0xE0, [4] = 0x07},
+    };
+
+    // Only a complete utility request from the head unit can cancel a session.
+    precondition_can_rx_hook(&utility, CAR_BUS);
+    expect_state("active");
+    twai_message_t invalid = utility;
+    invalid.data_length_code = 4;
+    precondition_can_rx_hook(&invalid, HEAD_UNIT_BUS);
+    expect_state("active");
+    invalid = utility;
+    invalid.data[2] = 0;
+    precondition_can_rx_hook(&invalid, HEAD_UNIT_BUS);
+    expect_state("active");
+    CHECK(!platform.car_in_utility);
+    CHECK(popup_show_count == notices);
+
+    precondition_can_rx_hook(&utility, HEAD_UNIT_BUS);
+    expect_state(cfg_mode == ONCE ? "idle" : "managed");
+    CHECK(platform.car_in_utility);
+    CHECK(precon_blockers & PRECONDITION_BLOCK_UTILITY_MODE);
+    CHECK(precondition_display().requested == repeating_mode());
+    if (cfg_mode == ONCE) {
+        CHECK(popup_show_count == notices + 1);
+        CHECK(strcmp(popup_text, "ⓘ Once: utility mode stopped precon.") == 0);
+    } else {
+        CHECK(repeating_mode_enabled());
+        CHECK(popup_show_count == notices);
+    }
+    twai_message_t forwarded = utility;
+    CHECK(precondition_fwd_hook(&forwarded, CAR_BUS) == FWD_PASSTHROUGH);
+    CHECK(memcmp(forwarded.data, utility.data, sizeof(utility.data)) == 0);
+
+    // Repeated requests are silent, and utility mode sends no start/stop bursts.
+    notices = popup_show_count;
+    precondition_can_rx_hook(&utility, HEAD_UNIT_BUS);
+    CHECK(popup_show_count == notices);
+    advance_us(REPEATING_MODE_RETRY_INTERVAL_US + 1000000);
+    expect_state(cfg_mode == ONCE ? "idle" : "managed");
+    CHECK(sent_count == 0);
+
+    if (cfg_mode == ONCE) {
+        // A blocked manual start keeps its own notice and skips cleanup traffic.
+        toggle();
+        expect_state("idle");
+        CHECK(popup_show_count == notices + 1);
+        CHECK(strcmp(popup_text, "ⓘ Once: utility mode blocked start") == 0);
+        advance_us(PRECONDITION_RETRY_US + 1000000);
+        CHECK(sent_count == 0);
+    }
+
+    // After a power cycle, ordinary starts and user-requested stops still burst.
+    car_power(false);
+    CHECK(!platform.car_in_utility);
+    CHECK(!(precon_blockers & PRECONDITION_BLOCK_UTILITY_MODE));
+    car_power(true);
+    if (cfg_mode == PERSISTENT) {
+        advance_until_state("start-burst", PRECONDITION_CAR_START_DELAY_US + 1000000);
+    } else {
+        toggle();
+    }
+    for (int i = 0; i < 6; i++) tick1();
+    CHECK(sent_count == 6);
+    check_start_burst_msgs(0);
+    fake_now += 2000000;
+    toggle();
+    expect_state("stop-burst");
+    sent_count = 0;
+    for (int i = 0; i < 6; i++) tick1();
+    CHECK(sent_count == 6);
+    check_stop_burst_msgs(0);
+}
+
 // ---- suite table ----
 // each suite runs in its own forked process: the config snapshot, repeating
 // latch, fake NVS, and platform discovery flags all live in process statics
@@ -1583,6 +1669,9 @@ static const suite_t suites[] = {
     {"precondition persistent write retry", PERSISTENT, PRESS_SHORT, run_persistent_write_retry},
     {"precondition persistent write retry limit", PERSISTENT, PRESS_SHORT, run_persistent_write_retry_limit},
     {"precondition once ignores stored latch", ONCE, PRESS_SHORT, run_once_ignores_stored_latch},
+    {"precondition once utility mode", ONCE, PRESS_SHORT, run_utility_mode},
+    {"precondition continuous utility mode", CONTINUOUS, PRESS_SHORT, run_utility_mode},
+    {"precondition persistent utility mode", PERSISTENT, PRESS_SHORT, run_utility_mode},
 };
 #define NUM_SUITES (sizeof(suites) / sizeof(suites[0]))
 
