@@ -205,6 +205,28 @@ static bool activation_is_release(const message_payload_t *msg, const twai_messa
 #define CONDITIONING_MODE_PHASE2_TICKS 3U // E007 message
 #define CONDITIONING_MODE_TICKS (CONDITIONING_MODE_PHASE1_TICKS + CONDITIONING_MODE_PHASE2_TICKS)
 
+// The car broadcasts its conditioning mode on 0x25D every 200 ms (median 200,
+// max 211 in the M-CAN MITM captures), so a charge-limit write is answered by
+// waiting for a reading rather than firing blind.
+#define CONDITIONING_MODE_REPLY_PERIOD_TICKS 5U
+
+// A reading taken this soon after the write may still be the pre-write mode: the
+// BMU takes 194-334 ms to act on a charge-limit write (measured from its 0x1F9
+// echo), and one full enable message the head unit may send itself is 240 ms.
+// Readings inside the floor are ignored.
+#define CONDITIONING_MODE_HOLD_OFF_TICKS (2U * CONDITIONING_MODE_TICKS)
+
+// Decide this long after the write: the floor, plus two broadcast periods for a
+// reading that post-dates the BMU's action to arrive (the MITM captures' p99
+// period is 331 ms, and one dropped beat is common). Nothing usable by then
+// still means the mode has to be enabled, so a miss only costs one extra burst.
+#define CONDITIONING_MODE_REPLY_TIMEOUT_TICKS \
+    (CONDITIONING_MODE_HOLD_OFF_TICKS + 2U * CONDITIONING_MODE_REPLY_PERIOD_TICKS)
+
+// Ticks at the tail of the wait whose 0x25D readings are trusted to decide.
+#define CONDITIONING_MODE_DECISION_TICKS \
+    (CONDITIONING_MODE_REPLY_TIMEOUT_TICKS - CONDITIONING_MODE_HOLD_OFF_TICKS)
+
 #define IS_CONDITIONING_MODE_FRAME(frame_id) ((frame_id) == CONDITIONING_MODE_FRAME_ID)
 
 // Head-unit charge-limit command. D5 (data[4]) = AC raw, D6 (data[5]) = DC raw,
@@ -393,15 +415,23 @@ static struct {
     bool long_press_fired;
 } button;
 
-// Writing a charge limit clears the car's latched conditioning mode, so any
-// head-unit charge-limit frame is answered with the documented enable burst.
-// Armed by the rx hook, sequenced one frame per tick by charge_limit_watch_tick.
-// Both run inside state machine dispatch, which is lock-serialized, so no mutex
-// is needed. Platform state, not session state: the mode must come back whether
-// or not preconditioning is currently requested.
+// Writing a charge limit clears the car's latched conditioning mode, so a
+// charge-limit write waits for the car's next 0x25D reading and enables the mode
+// only if it is not already on: whenever the write came from the EV settings the
+// head unit enables it itself, and re-asserting on top of that would put two
+// enable bursts on the bus at once. Armed and decided by the rx hook, sequenced
+// one frame per tick by charge_limit_watch_tick. All of it runs inside state
+// machine dispatch, which is lock-serialized, so no mutex is needed. Platform
+// state, not session state: the mode must come back whether or not
+// preconditioning is currently requested.
 static struct {
+    // ticks left of the reply wait; 0 = decide now. See
+    // CONDITIONING_MODE_REPLY_TIMEOUT_TICKS
+    uint32_t wait;
     // frames still owed in the enable burst; 0 = idle
     uint32_t remaining;
+    // did the newest trusted reading report the mode as already enabled?
+    bool reply_enabled;
 } charge_limit_watch;
 
 // Is this the head unit writing a charge limit? The head unit addresses AC (D5)
@@ -416,6 +446,13 @@ static bool charge_limit_values_sent(const twai_message_t *f) {
     }
     return f->data[CHARGE_LIMIT_AC_INDEX] != CHARGE_LIMIT_UNSET
         || f->data[CHARGE_LIMIT_DC_INDEX] != CHARGE_LIMIT_UNSET;
+}
+
+// May a 0x25D reading decide the pending re-assertion? Only inside the decision
+// window: an earlier frame may still carry the mode from before the write.
+static bool conditioning_mode_reading_decides(void) {
+    return charge_limit_watch.remaining != 0U
+        && charge_limit_watch.wait <= CONDITIONING_MODE_DECISION_TICKS;
 }
 
 static QueueHandle_t battery_temperature_queue = NULL;
@@ -1302,15 +1339,25 @@ static const sm_state_t S_WAIT_STOPPED = {
 
 static void push_precondition_state(void);
 
-// Re-assert battery conditioning mode after a head-unit charge-limit change:
-// one 0x0C7 frame per tick, so the burst keeps the documented 25 Hz spacing.
-// Only the start and stop bursts send 0x0C7 from the per-state walk, so
-// deferring to them (and resuming afterwards) is enough to keep two frames from
-// landing in the same 40 ms slot.
+// Answer a head-unit charge-limit write once its reply wait expires: stay silent
+// while the wait runs, then enable the mode unless the wait's trusted reading
+// says the car already has it on. The burst is one 0x0C7 frame per tick, so it
+// keeps the documented 25 Hz spacing. Only the start and stop bursts send 0x0C7
+// from the per-state walk, so deferring to them (and resuming afterwards) is
+// enough to keep two frames from landing in the same 40 ms slot.
 static void charge_limit_watch_tick(sm_t *sm) {
     if (charge_limit_watch.remaining == 0U
             || sm_in(sm, &S_START_BURST)
             || sm_in(sm, &S_STOP_BURST)) {
+        return;
+    }
+    if (charge_limit_watch.wait > 0U) {
+        charge_limit_watch.wait--;
+        return;
+    }
+    if (charge_limit_watch.reply_enabled) {
+        charge_limit_watch.remaining = 0U;
+        ESP_LOGI(TAG, "conditioning mode is already on; not re-asserting");
         return;
     }
     send_conditioning_mode_enable_msg(CONDITIONING_MODE_TICKS - charge_limit_watch.remaining);
@@ -1424,21 +1471,31 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
         platform.conditioning_mode =
             (to_push->data[CONDITIONING_MODE_INDEX] & CONDITIONING_MODE_ENABLED_MASK) != 0U
             ? CONDITIONING_MODE_ENABLED : CONDITIONING_MODE_DISABLED;
+        // A pending charge-limit re-assertion decides on the newest reading from
+        // its decision window, so a later reading inside the window overrides an
+        // earlier one.
+        if (conditioning_mode_reading_decides()) {
+            charge_limit_watch.reply_enabled =
+                platform.conditioning_mode == CONDITIONING_MODE_ENABLED;
+        }
     }
 
-    // A head-unit charge-limit write clears the car's conditioning mode, so
-    // answer it with the enable burst. 0x4C5 is the head unit's command and only
-    // ever arrives on the head-unit bus. The 0x25D reading is deliberately not
-    // consulted: it is a 200 ms broadcast, so it still reports the pre-change
-    // mode for up to a frame period after the clear.
+    // A head-unit charge-limit write clears the car's conditioning mode, so wait
+    // for the car to report what the write left behind and enable the mode only
+    // if it is off: 0x4C5 is the head unit's command and only ever arrives on the
+    // head-unit bus. Waiting also covers the head unit enabling the mode itself,
+    // which it does for changes made through the EV settings.
     if (rx_bus == HEAD_UNIT_BUS && charge_limit_values_sent(to_push)) {
-        // Re-arm only when no burst is owed: the head unit repeats every write
-        // three times, and restarting on each repeat would smear the documented
-        // F007 x3 / E007 x3 shape.
+        // Every write frame restarts the reply wait: the head unit repeats each
+        // write three times, and a later write needs its own window. The burst
+        // itself is armed once and never restarted, because restarting would
+        // smear the documented F007 x3 / E007 x3 shape.
+        charge_limit_watch.wait = CONDITIONING_MODE_REPLY_TIMEOUT_TICKS;
+        charge_limit_watch.reply_enabled = false;
         if (charge_limit_watch.remaining == 0U) {
             charge_limit_watch.remaining = CONDITIONING_MODE_TICKS;
         }
-        ESP_LOGI(TAG, "head unit wrote a charge limit; re-asserting conditioning mode");
+        ESP_LOGI(TAG, "head unit wrote a charge limit; awaiting conditioning mode reply");
     }
 
     int8_t precon_button_type = precon_config.button_type;

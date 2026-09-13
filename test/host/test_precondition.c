@@ -179,9 +179,9 @@ static void advance_until_state(const char *name, int64_t max_us) {
     expect_state(name);
 }
 
-// A head-unit charge-limit change as it appears on the wire: three identical
+// A head-unit charge-limit write as it appears on the wire: three identical
 // value frames at 25 Hz, then three all-0xFF rest frames, one frame per tick.
-static void head_unit_charge_limit_change(uint8_t ac_raw, uint8_t dc_raw) {
+static void head_unit_charge_limit_write(uint8_t ac_raw, uint8_t dc_raw) {
     for (int i = 0; i < 3; i++) {
         head_unit_charge_limit(ac_raw, dc_raw, CAN_BUS_1);
         tick1();
@@ -740,25 +740,40 @@ static void run_conditioning_mode_check(void) {
     expect_state("idle");
 }
 
-// A head-unit charge-limit change clears the car's conditioning mode, so the
-// firmware re-asserts it with the 0x0C7 enable burst, one frame per tick.
+// Writing a charge limit clears the car's conditioning mode, so the firmware
+// re-asserts it with the 0x0C7 enable burst. The re-assertion waits out the
+// hold-off first (the head unit sometimes sends the same enable message itself
+// after a write), then emits one frame per tick.
+// Writing a charge limit clears the car's conditioning mode. The firmware waits
+// out the reply floor for the car's next 0x25D reading, decides on that reading,
+// and only then sends the 0x0C7 enable burst, one frame per tick.
 static void run_charge_limit_reassert(void) {
     precondition_init();
     expect_state("idle");
     sent_count = 0;
 
-    // The all-0xFF rest frames that pad every change are not modifications.
+    // The all-0xFF rest frames that pad every write carry no value, so they arm
+    // nothing at all.
     for (int i = 0; i < 3; i++) {
         head_unit_charge_limit_rest();
         tick1();
     }
-    CHECK(sent_count == 0);
+    CHECK(charge_limit_watch.wait == 0U);
     CHECK(charge_limit_watch.remaining == 0U);
+    advance_us((int64_t)(CONDITIONING_MODE_REPLY_TIMEOUT_TICKS
+                         + CONDITIONING_MODE_TICKS) * 40000);
+    CHECK(sent_count == 0);
 
-    // A value-bearing command on the head-unit bus arms the burst, which then
-    // emits exactly one frame per tick.
+    // A value-bearing command arms the re-assertion: silent for the whole reply
+    // wait, then one frame per tick.
     head_unit_charge_limit(0xA0, 0xFF, CAN_BUS_1);          // AC 80%
+    CHECK(charge_limit_watch.wait == CONDITIONING_MODE_REPLY_TIMEOUT_TICKS);
     CHECK(charge_limit_watch.remaining == CONDITIONING_MODE_TICKS);
+    for (int i = 0; i < (int)CONDITIONING_MODE_REPLY_TIMEOUT_TICKS; i++) {
+        tick1();
+    }
+    CHECK(sent_count == 0);
+    CHECK(charge_limit_watch.wait == 0U);
     for (int i = 0; i < (int)CONDITIONING_MODE_TICKS; i++) {
         CHECK(sent_count == i);
         tick1();
@@ -767,23 +782,77 @@ static void run_charge_limit_reassert(void) {
     check_conditioning_mode_burst_msgs(0);
     CHECK(charge_limit_watch.remaining == 0U);
 
-    // A full wire event: the repeated value and the all-0xFF rest frames at its
-    // tail must neither restart the burst nor count as another modification.
+    // A reading from before the floor expired is still the pre-write mode: the
+    // BMU takes 194-334 ms to act on a write, so it must not suppress the burst.
     sent_count = 0;
-    head_unit_charge_limit_change(0xB4, 0xFF);              // AC 90%
+    head_unit_charge_limit(0xA0, 0xFF, CAN_BUS_1);
+    conditioning_mode(0x80);                                // "enabled" too early
+    CHECK(!charge_limit_watch.reply_enabled);
+    advance_us((int64_t)(CONDITIONING_MODE_REPLY_TIMEOUT_TICKS
+                         + CONDITIONING_MODE_TICKS) * 40000);
+    CHECK(sent_count == (int)CONDITIONING_MODE_TICKS);
+    check_conditioning_mode_burst_msgs(0);
+
+    // A reading inside the decision window is trusted: the head unit enabled the
+    // mode itself, so nothing is sent. It is taken a full broadcast period after
+    // the floor, where a real reply lands, so the window has to actually be wide
+    // enough to catch it.
+    sent_count = 0;
+    head_unit_charge_limit(0xA0, 0xFF, CAN_BUS_1);
+    advance_us((int64_t)(CONDITIONING_MODE_HOLD_OFF_TICKS
+                         + CONDITIONING_MODE_REPLY_PERIOD_TICKS) * 40000);
+    CHECK(charge_limit_watch.wait > 0U);
+    CHECK(charge_limit_watch.wait <= CONDITIONING_MODE_DECISION_TICKS);
+    conditioning_mode(0x80);                                // enabled, in the window
+    CHECK(charge_limit_watch.reply_enabled);
+    advance_us((int64_t)(CONDITIONING_MODE_DECISION_TICKS
+                         + CONDITIONING_MODE_TICKS) * 40000);
+    CHECK(sent_count == 0);
+    CHECK(charge_limit_watch.remaining == 0U);
+
+    // A window reading that reports the mode off means the write did clear it,
+    // and the newest window reading wins over an earlier one.
+    sent_count = 0;
+    head_unit_charge_limit(0xA0, 0xFF, CAN_BUS_1);
+    advance_us((int64_t)CONDITIONING_MODE_HOLD_OFF_TICKS * 40000);
+    conditioning_mode(0x80);                                // enabled...
+    CHECK(charge_limit_watch.reply_enabled);
+    conditioning_mode(0x40);                                // ...then off again
+    CHECK(!charge_limit_watch.reply_enabled);
+    advance_us((int64_t)(CONDITIONING_MODE_DECISION_TICKS
+                         + CONDITIONING_MODE_TICKS) * 40000);
+    CHECK(sent_count == (int)CONDITIONING_MODE_TICKS);
+    check_conditioning_mode_burst_msgs(0);
+
+    // A full wire event: its six frames all land inside the wait it starts, and
+    // its repeats and all-0xFF rest frames must not restart the burst, so the
+    // burst keeps the documented F007 x3 / E007 x3 shape
+    // (check_conditioning_mode_burst_msgs asserts the exact payloads).
+    sent_count = 0;
+    head_unit_charge_limit_write(0xB4, 0xFF);               // AC 90%
+    CHECK(sent_count == 0);                                 // still waiting
+    CHECK(charge_limit_watch.remaining == CONDITIONING_MODE_TICKS);
+    advance_us((int64_t)(CONDITIONING_MODE_REPLY_TIMEOUT_TICKS
+                         + CONDITIONING_MODE_TICKS) * 40000);
     CHECK(sent_count == (int)CONDITIONING_MODE_TICKS);
     check_conditioning_mode_burst_msgs(0);
     CHECK(charge_limit_watch.remaining == 0U);
 
-    // The same unchanged limit commanded again later is not a modification.
+    // Re-sending the limit the car already has is still a write, and the write
+    // is what clears the mode, so it re-arms the re-assertion.
     sent_count = 0;
-    head_unit_charge_limit_change(0xB4, 0xFF);
-    CHECK(sent_count == 0);
+    head_unit_charge_limit_write(0xB4, 0xFF);
+    advance_us((int64_t)(CONDITIONING_MODE_REPLY_TIMEOUT_TICKS
+                         + CONDITIONING_MODE_TICKS) * 40000);
+    CHECK(sent_count == (int)CONDITIONING_MODE_TICKS);
+    check_conditioning_mode_burst_msgs(0);
     CHECK(charge_limit_watch.remaining == 0U);
 
-    // A DC-only command after an AC-only one is a modification.
+    // A DC-only write counts the same as an AC-only one.
     sent_count = 0;
-    head_unit_charge_limit_change(0xFF, 0xA0);              // DC 80%
+    head_unit_charge_limit_write(0xFF, 0xA0);               // DC 80%
+    advance_us((int64_t)(CONDITIONING_MODE_REPLY_TIMEOUT_TICKS
+                         + CONDITIONING_MODE_TICKS) * 40000);
     CHECK(sent_count == (int)CONDITIONING_MODE_TICKS);
     check_conditioning_mode_burst_msgs(0);
 
@@ -795,27 +864,53 @@ static void run_charge_limit_reassert(void) {
     memset(short_frame, 0xFF, sizeof(short_frame));
     short_frame[4] = 0xC8;
     rx_frame_len(0x4C5, short_frame, 5, CAN_BUS_1);
-    for (int i = 0; i < 4; i++) tick1();
+    advance_us((int64_t)(CONDITIONING_MODE_REPLY_TIMEOUT_TICKS
+                         + CONDITIONING_MODE_TICKS) * 40000);
     CHECK(sent_count == 0);
     CHECK(charge_limit_watch.remaining == 0U);
 
-    // A change landing mid start-burst defers to it rather than putting two
-    // 0x0C7 frames in one tick, then goes out once the burst is done.
+    // A write landing mid start-burst defers to it rather than putting two
+    // 0xC7 frames in one tick, and its wait only starts once the start burst is
+    // out of the way. The mode is on again so the start burst is a bare one.
+    conditioning_mode(0x80);
     sent_count = 0;
     toggle();
     expect_state("start-burst");
     tick1();
     CHECK(sent_count == 1);
     head_unit_charge_limit(0xC8, 0xFF, CAN_BUS_1);
+    CHECK(charge_limit_watch.wait == CONDITIONING_MODE_REPLY_TIMEOUT_TICKS);
     CHECK(charge_limit_watch.remaining == CONDITIONING_MODE_TICKS);
     for (int i = 1; i < (int)PRECONDITION_START_TICKS; i++) tick1();
     CHECK(sent_count == (int)PRECONDITION_START_TICKS);
     check_start_burst_msgs(0);
     expect_state("wait-starting");
-    CHECK(charge_limit_watch.remaining == CONDITIONING_MODE_TICKS);
+    CHECK(charge_limit_watch.wait == CONDITIONING_MODE_REPLY_TIMEOUT_TICKS);
+    for (int i = 0; i < (int)CONDITIONING_MODE_REPLY_TIMEOUT_TICKS; i++) tick1();
+    CHECK(sent_count == (int)PRECONDITION_START_TICKS);
     for (int i = 0; i < (int)CONDITIONING_MODE_TICKS; i++) tick1();
     CHECK(sent_count == (int)(PRECONDITION_START_TICKS + CONDITIONING_MODE_TICKS));
     check_conditioning_mode_burst_msgs((int)PRECONDITION_START_TICKS);
+    CHECK(charge_limit_watch.remaining == 0U);
+
+    // A write that lands while the re-assertion is in flight restarts the wait,
+    // so the burst cannot race the head unit's own message, but does not restart
+    // the burst: the six frames stay in the documented order.
+    sent_count = 0;
+    head_unit_charge_limit(0xA0, 0xFF, CAN_BUS_1);
+    advance_us((int64_t)CONDITIONING_MODE_REPLY_TIMEOUT_TICKS * 40000);
+    CHECK(sent_count == 0);
+    tick1();
+    tick1();                                                // two frames are out
+    CHECK(sent_count == 2);
+    head_unit_charge_limit(0x8C, 0xFF, CAN_BUS_1);          // overlapping write
+    CHECK(charge_limit_watch.wait == CONDITIONING_MODE_REPLY_TIMEOUT_TICKS);
+    CHECK(charge_limit_watch.remaining == CONDITIONING_MODE_TICKS - 2U);
+    advance_us((int64_t)CONDITIONING_MODE_REPLY_TIMEOUT_TICKS * 40000);
+    CHECK(sent_count == 2);                                 // paused, not restarted
+    for (int i = 0; i < (int)CONDITIONING_MODE_TICKS; i++) tick1();
+    CHECK(sent_count == (int)CONDITIONING_MODE_TICKS);
+    check_conditioning_mode_burst_msgs(0);
     CHECK(charge_limit_watch.remaining == 0U);
 }
 
