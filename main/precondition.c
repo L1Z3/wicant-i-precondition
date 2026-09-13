@@ -154,6 +154,9 @@ static bool activation_is_release(const message_payload_t *msg, const twai_messa
 #define IS_POWER_STATUS_FRAME(frame_id) \
     ((frame_id) == 0x038U)
 
+#define IS_BMU_CONTROL_FRAME(frame_id) \
+    ((frame_id) == 0x0C7U)
+
 // TODO(ejones): unclear if this mask/value is necessary and sufficient
 #define POWER_STATUS_MASK 0x0FU
 #define POWER_STATUS_READY(power_status_byte) \
@@ -231,6 +234,7 @@ enum {
     EV_CAR_NOT_READY,   // car power left READY (0x038 edge)
     EV_TEMPERATURE_FRAME, // valid battery temperature sample received
     EV_SOC_BECAME_LOW,  // HV battery SoC crossed below the start cutoff
+    EV_UTILITY_MODE,    // car entered utility mode
 };
 
 static const sm_state_t S_IDLE, S_REQUESTED, S_CAR_START_DELAY, S_START_BURST,
@@ -272,6 +276,7 @@ typedef enum {
     STOP_REASON_LOW_SOC,
     STOP_REASON_START_BLOCKED,
     STOP_REASON_RETRIES_EXHAUSTED,
+    STOP_REASON_UTILITY_MODE,
 } stop_reason_t;
 
 typedef uint8_t precondition_blockers_t;
@@ -326,6 +331,7 @@ static struct {
     // is the car in READY? tracked from 0x038 edges; stays false on platforms
     // where that frame is unavailable
     bool car_in_ready;
+    bool car_in_utility;
 } platform;
 
 static bool precon_status_available(void) {
@@ -573,6 +579,8 @@ static void show_stopping_notice(stop_reason_t reason) {
         case STOP_REASON_RETRIES_EXHAUSTED:
             track_popup_show_error("Once: start failed (out of retries)");
             break;
+        case STOP_REASON_UTILITY_MODE:
+            track_popup_show_info("Once: utility mode stopped precon.")
     }
 }
 
@@ -786,11 +794,15 @@ static fwd_result_t requested_fwd(sm_t *sm, twai_message_t *to_send, can_bus_t f
         return FWD_PASSTHROUGH;
     }
     // block 0x0C7 so that the head unit doesn't turn off preconditioning on us
-    // TODO(ejones): handle utility mode and test
+    // TODO(ejones): handle utility mode and test (trh: solved?)
     // (mitm 00 00 on bytes 4 and 5 to E0 07 (allows utility mode (byte 3, 80) to go through))
-    if (to_send->identifier == 0x0C7U) {
+    // let all utility mode rising and falling edge messages through
+    if (platform.car_in_utility) {
+        return FWD_PASSTHROUGH;
+    } else {
         return FWD_BLOCK;
     }
+
     // MITM 0x4ED while preconditioning is requested
     if (to_send->identifier == 0x4EDU) {
         to_send->data[5] = 0x10U;
@@ -1232,6 +1244,24 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
             platform.car_in_ready = ready;
             ESP_LOGI(TAG, "car power: %s", ready ? "ready" : "off");
             sm_send_event(sm, ready ? EV_CAR_READY : EV_CAR_NOT_READY);
+            // definitely out of utility mode if the car power changes
+            // probably there's a value here corresponding to utility mode
+            // let's find it later
+            platform.car_in_utility = false; 
+        }
+    }
+
+    // utility mode
+    if (IS_BMU_CONTROL_FRAME(to_push->identifier) && (to_push->data[2] == 0x80U && to_push->data[3] == 0xE0U && to_push->data[4] == 0x07U)) {
+        sm_send_event(sm, EV_UTILITY_MODE);
+        platform.car_in_utility = true; 
+        // utility mode requested
+        if (precon_config.mode == ONCE) {
+            // tell the user utility mode canceled preconditioning
+            sm_transition_arg(sm, &S_IDLE, STOP_REASON_UTILITY_MODE);
+        } else {
+            // this seems pretty safe?
+            sm_transition(sm, &S_MANAGED);
         }
     }
 
