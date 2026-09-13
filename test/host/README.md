@@ -22,7 +22,7 @@ test/host/
     can.h  config_server.h  esp_log.h  esp_timer.h  nvs.h
     driver/twai.h  freertos/FreeRTOS.h  freertos/queue.h  freertos/task.h
   test_hsm.c            state machine engine semantics
-  test_precondition.c   precondition features
+  test_precondition.c   precondition features (built for two bus counts)
 ```
 
 ## How it works
@@ -37,6 +37,17 @@ tests against it.
 
 Each `test_*.c` is one self-contained test program: it must run everything it
 covers and exit 0 on success, non-zero on failure.
+
+`test_precondition.c` is the exception to one-binary-per-source: `precondition.c`
+picks the head-unit bus from `CAN_BUS_COUNT` (on a single-bus board
+`HEAD_UNIT_BUS` falls back to `CAN_BUS_0`), so the suite is built twice —
+`build/test_precondition` for the two-bus custom board and
+`build/test_precondition_1bus` with `-DCAN_BUS_COUNT=1` for the v300 board — and
+both run under `make`. Each build passes its configuration as
+`-DEXPECT_CAN_BUS_COUNT=<n>` and `run_suite()` asserts it, because the suite is
+self-consistent under either value: without that marker a stub or flag
+regression could run the same configuration twice and leave the single-bus
+branches uncovered.
 
 ## Adding a test
 
@@ -55,7 +66,11 @@ covers and exit 0 on success, non-zero on failure.
    constants mirrored from real headers must stay in sync (see
    `stubs/config_server.h`). Stubs shared by several tests live in `stubs/`;
    fakes specific to one test (like the recording `can_send`) live in that
-   test file.
+   test file. `stubs/can.h` supplies `CAN_BUS_COUNT` (2, under `#ifndef`)
+   because the real header takes it from `hw_config.h`; leave it undefined and
+   `#if CAN_BUS_COUNT > 1` silently compiles the single-bus side. A test needing
+   the other configuration needs its own explicit rule, as
+   `build/test_precondition_1bus` has.
 
 ## Quirks worth knowing
 
