@@ -204,7 +204,11 @@ static bool is_utility_request(const twai_message_t *frame) {
 #define IS_BATTERY_SOC_FRAME(frame_id) ((frame_id) == BATTERY_SOC_FRAME_ID)
 
 #define CAR_BUS CAN_BUS_0
+#if CAN_BUS_COUNT > 1
 #define HEAD_UNIT_BUS CAN_BUS_1
+#else
+#define HEAD_UNIT_BUS CAN_BUS_0
+#endif
 
 #define SECONDS_UNTIL_START(elapsed) \
     (((elapsed) >= PRECONDITION_STARTED_TIMEOUT_US) ? 0U : \
