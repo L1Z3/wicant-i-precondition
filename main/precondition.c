@@ -191,8 +191,62 @@ static bool activation_is_release(const message_payload_t *msg, const twai_messa
 
 #define IS_BATTERY_SOC_FRAME(frame_id) ((frame_id) == BATTERY_SOC_FRAME_ID)
 
+// Battery conditioning mode is a latched vehicle setting. The car broadcasts
+// it on 0x25D D6 bit 7, so the check needs no probe: 0x80 = enabled,
+// 0x40 = disabled
+#define CONDITIONING_MODE_FRAME_ID 0x25DU
+#define CONDITIONING_MODE_INDEX 5U
+#define CONDITIONING_MODE_DATA_LENGTH 6U
+#define CONDITIONING_MODE_ENABLED_MASK 0x80U
+
+// Enabling the mode is a 0x0C7 command pair, the same shape and cadence as the
+// preconditioning start burst.
+#define CONDITIONING_MODE_PHASE1_TICKS 3U // F007 message
+#define CONDITIONING_MODE_PHASE2_TICKS 3U // E007 message
+#define CONDITIONING_MODE_TICKS (CONDITIONING_MODE_PHASE1_TICKS + CONDITIONING_MODE_PHASE2_TICKS)
+
+// The car broadcasts its conditioning mode on 0x25D every 200 ms (median 200,
+// max 211 in the M-CAN MITM captures), so a charge-limit write is answered by
+// waiting for a reading rather than firing blind.
+#define CONDITIONING_MODE_REPLY_PERIOD_TICKS 5U
+
+// A reading taken this soon after the write may still be the pre-write mode: the
+// BMU takes 194-334 ms to act on a charge-limit write (measured from its 0x1F9
+// echo), and one full enable message the head unit may send itself is 240 ms.
+// Readings inside the floor are ignored.
+#define CONDITIONING_MODE_HOLD_OFF_TICKS (2U * CONDITIONING_MODE_TICKS)
+
+// Decide this long after the write: the floor, plus two broadcast periods for a
+// reading that post-dates the BMU's action to arrive (the MITM captures' p99
+// period is 331 ms, and one dropped beat is common). Nothing usable by then
+// still means the mode has to be enabled, so a miss only costs one extra burst.
+#define CONDITIONING_MODE_REPLY_TIMEOUT_TICKS \
+    (CONDITIONING_MODE_HOLD_OFF_TICKS + 2U * CONDITIONING_MODE_REPLY_PERIOD_TICKS)
+
+// Ticks at the tail of the wait whose 0x25D readings are trusted to decide.
+#define CONDITIONING_MODE_DECISION_TICKS \
+    (CONDITIONING_MODE_REPLY_TIMEOUT_TICKS - CONDITIONING_MODE_HOLD_OFF_TICKS)
+
+#define IS_CONDITIONING_MODE_FRAME(frame_id) ((frame_id) == CONDITIONING_MODE_FRAME_ID)
+
+// Head-unit charge-limit command. D5 (data[4]) = AC raw, D6 (data[5]) = DC raw,
+// percent * 2; a field the frame does not address reads 0xFF. The head unit
+// addresses AC and DC in separate commands, repeats each value three times at
+// 25 Hz, then sends three all-0xFF rest frames (M-CAN charge-limit logs).
+#define CHARGE_LIMIT_FRAME_ID 0x4C5U
+#define CHARGE_LIMIT_AC_INDEX 4U
+#define CHARGE_LIMIT_DC_INDEX 5U
+#define CHARGE_LIMIT_DATA_LENGTH 6U
+#define CHARGE_LIMIT_UNSET 0xFFU
+
+#define IS_CHARGE_LIMIT_FRAME(frame_id) ((frame_id) == CHARGE_LIMIT_FRAME_ID)
+
 #define CAR_BUS CAN_BUS_0
+#if CAN_BUS_COUNT > 1
 #define HEAD_UNIT_BUS CAN_BUS_1
+#else
+#define HEAD_UNIT_BUS CAN_BUS_0
+#endif
 
 #define SECONDS_UNTIL_START(elapsed) \
     (((elapsed) >= PRECONDITION_STARTED_TIMEOUT_US) ? 0U : \
@@ -220,7 +274,9 @@ static int64_t ts_elapsed(int64_t now, int64_t old) {
 // +- STOP_BURST (initial)    Sends the stop command sequence.
 // +- WAIT_STOPPED            Waits for the car to confirm that it stopped.
 //
-// Global hooks decode input and status frames independently of the active state.
+// Global hooks decode input and status frames independently of the active state,
+// and re-assert battery conditioning mode when the head unit writes a charge
+// limit (which clears it).
 
 enum {
     EV_TOGGLE,          // activation input fired (short press release / long press hold)
@@ -253,6 +309,13 @@ typedef enum {
     PRECON_STATUS_STARTED,
 } precon_status_t;
 
+// Battery conditioning mode as most recently reported by the car on 0x25D.
+typedef enum {
+    CONDITIONING_MODE_UNKNOWN = 0, // no 0x25D seen yet
+    CONDITIONING_MODE_DISABLED,
+    CONDITIONING_MODE_ENABLED,
+} conditioning_mode_t;
+
 // why the current start attempt was launched. MANUAL must be zero: it is the
 // entry argument plain sm_transition supplies
 typedef enum {
@@ -270,6 +333,7 @@ typedef enum {
     STOP_REASON_UNEXPECTED_IDLE,
     STOP_REASON_TEMPERATURE_REACHED,
     STOP_REASON_LOW_SOC,
+    STOP_REASON_CONDITIONING_MODE_OFF,
     STOP_REASON_START_BLOCKED,
     STOP_REASON_RETRIES_EXHAUSTED,
 } stop_reason_t;
@@ -279,9 +343,21 @@ typedef uint8_t precondition_blockers_t;
 enum {
     PRECONDITION_BLOCK_NONE = 0U,
     // Higher bits have higher display and stop-reason priority.
-    PRECONDITION_BLOCK_BATTERY_WARM = 1U << 0,
-    PRECONDITION_BLOCK_BATTERY_LOW_SOC = 1U << 1,
+    // The car's conditioning mode being off only ranks above nothing: the
+    // firmware turns it back on itself (see PRECONDITION_BLOCK_ABORTS), so a
+    // car-imposed condition is the more useful thing to report.
+    PRECONDITION_BLOCK_CONDITIONING_MODE_OFF = 1U << 0,
+    PRECONDITION_BLOCK_BATTERY_WARM = 1U << 1,
+    PRECONDITION_BLOCK_BATTERY_LOW_SOC = 1U << 2,
 };
+
+// Blockers that stop a start attempt outright. Conditioning mode off is absent
+// on purpose: the start burst turns the mode back on before its first start
+// frame, so aborting on it would make that fix unreachable and leave the mode
+// off for good. It is still ranked and reported, which is what names the failure
+// when the mode never comes back.
+#define PRECONDITION_BLOCK_ABORTS \
+    (PRECONDITION_BLOCK_BATTERY_WARM | PRECONDITION_BLOCK_BATTERY_LOW_SOC)
 
 // owned by IDLE
 static struct {
@@ -300,6 +376,10 @@ static struct {
     int64_t last_attempt_ts;
     // number of times we've re-sent the start burst within the current request
     uint8_t retries;
+    // does this attempt have to turn battery conditioning mode on before the
+    // start command? latched on entry to START_BURST so the car's own reply to
+    // the enable burst cannot cut that burst short
+    bool conditioning_mode_first;
 } requested;
 
 // owned by MANAGED: scheduling for periodic start bursts while a repeating
@@ -326,10 +406,20 @@ static struct {
     // is the car in READY? tracked from 0x038 edges; stays false on platforms
     // where that frame is unavailable
     bool car_in_ready;
+    // most recent battery conditioning mode reported by the car
+    conditioning_mode_t conditioning_mode;
 } platform;
 
 static bool precon_status_available(void) {
     return platform.precon_status != PRECON_STATUS_UNKNOWN;
+}
+
+// Does a start attempt have to turn battery conditioning mode on first? Only a
+// confirmed "enabled" reading skips the enable burst: with no 0x25D yet (or a
+// platform that never broadcasts one) it is sent anyway, since the command is
+// idempotent and preconditioning depends on the mode being on.
+static bool conditioning_mode_enable_needed(void) {
+    return platform.conditioning_mode != CONDITIONING_MODE_ENABLED;
 }
 
 // activation button edge tracking, owned by the global hooks
@@ -341,6 +431,46 @@ static struct {
     // has the current hold already triggered? (long press mode fires once per hold)
     bool long_press_fired;
 } button;
+
+// Writing a charge limit clears the car's latched conditioning mode, so a
+// charge-limit write waits for the car's next 0x25D reading and enables the mode
+// only if it is not already on: whenever the write came from the EV settings the
+// head unit enables it itself, and re-asserting on top of that would put two
+// enable bursts on the bus at once. Armed and decided by the rx hook, sequenced
+// one frame per tick by charge_limit_watch_tick. All of it runs inside state
+// machine dispatch, which is lock-serialized, so no mutex is needed. Platform
+// state, not session state: the mode must come back whether or not
+// preconditioning is currently requested.
+static struct {
+    // ticks left of the reply wait; 0 = decide now. See
+    // CONDITIONING_MODE_REPLY_TIMEOUT_TICKS
+    uint32_t wait;
+    // frames still owed in the enable burst; 0 = idle
+    uint32_t remaining;
+    // did the newest trusted reading report the mode as already enabled?
+    bool reply_enabled;
+} charge_limit_watch;
+
+// Is this the head unit writing a charge limit? The head unit addresses AC (D5)
+// and DC (D6) in separate commands and pads every write with all-0xFF rest
+// frames, so only a value-bearing frame counts. Every such frame is a write
+// worth answering, including one that re-sends the limit the car already has:
+// the write itself is what clears the car's conditioning mode.
+static bool charge_limit_values_sent(const twai_message_t *f) {
+    if (!IS_CHARGE_LIMIT_FRAME(f->identifier)
+            || f->data_length_code < CHARGE_LIMIT_DATA_LENGTH) {
+        return false;
+    }
+    return f->data[CHARGE_LIMIT_AC_INDEX] != CHARGE_LIMIT_UNSET
+        || f->data[CHARGE_LIMIT_DC_INDEX] != CHARGE_LIMIT_UNSET;
+}
+
+// May a 0x25D reading decide the pending re-assertion? Only inside the decision
+// window: an earlier frame may still carry the mode from before the write.
+static bool conditioning_mode_reading_decides(void) {
+    return charge_limit_watch.remaining != 0U
+        && charge_limit_watch.wait <= CONDITIONING_MODE_DECISION_TICKS;
+}
 
 static QueueHandle_t battery_temperature_queue = NULL;
 static QueueHandle_t battery_soc_queue = NULL;
@@ -526,6 +656,8 @@ static stop_reason_t once_stop_reason(void) {
             return STOP_REASON_LOW_SOC;
         case PRECONDITION_BLOCK_BATTERY_WARM:
             return STOP_REASON_TEMPERATURE_REACHED;
+        case PRECONDITION_BLOCK_CONDITIONING_MODE_OFF:
+            return STOP_REASON_CONDITIONING_MODE_OFF;
         default:
             return STOP_REASON_UNEXPECTED_IDLE;
     }
@@ -570,13 +702,40 @@ static void show_stopping_notice(stop_reason_t reason) {
         case STOP_REASON_START_BLOCKED:
             show_once_blocker_notice(primary_precon_blocker());
             break;
+        case STOP_REASON_CONDITIONING_MODE_OFF:
+            // The session ended and the car reports the mode off: the start
+            // burst's enable phase did not stick.
+            track_popup_show_warning("Once: stopping (conditioning mode off)");
+            break;
         case STOP_REASON_RETRIES_EXHAUSTED:
-            track_popup_show_error("Once: start failed (out of retries)");
+            // A mode that never came back is the likelier cause than the retry
+            // budget, so name it instead of blaming the retries.
+            if ((precon_blockers & PRECONDITION_BLOCK_CONDITIONING_MODE_OFF) != 0U) {
+                track_popup_show_error("Once: start failed (conditioning mode off)");
+            } else {
+                track_popup_show_error("Once: start failed (out of retries)");
+            }
             break;
     }
 }
 
 // ********************* CAN tx helpers *********************
+
+// burst_tick counts up from 0 within the burst
+static void send_conditioning_mode_enable_msg(uint32_t burst_tick) {
+    twai_message_t packet = {0};
+    packet.identifier = 0x0C7U;
+    packet.data_length_code = 8U;
+    if (burst_tick < CONDITIONING_MODE_PHASE1_TICKS) {
+        // send 000000F007000000 to 0x0C7
+        packet.data[3] = 0xF0U;
+    } else {
+        // send 000000E007000000 to 0x0C7
+        packet.data[3] = 0xE0U;
+    }
+    packet.data[4] = 0x07U;
+    can_send(CAR_BUS, &packet, 1);
+}
 
 // burst_tick counts up from 0 within the burst
 static void send_precondition_start_msg(uint32_t burst_tick) {
@@ -819,10 +978,12 @@ static void car_start_delay_tick(sm_t *sm) {
 
 // ********************* REQUESTED / START_BURST *********************
 
-// Abort an in-progress start attempt when precon is known to be blocked.
+// Abort an in-progress start attempt when precon is known to be blocked. The
+// conditioning-mode blocker is deliberately not one of these: the start burst
+// turns the mode back on, so aborting would make that unreachable.
 static bool abort_start_if_blocked(sm_t *sm) {
     precondition_blockers_t blocker = primary_precon_blocker();
-    if (blocker == PRECONDITION_BLOCK_NONE) {
+    if ((blocker & PRECONDITION_BLOCK_ABORTS) == PRECONDITION_BLOCK_NONE) {
         return false;
     }
 
@@ -851,6 +1012,10 @@ static bool abort_start_if_blocked(sm_t *sm) {
 // retry timers and the countdown display measure from the moment the burst began
 static void start_burst_enter(sm_t *sm) {
     requested.last_attempt_ts = sm_now(sm);
+    // Latch the conditioning-mode check for the whole burst: the car's reply to
+    // our own enable command flips 0x25D within one frame period, and that must
+    // not truncate the burst still in flight.
+    requested.conditioning_mode_first = conditioning_mode_enable_needed();
     abort_start_if_blocked(sm);
 }
 
@@ -859,6 +1024,16 @@ static void start_burst_tick(sm_t *sm) {
         return;
     }
     uint32_t t = sm_ticks_in_state(sm);
+    // turn the car's battery conditioning mode on before asking it to start
+    // preconditioning; the enable burst keeps the check's pace, one frame per
+    // tick
+    if (requested.conditioning_mode_first) {
+        if (t < CONDITIONING_MODE_TICKS) {
+            send_conditioning_mode_enable_msg(t);
+            return;
+        }
+        t -= CONDITIONING_MODE_TICKS;
+    }
     send_precondition_start_msg(t);
     // Status events deliberately do not cut the burst short. After all start
     // messages are sent, route using the car's latest reported status.
@@ -984,7 +1159,9 @@ static void managed_enter(sm_t *sm) {
 
 static void managed_tick(sm_t *sm) {
     if (platform.car_in_ready && managed.nudge_at_us != 0
-            && precon_blockers == PRECONDITION_BLOCK_NONE
+            // only car-imposed blockers hold nudges back: a nudge is how the
+            // mode-off blocker gets retried
+            && (precon_blockers & PRECONDITION_BLOCK_ABORTS) == PRECONDITION_BLOCK_NONE
             && sm_now(sm) >= managed.nudge_at_us) {
         // targets the parent, so REQUESTED exits and re-enters: fresh attempt
         // ctx, kind set from the entry argument, descend into START_BURST
@@ -1196,6 +1373,31 @@ static const sm_state_t S_WAIT_STOPPED = {
 
 static void push_precondition_state(void);
 
+// Answer a head-unit charge-limit write once its reply wait expires: stay silent
+// while the wait runs, then enable the mode unless the wait's trusted reading
+// says the car already has it on. The burst is one 0x0C7 frame per tick, so it
+// keeps the documented 25 Hz spacing. Only the start and stop bursts send 0x0C7
+// from the per-state walk, so deferring to them (and resuming afterwards) is
+// enough to keep two frames from landing in the same 40 ms slot.
+static void charge_limit_watch_tick(sm_t *sm) {
+    if (charge_limit_watch.remaining == 0U
+            || sm_in(sm, &S_START_BURST)
+            || sm_in(sm, &S_STOP_BURST)) {
+        return;
+    }
+    if (charge_limit_watch.wait > 0U) {
+        charge_limit_watch.wait--;
+        return;
+    }
+    if (charge_limit_watch.reply_enabled) {
+        charge_limit_watch.remaining = 0U;
+        ESP_LOGI(TAG, "conditioning mode is already on; not re-asserting");
+        return;
+    }
+    send_conditioning_mode_enable_msg(CONDITIONING_MODE_TICKS - charge_limit_watch.remaining);
+    charge_limit_watch.remaining--;
+}
+
 static void precondition_global_tick(sm_t *sm) {
     track_popup_tick();
 
@@ -1216,6 +1418,9 @@ static void precondition_global_tick(sm_t *sm) {
         sm_send_event(&precon_sm, EV_TOGGLE);
     }
 
+    // this fixes the charge limit changed -> conditioning mode disabled bug
+    // the head unit also fixes this for changes made through EV settings
+    charge_limit_watch_tick(sm);
     push_precondition_state();
 }
 
@@ -1289,6 +1494,49 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
         if (became_low) {
             sm_send_event(sm, EV_SOC_BECAME_LOW);
         }
+    }
+
+    // 0x25D D6 bit 7: the car's latched battery conditioning mode. The frame is
+    // broadcast, so the check needs no probe; only the car's own copy is
+    // trusted.
+    if (IS_CONDITIONING_MODE_FRAME(to_push->identifier)
+            && rx_bus == CAR_BUS
+            && to_push->data_length_code >= CONDITIONING_MODE_DATA_LENGTH) {
+        platform.conditioning_mode =
+            (to_push->data[CONDITIONING_MODE_INDEX] & CONDITIONING_MODE_ENABLED_MASK) != 0U
+            ? CONDITIONING_MODE_ENABLED : CONDITIONING_MODE_DISABLED;
+        // Recognized but never pre-empted: a start attempt enables the mode
+        // itself (PRECONDITION_BLOCK_ABORTS), so this only surfaces when the
+        // mode stays off anyway.
+        (void)update_precon_blocker(
+            PRECONDITION_BLOCK_CONDITIONING_MODE_OFF,
+            platform.conditioning_mode == CONDITIONING_MODE_DISABLED
+        );
+        // A pending charge-limit re-assertion decides on the newest reading from
+        // its decision window, so a later reading inside the window overrides an
+        // earlier one.
+        if (conditioning_mode_reading_decides()) {
+            charge_limit_watch.reply_enabled =
+                platform.conditioning_mode == CONDITIONING_MODE_ENABLED;
+        }
+    }
+
+    // A head-unit charge-limit write clears the car's conditioning mode, so wait
+    // for the car to report what the write left behind and enable the mode only
+    // if it is off: 0x4C5 is the head unit's command and only ever arrives on the
+    // head-unit bus. Waiting also covers the head unit enabling the mode itself,
+    // which it does for changes made through the EV settings.
+    if (rx_bus == HEAD_UNIT_BUS && charge_limit_values_sent(to_push)) {
+        // Every write frame restarts the reply wait: the head unit repeats each
+        // write three times, and a later write needs its own window. The burst
+        // itself is armed once and never restarted, because restarting would
+        // smear the documented F007 x3 / E007 x3 shape.
+        charge_limit_watch.wait = CONDITIONING_MODE_REPLY_TIMEOUT_TICKS;
+        charge_limit_watch.reply_enabled = false;
+        if (charge_limit_watch.remaining == 0U) {
+            charge_limit_watch.remaining = CONDITIONING_MODE_TICKS;
+        }
+        ESP_LOGI(TAG, "head unit wrote a charge limit; awaiting conditioning mode reply");
     }
 
     int8_t precon_button_type = precon_config.button_type;
