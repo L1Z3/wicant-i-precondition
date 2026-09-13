@@ -1443,11 +1443,10 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
     }
 
     // A head-unit charge-limit change clears the car's conditioning mode, so
-    // answer it with the enable burst. Only the head-unit bus carries the
-    // command; a 0x4C5 on the car bus is our own injection or the car's own
-    // traffic, neither of which is a head-unit modification. The 0x25D reading
-    // is deliberately not consulted: it is a 200 ms broadcast, so it still
-    // reports the pre-change mode for up to a frame period after the clear.
+    // answer it with the enable burst. 0x4C5 is the head unit's command and only
+    // ever arrives on the head-unit bus. The 0x25D reading is deliberately not
+    // consulted: it is a 200 ms broadcast, so it still reports the pre-change
+    // mode for up to a frame period after the clear.
     if (rx_bus == HEAD_UNIT_BUS && charge_limit_modified(to_push)) {
         charge_limit_watch.remaining = CONDITIONING_MODE_TICKS;
         ESP_LOGI(TAG, "head unit changed charge limit; re-asserting conditioning mode");
