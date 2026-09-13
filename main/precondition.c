@@ -286,6 +286,7 @@ enum {
     // Higher bits have higher display and stop-reason priority.
     PRECONDITION_BLOCK_BATTERY_WARM = 1U << 0,
     PRECONDITION_BLOCK_BATTERY_LOW_SOC = 1U << 1,
+    PRECONDITION_BLOCK_UTILITY_MODE = 1U << 2,
 };
 
 // owned by IDLE
@@ -1245,9 +1246,15 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
             ESP_LOGI(TAG, "car power: %s", ready ? "ready" : "off");
             sm_send_event(sm, ready ? EV_CAR_READY : EV_CAR_NOT_READY);
             // definitely out of utility mode if the car power changes
+            // as that's the only way to leave utility mode
             // probably there's a value here corresponding to utility mode
-            // let's find it later
+            // let's find it later as NOT_READY is a fine catch-all that 
+            // should include utility mode
             platform.car_in_utility = false;
+            update_precon_blocker(
+                PRECONDITION_BLOCK_UTILITY_MODE,
+                false
+            );
         }
     }
 
@@ -1261,17 +1268,26 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
             && to_push->data[3] == 0xE0U
             && to_push->data[4] == 0x07U
             && !platform.car_in_utility) {
-        platform.car_in_utility = true;
-        sm_send_event(sm, EV_UTILITY_MODE);
         // utility mode requested
-        if (precon_config.mode == ONCE) {
-            // tell the user utility mode canceled preconditioning, then idle
-            // immediately; no stop burst is sent
-            show_stopping_notice(STOP_REASON_UTILITY_MODE);
-            sm_transition(sm, &S_IDLE);
-        } else {
-            // this seems pretty safe?
-            sm_transition(sm, &S_MANAGED);
+        platform.car_in_utility = true;
+        update_precon_blocker(
+            PRECONDITION_BLOCK_UTILITY_MODE,
+            true
+        );
+        sm_send_event(sm, EV_UTILITY_MODE);
+        if (sm_in(&precon_sm, &S_REQUESTED)) {
+            if (precon_config.mode == ONCE && ) {
+                // tell the user utility mode canceled preconditioning, then idle
+                // immediately; no stop burst is sent
+                show_stopping_notice(STOP_REASON_UTILITY_MODE);
+                // skipping stopping, but it has to be done either this way or with 
+                // a special stopping state to avoid interrupting utility mode with 
+                // stop bursts
+                sm_transition(sm, &S_IDLE);
+            } else {
+                // this seems pretty safe?
+                sm_transition(sm, &S_MANAGED);
+            }
         }
     }
 
