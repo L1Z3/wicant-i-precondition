@@ -430,6 +430,26 @@ static const char *precondition_mode_name(bool abbreviated) {
     }
 }
 
+static int display_temperature(int celsius) {
+    if (!config_server_temperature_fahrenheit()) {
+        return celsius;
+    }
+    // Whole Celsius degrees produce distinct nearest Fahrenheit integers.
+    // Division truncates toward zero, so round negative numerators separately.
+    int n = 9 * celsius + 160;
+    return n >= 0 ? (n + 2) / 5 : (n - 2) / 5;
+}
+
+// Signed-byte Celsius readings need at most "-198°F" plus the NUL byte.
+#define TEMPERATURE_TEXT_SIZE 8U
+
+// Return caller-owned text so multiple temperatures can share one snprintf.
+static char *format_temperature(int celsius, char text[TEMPERATURE_TEXT_SIZE]) {
+    snprintf(text, TEMPERATURE_TEXT_SIZE, "%d°%c", display_temperature(celsius),
+             config_server_temperature_fahrenheit() ? 'F' : 'C');
+    return text;
+}
+
 static void show_once_blocker_notice(precondition_blockers_t blocker) {
     char message[48];
     if (blocker == PRECONDITION_BLOCK_BATTERY_LOW_SOC) {
@@ -450,14 +470,16 @@ static void show_once_blocker_notice(precondition_blockers_t blocker) {
 
     if (blocker == PRECONDITION_BLOCK_BATTERY_WARM) {
         precondition_temperature_t temperature;
+        char current[TEMPERATURE_TEXT_SIZE];
+        char target[TEMPERATURE_TEXT_SIZE];
+        format_temperature(PRECONDITION_BATTERY_TEMPERATURE_CUTOFF_C, target);
         if (precondition_get_battery_temperature(&temperature)) {
             snprintf(message, sizeof(message),
-                     "Once: temp too high: %d°C ≥ %d°C",
-                     temperature.min_c, PRECONDITION_BATTERY_TEMPERATURE_CUTOFF_C);
+                     "Once: temp too high: %s ≥ %s",
+                     format_temperature(temperature.min_c, current), target);
         } else {
             snprintf(message, sizeof(message),
-                     "Once: temp too high: ≥ %d°C",
-                     PRECONDITION_BATTERY_TEMPERATURE_CUTOFF_C);
+                     "Once: temp too high: ≥ %s", target);
         }
         track_popup_show_error(message);
     }
@@ -474,15 +496,17 @@ static void show_repeating_soc_notice(void) {
 static void show_repeating_maintaining_notice(void) {
     precondition_temperature_t temperature;
     char message[64];
+    char current[TEMPERATURE_TEXT_SIZE];
+    char target[TEMPERATURE_TEXT_SIZE];
+    format_temperature(PRECONDITION_BATTERY_TEMPERATURE_CUTOFF_C, target);
     if (precondition_get_battery_temperature(&temperature)) {
         snprintf(message, sizeof(message),
-                 "%s: maintaining %d°C (%d°C now)",
-                 precondition_mode_name(true), PRECONDITION_BATTERY_TEMPERATURE_CUTOFF_C,
-                 temperature.min_c);
+                 "%s: maintaining %s (%s now)",
+                 precondition_mode_name(true), target,
+                 format_temperature(temperature.min_c, current));
     } else {
         snprintf(message, sizeof(message),
-                 "%s: maintaining %d°C",
-                 precondition_mode_name(false), PRECONDITION_BATTERY_TEMPERATURE_CUTOFF_C);
+                 "%s: maintaining %s", precondition_mode_name(false), target);
     }
     track_popup_show_info(message);
 }
@@ -500,8 +524,10 @@ static void show_request_started_notice(void) {
             precondition_temperature_t temperature;
             char message[48];
             if (precondition_get_battery_temperature(&temperature)) {
+                char current[TEMPERATURE_TEXT_SIZE];
                 snprintf(message, sizeof(message),
-                         "Once: starting (%d°C now)", temperature.min_c);
+                         "Once: starting (%s now)",
+                         format_temperature(temperature.min_c, current));
             } else {
                 snprintf(message, sizeof(message), "Once: starting");
             }
@@ -555,12 +581,14 @@ static void show_stopping_notice(stop_reason_t reason) {
             // we can retroactively learn the reason the BMU stopped preconditioning.
             track_popup_show_warning("Once: stopping (unknown reason)");
             break;
-        case STOP_REASON_TEMPERATURE_REACHED:
+        case STOP_REASON_TEMPERATURE_REACHED: {
+            char target[TEMPERATURE_TEXT_SIZE];
             snprintf(message, sizeof(message),
-                     "Once: stopping (reached %d°C)",
-                     PRECONDITION_BATTERY_TEMPERATURE_CUTOFF_C);
+                     "Once: stopping (reached %s)",
+                     format_temperature(PRECONDITION_BATTERY_TEMPERATURE_CUTOFF_C, target));
             track_popup_show_info(message);
             break;
+        }
         case STOP_REASON_LOW_SOC:
             snprintf(message, sizeof(message),
                      "Once: stopping (<%u%% SoC)",
