@@ -242,7 +242,11 @@ static bool activation_is_release(const message_payload_t *msg, const twai_messa
 #define IS_CHARGE_LIMIT_FRAME(frame_id) ((frame_id) == CHARGE_LIMIT_FRAME_ID)
 
 #define CAR_BUS CAN_BUS_0
+#if CAN_BUS_COUNT > 1
 #define HEAD_UNIT_BUS CAN_BUS_1
+#else
+#define HEAD_UNIT_BUS CAN_BUS_0
+#endif
 
 #define SECONDS_UNTIL_START(elapsed) \
     (((elapsed) >= PRECONDITION_STARTED_TIMEOUT_US) ? 0U : \
