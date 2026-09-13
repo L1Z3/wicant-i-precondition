@@ -141,6 +141,8 @@ typedef struct _device_config
     char precon_mode[16];
     char precon_button[32];
     char precon_press[16];
+    char charge_ac_limit[8];
+    char charge_dc_limit[8];
 }device_config_t;
 
 
@@ -208,3 +210,8 @@ char *config_server_get_status_json(bool remove_sensitive_info);
 int8_t config_server_precon_button(void);
 int8_t config_server_precon_mode(void);
 int8_t config_server_precon_press(void);
+int config_server_get_charge_ac_limit(void);
+int config_server_get_charge_dc_limit(void);
+void config_server_set_charge_ac_limit(uint8_t percent);
+void config_server_set_charge_dc_limit(uint8_t percent);
+void config_server_save_cfg(void);

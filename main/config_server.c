@@ -76,6 +76,7 @@
 #include "ha_webhooks.h"
 #include "precondition.h"
 #include "track_popup.h"
+#include "car_settings.h"
 #include "esp_timer.h"
 
 #define WIFI_CONNECTED_BIT			BIT0
@@ -158,7 +159,9 @@ const char device_config_default[] = R"json({
 "mqtt_status_topic":"wican/%s/can/status",
 "precon_mode":"once",
 "precon_button":"sw_star",
-"precon_press":"short"
+"precon_press":"short",
+"charge_ac_limit":"100",
+"charge_dc_limit":"100"
 })json";
 static device_config_t device_config;
 TimerHandle_t xrestartTimer;
@@ -791,6 +794,128 @@ static esp_err_t track_popup_handler(httpd_req_t *req)
     return httpd_resp_send(req, "Track popup queued", HTTPD_RESP_USE_STRLEN);
 }
 
+static esp_err_t charge_limit_get_handler(httpd_req_t *req)
+{
+    uint8_t ac = 0, dc = 0;
+    charge_limit_get(&ac, &dc);
+    uint8_t act_ac = 0, act_dc = 0;
+    charge_limit_get_actuals(&act_ac, &act_dc);
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    cJSON_AddNumberToObject(root, "ac", ac);
+    cJSON_AddNumberToObject(root, "dc", dc);
+    cJSON_AddNumberToObject(root, "ac_raw", charge_limit_percent_to_raw(ac));
+    cJSON_AddNumberToObject(root, "dc_raw", charge_limit_percent_to_raw(dc));
+    cJSON_AddNumberToObject(root, "actual_ac", act_ac);
+    cJSON_AddNumberToObject(root, "actual_dc", act_dc);
+    cJSON_AddNumberToObject(root, "actual_ac_raw", charge_limit_percent_to_raw(act_ac));
+    cJSON_AddNumberToObject(root, "actual_dc_raw", charge_limit_percent_to_raw(act_dc));
+    uint8_t last_ac = 0, last_dc = 0;
+    int64_t age_us = 0;
+    if (charge_limit_get_last_reply(&last_ac, &last_dc, &age_us)) {
+        cJSON_AddNumberToObject(root, "last_ac_raw", last_ac);
+        cJSON_AddNumberToObject(root, "last_dc_raw", last_dc);
+        cJSON_AddNumberToObject(root, "last_ac_percent", charge_limit_raw_to_percent(last_ac));
+        cJSON_AddNumberToObject(root, "last_dc_percent", charge_limit_raw_to_percent(last_dc));
+        cJSON_AddNumberToObject(root, "last_seen_age_ms", age_us / 1000);
+        cJSON_AddBoolToObject(root, "last_seen_valid", true);
+    } else {
+        cJSON_AddBoolToObject(root, "last_seen_valid", false);
+    }
+    char *out = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!out) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+    free(out);
+    return ESP_OK;
+}
+
+static esp_err_t charge_limit_set_handler(httpd_req_t *req)
+{
+    // Accept either a query string (?ac=80&dc=90) or a JSON body
+    // {"ac":80,"dc":90}; omitted values keep their current setting.
+    bool has_ac = false, has_dc = false;
+    int ac_val = 0, dc_val = 0;
+    char query[64] = {0};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char val_str[8] = {0};
+        if (httpd_query_key_value(query, "ac", val_str, sizeof(val_str)) == ESP_OK) {
+            ac_val = atoi(val_str);
+            has_ac = true;
+        }
+        if (httpd_query_key_value(query, "dc", val_str, sizeof(val_str)) == ESP_OK) {
+            dc_val = atoi(val_str);
+            has_dc = true;
+        }
+    }
+    if (req->content_len > 0 && req->content_len < 128) {
+        char buf[128] = {0};
+        if (httpd_req_recv(req, buf, req->content_len) > 0) {
+            buf[req->content_len] = '\0';
+            cJSON *root = cJSON_Parse(buf);
+            if (root) {
+                cJSON *ac_item = cJSON_GetObjectItem(root, "ac");
+                cJSON *dc_item = cJSON_GetObjectItem(root, "dc");
+                if (cJSON_IsNumber(ac_item)) {
+                    ac_val = ac_item->valueint;
+                    has_ac = true;
+                } else if (cJSON_IsString(ac_item) && ac_item->valuestring) {
+                    ac_val = atoi(ac_item->valuestring);
+                    has_ac = true;
+                }
+                if (cJSON_IsNumber(dc_item)) {
+                    dc_val = dc_item->valueint;
+                    has_dc = true;
+                } else if (cJSON_IsString(dc_item) && dc_item->valuestring) {
+                    dc_val = atoi(dc_item->valuestring);
+                    has_dc = true;
+                }
+                cJSON_Delete(root);
+            }
+        }
+    }
+    if (!has_ac && !has_dc) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing ac/dc");
+        return ESP_FAIL;
+    }
+    int new_ac = ac_val;
+    int new_dc = dc_val;
+    if (new_ac < CHARGE_LIMIT_MIN || new_ac > CHARGE_LIMIT_MAX
+            || new_dc < CHARGE_LIMIT_MIN || new_dc > CHARGE_LIMIT_MAX) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "ac/dc must be 50-100");
+        return ESP_FAIL;
+    }
+    if (!charge_limit_set((uint8_t)new_ac, (uint8_t)new_dc)) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to set");
+        return ESP_FAIL;
+    }
+    config_server_save_cfg();
+    uint8_t act_ac = 0, act_dc = 0;
+    charge_limit_get_actuals(&act_ac, &act_dc);
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddNumberToObject(resp, "ac", new_ac);
+    cJSON_AddNumberToObject(resp, "dc", new_dc);
+    cJSON_AddNumberToObject(resp, "ac_raw", charge_limit_percent_to_raw((uint8_t)new_ac));
+    cJSON_AddNumberToObject(resp, "dc_raw", charge_limit_percent_to_raw((uint8_t)new_dc));
+    cJSON_AddNumberToObject(resp, "actual_ac", act_ac);
+    cJSON_AddNumberToObject(resp, "actual_dc", act_dc);
+    cJSON_AddNumberToObject(resp, "actual_ac_raw", charge_limit_percent_to_raw(act_ac));
+    cJSON_AddNumberToObject(resp, "actual_dc_raw", charge_limit_percent_to_raw(act_dc));
+    char *out = cJSON_PrintUnformatted(resp);
+    cJSON_Delete(resp);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+    free(out);
+    return ESP_OK;
+}
+
 static esp_err_t logo_handler(httpd_req_t *req)
 {
     const char* resp_str = (const char*)logo;
@@ -1111,6 +1236,28 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 		time_t now;
 		time(&now);
 		cJSON_AddNumberToObject(root, "timestamp", (double)now);
+	}
+
+	// Charge limits: configured target and last 0x1F9 car-side reply
+	{
+		uint8_t ac = 0, dc = 0;
+		charge_limit_get(&ac, &dc);
+		cJSON_AddNumberToObject(root, "charge_ac_limit", ac);
+		cJSON_AddNumberToObject(root, "charge_dc_limit", dc);
+		cJSON_AddNumberToObject(root, "charge_ac_raw", charge_limit_percent_to_raw(ac));
+		cJSON_AddNumberToObject(root, "charge_dc_raw", charge_limit_percent_to_raw(dc));
+		uint8_t last_ac = 0, last_dc = 0;
+		int64_t age_us = 0;
+		if (charge_limit_get_last_reply(&last_ac, &last_dc, &age_us)) {
+			cJSON_AddBoolToObject(root, "charge_last_valid", true);
+			cJSON_AddNumberToObject(root, "charge_last_ac_raw", last_ac);
+			cJSON_AddNumberToObject(root, "charge_last_dc_raw", last_dc);
+			cJSON_AddNumberToObject(root, "charge_last_ac_percent", charge_limit_raw_to_percent(last_ac));
+			cJSON_AddNumberToObject(root, "charge_last_dc_percent", charge_limit_raw_to_percent(last_dc));
+			cJSON_AddNumberToObject(root, "charge_last_age_ms", age_us / 1000);
+		} else {
+			cJSON_AddBoolToObject(root, "charge_last_valid", false);
+		}
 	}
 
 	char *resp_str = cJSON_PrintUnformatted(root);
@@ -1773,6 +1920,36 @@ static const httpd_uri_t scan_available_pids_uri = {
     .handler   = scan_available_pids_handler,
     .user_ctx  = NULL
 };
+static const httpd_uri_t charge_limit_get_uri = {
+    .uri       = "/charge_limit",
+    .method    = HTTP_GET,
+    .handler   = charge_limit_get_handler,
+    .user_ctx  = NULL
+};
+static const httpd_uri_t charge_limit_set_uri = {
+    .uri       = "/charge_limit",
+    .method    = HTTP_POST,
+    .handler   = charge_limit_set_handler,
+    .user_ctx  = NULL
+};
+
+// Parse a charge-limit config value (string or number) into out, defaulting to
+// 100% when the key is missing and clamping out-of-range values.
+static void load_charge_limit_percent(cJSON *root, const char *key, char *out, size_t out_size)
+{
+	cJSON *item = cJSON_GetObjectItem(root, key);
+	if (cJSON_IsNumber(item)) {
+		snprintf(out, out_size, "%d", item->valueint);
+	} else if (cJSON_IsString(item) && item->valuestring) {
+		strlcpy(out, item->valuestring, out_size);
+	} else {
+		strlcpy(out, "100", out_size);
+	}
+	if (atoi(out) < CHARGE_LIMIT_MIN || atoi(out) > CHARGE_LIMIT_MAX) {
+		strlcpy(out, "100", out_size);
+	}
+}
+
 static void config_server_load_cfg(char *cfg)
 {
 	cJSON * root, *key = 0;
@@ -2369,6 +2546,17 @@ static void config_server_load_cfg(char *cfg)
 	ESP_LOGI(TAG, "device_config.webhook_en: %s", device_config.webhook_en);
 	//*****
 
+	//*****
+	// charge limits: new keys, default to 100% if missing (backwards compat)
+	load_charge_limit_percent(root, "charge_ac_limit", device_config.charge_ac_limit, sizeof(device_config.charge_ac_limit));
+	ESP_LOGI(TAG, "device_config.charge_ac_limit: %s", device_config.charge_ac_limit);
+	//*****
+
+	//*****
+	load_charge_limit_percent(root, "charge_dc_limit", device_config.charge_dc_limit, sizeof(device_config.charge_dc_limit));
+	ESP_LOGI(TAG, "device_config.charge_dc_limit: %s", device_config.charge_dc_limit);
+	//*****
+
 	cJSON_Delete(root);
 	return;
 
@@ -2541,7 +2729,7 @@ static httpd_handle_t config_server_init(void)
                        );
 
     // Start the httpd server
-	config.max_uri_handlers = 32;
+	config.max_uri_handlers = 36;
 	config.stack_size = 5120;
     ESP_LOGI(TAG, "Starting server on port: '%d'", config.server_port);
     if (httpd_start(&server, &config) == ESP_OK)
@@ -2568,6 +2756,8 @@ static httpd_handle_t config_server_init(void)
 		httpd_register_uri_handler(server, &load_car_config_uri);
 		httpd_register_uri_handler(server, &store_car_data_uri);
 		httpd_register_uri_handler(server, &scan_available_pids_uri);
+		httpd_register_uri_handler(server, &charge_limit_get_uri);
+		httpd_register_uri_handler(server, &charge_limit_set_uri);
 		ha_webhooks_register_handlers(server);
         #if CONFIG_EXAMPLE_BASIC_AUTH
         httpd_register_basic_auth(server);
@@ -2581,7 +2771,7 @@ static httpd_handle_t config_server_init(void)
 void config_server_restart(void)
 {
     // Start the httpd server
-	config.max_uri_handlers = 32;
+	config.max_uri_handlers = 36;
 	// Ensure webhook cache is initialized after restarts too.
 	ha_webhooks_init();
     ESP_LOGI(TAG, "Starting server on port: '%d'", config.server_port);
@@ -2609,6 +2799,8 @@ void config_server_restart(void)
 		httpd_register_uri_handler(server, &load_car_config_uri);
 		httpd_register_uri_handler(server, &store_car_data_uri);
 		httpd_register_uri_handler(server, &scan_available_pids_uri);
+		httpd_register_uri_handler(server, &charge_limit_get_uri);
+		httpd_register_uri_handler(server, &charge_limit_set_uri);
 		ha_webhooks_register_handlers(server);
         return;
     }
@@ -3146,4 +3338,112 @@ int8_t config_server_precon_press(void)
 		return PRESS_LONG;
 	}
 	return PRESS_SHORT;
+}
+
+int config_server_get_charge_ac_limit(void)
+{
+	int v = atoi(device_config.charge_ac_limit);
+	if (v < CHARGE_LIMIT_MIN || v > CHARGE_LIMIT_MAX) return CHARGE_LIMIT_DEFAULT;
+	return v;
+}
+
+int config_server_get_charge_dc_limit(void)
+{
+	int v = atoi(device_config.charge_dc_limit);
+	if (v < CHARGE_LIMIT_MIN || v > CHARGE_LIMIT_MAX) return CHARGE_LIMIT_DEFAULT;
+	return v;
+}
+
+void config_server_set_charge_ac_limit(uint8_t percent)
+{
+	if (percent < CHARGE_LIMIT_MIN || percent > CHARGE_LIMIT_MAX) {
+		percent = CHARGE_LIMIT_DEFAULT;
+	}
+	snprintf(device_config.charge_ac_limit, sizeof(device_config.charge_ac_limit), "%u", percent);
+}
+
+void config_server_set_charge_dc_limit(uint8_t percent)
+{
+	if (percent < CHARGE_LIMIT_MIN || percent > CHARGE_LIMIT_MAX) {
+		percent = CHARGE_LIMIT_DEFAULT;
+	}
+	snprintf(device_config.charge_dc_limit, sizeof(device_config.charge_dc_limit), "%u", percent);
+}
+
+void config_server_save_cfg(void)
+{
+	// Serialize device_config to JSON and write to config.json
+	cJSON *root = cJSON_CreateObject();
+	if (!root) {
+		ESP_LOGE(TAG, "failed to create JSON for config save");
+		return;
+	}
+
+	// All the fields from device_config - match what load_config_handler returns
+	cJSON_AddStringToObject(root, "wifi_mode", device_config.wifi_mode);
+	cJSON_AddStringToObject(root, "ap_ch", device_config.ap_ch);
+	cJSON_AddStringToObject(root, "ap_auto_disable", device_config.ap_auto_disable);
+	cJSON_AddStringToObject(root, "webhook_en", device_config.webhook_en);
+	cJSON_AddStringToObject(root, "sta_ssid", device_config.sta_ssid);
+	cJSON_AddStringToObject(root, "sta_pass", device_config.sta_pass);
+	cJSON_AddStringToObject(root, "sta_security", device_config.sta_security);
+	cJSON_AddStringToObject(root, "can_datarate", device_config.can_datarate);
+	cJSON_AddStringToObject(root, "can_mode", device_config.can_mode);
+	cJSON_AddStringToObject(root, "can1_datarate", device_config.can1_datarate);
+	cJSON_AddStringToObject(root, "can1_mode", device_config.can1_mode);
+	cJSON_AddStringToObject(root, "can1_en", device_config.can1_en);
+	cJSON_AddStringToObject(root, "can_fwd_mode", device_config.can_fwd_mode);
+	cJSON_AddStringToObject(root, "port_type", device_config.port_type);
+	cJSON_AddStringToObject(root, "port", device_config.port);
+	cJSON_AddStringToObject(root, "ap_pass", device_config.ap_pass);
+	cJSON_AddStringToObject(root, "protocol", device_config.protocol);
+	cJSON_AddStringToObject(root, "ble_pass", device_config.ble_pass);
+	cJSON_AddStringToObject(root, "ble_status", device_config.ble_status);
+	cJSON_AddStringToObject(root, "sleep_status", device_config.sleep_status);
+	cJSON_AddStringToObject(root, "sleep_volt", device_config.sleep_volt);
+	cJSON_AddStringToObject(root, "wakeup_volt", device_config.wakeup_volt);
+	cJSON_AddStringToObject(root, "batt_alert", device_config.batt_alert);
+	cJSON_AddStringToObject(root, "batt_alert_ssid", device_config.batt_alert_ssid);
+	cJSON_AddStringToObject(root, "batt_alert_pass", device_config.batt_alert_pass);
+	cJSON_AddStringToObject(root, "batt_alert_volt", device_config.batt_alert_volt);
+	cJSON_AddStringToObject(root, "batt_alert_protocol", device_config.batt_alert_protocol);
+	cJSON_AddStringToObject(root, "batt_alert_url", device_config.batt_alert_url);
+	cJSON_AddStringToObject(root, "batt_alert_port", device_config.batt_alert_port);
+	cJSON_AddStringToObject(root, "batt_alert_topic", device_config.batt_alert_topic);
+	cJSON_AddStringToObject(root, "batt_mqtt_user", device_config.batt_mqtt_user);
+	cJSON_AddStringToObject(root, "batt_mqtt_pass", device_config.batt_mqtt_pass);
+	cJSON_AddStringToObject(root, "batt_alert_time", device_config.batt_alert_time);
+	cJSON_AddStringToObject(root, "mqtt_en", device_config.mqtt_en);
+	cJSON_AddStringToObject(root, "mqtt_elm327_log", device_config.mqtt_elm327_log);
+	cJSON_AddStringToObject(root, "mqtt_url", device_config.mqtt_url);
+	cJSON_AddStringToObject(root, "mqtt_port", device_config.mqtt_port);
+	cJSON_AddStringToObject(root, "mqtt_user", device_config.mqtt_user);
+	cJSON_AddStringToObject(root, "mqtt_pass", device_config.mqtt_pass);
+	cJSON_AddStringToObject(root, "keep_alive", device_config.keep_alive);
+	cJSON_AddStringToObject(root, "mqtt_tx_topic", device_config.mqtt_tx_topic);
+	cJSON_AddStringToObject(root, "mqtt_rx_topic", device_config.mqtt_rx_topic);
+	cJSON_AddStringToObject(root, "mqtt_status_topic", device_config.mqtt_status_topic);
+	cJSON_AddStringToObject(root, "precon_mode", device_config.precon_mode);
+	cJSON_AddStringToObject(root, "precon_button", device_config.precon_button);
+	cJSON_AddStringToObject(root, "precon_press", device_config.precon_press);
+	cJSON_AddStringToObject(root, "charge_ac_limit", device_config.charge_ac_limit);
+	cJSON_AddStringToObject(root, "charge_dc_limit", device_config.charge_dc_limit);
+
+	char *json_str = cJSON_PrintUnformatted(root);
+	cJSON_Delete(root);
+	if (!json_str) {
+		ESP_LOGE(TAG, "failed to serialize config");
+		return;
+	}
+
+	FILE *f = fopen(FS_MOUNT_POINT"/config.json", "w");
+	if (f) {
+		fwrite(json_str, 1, strlen(json_str), f);
+		fclose(f);
+		ESP_LOGI(TAG, "config saved: charge_ac=%s charge_dc=%s",
+		         device_config.charge_ac_limit, device_config.charge_dc_limit);
+	} else {
+		ESP_LOGE(TAG, "failed to open config.json for write");
+	}
+	free(json_str);
 }
