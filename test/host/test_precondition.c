@@ -1452,8 +1452,13 @@ static void run_utility_mode(void) {
     };
 
     // Only a complete utility request from the head unit can cancel a session.
+    // On a two-bus board a copy on the car bus is not the head unit's command.
+    // With CAN_BUS_COUNT == 1 the head unit shares the car bus, so there is no
+    // wrong bus to probe and the check is skipped.
+#if CAN_BUS_COUNT > 1
     precondition_can_rx_hook(&utility, CAR_BUS);
     expect_state("active");
+#endif
     twai_message_t invalid = utility;
     invalid.data_length_code = 4;
     precondition_can_rx_hook(&invalid, HEAD_UNIT_BUS);
@@ -1645,6 +1650,13 @@ static const suite_t suites[] = {
 #define NUM_SUITES (sizeof(suites) / sizeof(suites[0]))
 
 static int run_suite(const suite_t *s) {
+    // The Makefile builds this suite for both bus counts and states which one
+    // each binary is. Without this, the suite is self-consistent under either
+    // value, so a stub or -D regression could quietly run the two-bus
+    // configuration twice and leave the single-bus branches uncovered.
+#ifdef EXPECT_CAN_BUS_COUNT
+    CHECK(CAN_BUS_COUNT == EXPECT_CAN_BUS_COUNT);
+#endif
     cfg_mode = s->mode;
     cfg_press = s->press;
     s->fn();
