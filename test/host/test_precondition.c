@@ -1435,6 +1435,173 @@ static void run_once_ignores_stored_latch(void) {
     CHECK(precondition_display().active);
 }
 
+static void run_utility_mode(void) {
+    precondition_init();
+    car_power(true);
+    toggle();
+    for (int i = 0; i < 6; i++) tick1();
+    car_status(0x15, CAR_BUS);
+    expect_state("active");
+    sent_count = 0;
+    int notices = popup_show_count;
+
+    twai_message_t utility = {
+        .identifier = 0x0C7,
+        .data_length_code = 8,
+        .data = {[2] = 0x80, [3] = 0xE0, [4] = 0x07},
+    };
+
+    // Only a complete utility request from the head unit can cancel a session.
+    // On a two-bus board a copy on the car bus is not the head unit's command.
+    // With CAN_BUS_COUNT == 1 the head unit shares the car bus, so there is no
+    // wrong bus to probe and the check is skipped.
+#if CAN_BUS_COUNT > 1
+    precondition_can_rx_hook(&utility, CAR_BUS);
+    expect_state("active");
+#endif
+    twai_message_t invalid = utility;
+    invalid.data_length_code = 4;
+    precondition_can_rx_hook(&invalid, HEAD_UNIT_BUS);
+    expect_state("active");
+    invalid = utility;
+    invalid.data[2] = 0;
+    precondition_can_rx_hook(&invalid, HEAD_UNIT_BUS);
+    expect_state("active");
+    CHECK(!platform.car_in_utility);
+    CHECK(popup_show_count == notices);
+
+    precondition_can_rx_hook(&utility, HEAD_UNIT_BUS);
+    expect_state(cfg_mode == ONCE ? "idle" : "managed");
+    CHECK(platform.car_in_utility);
+    CHECK(precon_blockers & PRECONDITION_BLOCK_UTILITY_MODE);
+    CHECK(precondition_display().requested == repeating_mode());
+    if (cfg_mode == ONCE) {
+        CHECK(popup_show_count == notices + 1);
+        CHECK(strcmp(popup_text, "ⓘ Once: utility mode stopped precon.") == 0);
+    } else {
+        CHECK(repeating_mode_enabled());
+        CHECK(popup_show_count == notices);
+    }
+    twai_message_t forwarded = utility;
+    CHECK(precondition_fwd_hook(&forwarded, CAR_BUS) == FWD_PASSTHROUGH);
+    CHECK(memcmp(forwarded.data, utility.data, sizeof(utility.data)) == 0);
+
+    // Repeated requests are silent, and utility mode sends no start/stop bursts.
+    notices = popup_show_count;
+    precondition_can_rx_hook(&utility, HEAD_UNIT_BUS);
+    CHECK(popup_show_count == notices);
+    advance_us(REPEATING_MODE_RETRY_INTERVAL_US + 1000000);
+    expect_state(cfg_mode == ONCE ? "idle" : "managed");
+    CHECK(sent_count == 0);
+
+    if (cfg_mode == ONCE) {
+        // A blocked manual start keeps its own notice and skips cleanup traffic.
+        toggle();
+        expect_state("idle");
+        CHECK(popup_show_count == notices + 1);
+        CHECK(strcmp(popup_text, "‼ Once: utility mode blocked start") == 0);
+        advance_us(PRECONDITION_RETRY_US + 1000000);
+        CHECK(sent_count == 0);
+    }
+
+    // After a power cycle, ordinary starts and user-requested stops still burst.
+    car_power(false);
+    CHECK(!platform.car_in_utility);
+    CHECK(!(precon_blockers & PRECONDITION_BLOCK_UTILITY_MODE));
+    car_power(true);
+    if (cfg_mode == PERSISTENT) {
+        advance_until_state("start-burst", PRECONDITION_CAR_START_DELAY_US + 1000000);
+    } else {
+        toggle();
+    }
+    for (int i = 0; i < 6; i++) tick1();
+    CHECK(sent_count == 6);
+    check_start_burst_msgs(0);
+    fake_now += 2000000;
+    toggle();
+    expect_state("stop-burst");
+    sent_count = 0;
+    for (int i = 0; i < 6; i++) tick1();
+    CHECK(sent_count == 6);
+    check_stop_burst_msgs(0);
+}
+
+static void run_utility_mode_disable(void) {
+    precondition_init();
+    car_power(true);
+    toggle();
+    for (int i = 0; i < 6; i++) tick1();
+    car_status(0x15, CAR_BUS);
+    expect_state("active");
+
+    uint8_t utility[8] = {[2] = 0x80, [3] = 0xE0, [4] = 0x07};
+    rx_frame(0x0C7, utility, HEAD_UNIT_BUS);
+    expect_state("managed");
+    fake_now += 2000000;
+    sent_count = 0;
+    int notices = popup_show_count;
+
+    // Disabling the session must leave utility mode alone, including on retries.
+    toggle();
+    expect_state("idle");
+    CHECK(!repeating_mode_enabled());
+    CHECK(!precondition_display().requested);
+    CHECK(popup_show_count == notices + 1);
+    CHECK(precon_blockers & PRECONDITION_BLOCK_UTILITY_MODE);
+    advance_us(PRECONDITION_RETRY_US + 1000000);
+    CHECK(sent_count == 0);
+}
+
+static void run_utility_mode_without_ready(void) {
+    precondition_init();
+    toggle();
+    for (int i = 0; i < 6; i++) tick1();
+    car_status(0x15, CAR_BUS);
+    expect_state("active");
+    fake_now += 2000000;
+    sent_count = 0;
+
+    twai_message_t utility = {
+        .identifier = 0x0C7,
+        .data_length_code = 8,
+        .data = {[2] = 0x80, [3] = 0xE0, [4] = 0x07},
+    };
+    precondition_can_rx_hook(&utility, HEAD_UNIT_BUS);
+    expect_state(cfg_mode == ONCE ? "idle" : "managed");
+    CHECK(!ready_status_available());
+    CHECK(platform.car_in_utility);
+    CHECK(!(precon_blockers & PRECONDITION_BLOCK_UTILITY_MODE));
+    twai_message_t forwarded = utility;
+    CHECK(precondition_fwd_hook(&forwarded, CAR_BUS) == FWD_PASSTHROUGH);
+    CHECK(memcmp(forwarded.data, utility.data, sizeof(utility.data)) == 0);
+    advance_us(PRECONDITION_RETRY_US + 1000000);
+    CHECK(sent_count == 0);
+
+    if (repeating_mode()) {
+        toggle();
+        for (int i = 0; i < 6; i++) tick1();
+        car_status(0x01, CAR_BUS);
+        expect_state("idle");
+    }
+
+    // A fresh manual session still blocks ordinary head-unit stop commands,
+    // even though no READY edge has arrived to clear the utility latch.
+    sent_count = 0;
+    toggle();
+    for (int i = 0; i < 6; i++) tick1();
+    car_status(0x15, CAR_BUS);
+    expect_state("active");
+    CHECK(sent_count == 6);
+    check_start_burst_msgs(0);
+    CHECK(fwd(0x0C7, CAR_BUS, NULL) == FWD_BLOCK);
+
+    // Repeated utility requests stay passable without cancelling the new session.
+    precondition_can_rx_hook(&utility, HEAD_UNIT_BUS);
+    expect_state("active");
+    forwarded = utility;
+    CHECK(precondition_fwd_hook(&forwarded, CAR_BUS) == FWD_PASSTHROUGH);
+}
+
 // ---- suite table ----
 // each suite runs in its own forked process: the config snapshot, repeating
 // latch, fake NVS, and platform discovery flags all live in process statics
@@ -1471,10 +1638,25 @@ static const suite_t suites[] = {
     {"precondition persistent write retry", PERSISTENT, PRESS_SHORT, run_persistent_write_retry},
     {"precondition persistent write retry limit", PERSISTENT, PRESS_SHORT, run_persistent_write_retry_limit},
     {"precondition once ignores stored latch", ONCE, PRESS_SHORT, run_once_ignores_stored_latch},
+    {"precondition once utility mode", ONCE, PRESS_SHORT, run_utility_mode},
+    {"precondition continuous utility mode", CONTINUOUS, PRESS_SHORT, run_utility_mode},
+    {"precondition persistent utility mode", PERSISTENT, PRESS_SHORT, run_utility_mode},
+    {"precondition continuous utility disable", CONTINUOUS, PRESS_SHORT, run_utility_mode_disable},
+    {"precondition persistent utility disable", PERSISTENT, PRESS_SHORT, run_utility_mode_disable},
+    {"precondition once utility without READY", ONCE, PRESS_SHORT, run_utility_mode_without_ready},
+    {"precondition continuous utility without READY", CONTINUOUS, PRESS_SHORT, run_utility_mode_without_ready},
+    {"precondition persistent utility without READY", PERSISTENT, PRESS_SHORT, run_utility_mode_without_ready},
 };
 #define NUM_SUITES (sizeof(suites) / sizeof(suites[0]))
 
 static int run_suite(const suite_t *s) {
+    // The Makefile builds this suite for both bus counts and states which one
+    // each binary is. Without this, the suite is self-consistent under either
+    // value, so a stub or -D regression could quietly run the two-bus
+    // configuration twice and leave the single-bus branches uncovered.
+#ifdef EXPECT_CAN_BUS_COUNT
+    CHECK(CAN_BUS_COUNT == EXPECT_CAN_BUS_COUNT);
+#endif
     cfg_mode = s->mode;
     cfg_press = s->press;
     s->fn();

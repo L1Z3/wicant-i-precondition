@@ -154,6 +154,17 @@ static bool activation_is_release(const message_payload_t *msg, const twai_messa
 #define IS_POWER_STATUS_FRAME(frame_id) \
     ((frame_id) == 0x038U)
 
+#define IS_BMU_CONTROL_FRAME(frame_id) \
+    ((frame_id) == 0x0C7U)
+
+static bool is_utility_request(const twai_message_t *frame) {
+    return IS_BMU_CONTROL_FRAME(frame->identifier)
+           && frame->data_length_code >= 5U
+           && frame->data[2] == 0x80U
+           && frame->data[3] == 0xE0U
+           && frame->data[4] == 0x07U;
+}
+
 // TODO(ejones): unclear if this mask/value is necessary and sufficient
 #define POWER_STATUS_MASK 0x0FU
 #define POWER_STATUS_READY(power_status_byte) \
@@ -192,7 +203,11 @@ static bool activation_is_release(const message_payload_t *msg, const twai_messa
 #define IS_BATTERY_SOC_FRAME(frame_id) ((frame_id) == BATTERY_SOC_FRAME_ID)
 
 #define CAR_BUS CAN_BUS_0
+#if CAN_BUS_COUNT > 1
 #define HEAD_UNIT_BUS CAN_BUS_1
+#else
+#define HEAD_UNIT_BUS CAN_BUS_0
+#endif
 
 #define SECONDS_UNTIL_START(elapsed) \
     (((elapsed) >= PRECONDITION_STARTED_TIMEOUT_US) ? 0U : \
@@ -231,6 +246,7 @@ enum {
     EV_CAR_NOT_READY,   // car power left READY (0x038 edge)
     EV_TEMPERATURE_FRAME, // valid battery temperature sample received
     EV_SOC_BECAME_LOW,  // HV battery SoC crossed below the start cutoff
+    EV_UTILITY_MODE,    // car entered utility mode
 };
 
 static const sm_state_t S_IDLE, S_REQUESTED, S_CAR_START_DELAY, S_START_BURST,
@@ -253,6 +269,15 @@ typedef enum {
     PRECON_STATUS_STARTED,
 } precon_status_t;
 
+// most recent power (READY) status reported by the car via 0x038. UNKNOWN
+// until the first such frame, which never arrives on platforms where that
+// frame is unavailable
+typedef enum {
+    READY_STATUS_UNKNOWN = 0,
+    READY_STATUS_NOT_READY,
+    READY_STATUS_READY,
+} ready_status_t;
+
 // why the current start attempt was launched. MANUAL must be zero: it is the
 // entry argument plain sm_transition supplies
 typedef enum {
@@ -272,6 +297,7 @@ typedef enum {
     STOP_REASON_LOW_SOC,
     STOP_REASON_START_BLOCKED,
     STOP_REASON_RETRIES_EXHAUSTED,
+    STOP_REASON_UTILITY_MODE,
 } stop_reason_t;
 
 typedef uint8_t precondition_blockers_t;
@@ -281,6 +307,7 @@ enum {
     // Higher bits have higher display and stop-reason priority.
     PRECONDITION_BLOCK_BATTERY_WARM = 1U << 0,
     PRECONDITION_BLOCK_BATTERY_LOW_SOC = 1U << 1,
+    PRECONDITION_BLOCK_UTILITY_MODE = 1U << 2,
 };
 
 // owned by IDLE
@@ -323,13 +350,18 @@ static struct {
 static struct {
     // most recent recognized preconditioning status reported by the car
     precon_status_t precon_status;
-    // is the car in READY? tracked from 0x038 edges; stays false on platforms
-    // where that frame is unavailable
-    bool car_in_ready;
+    // latest power (READY) status from 0x038; stays UNKNOWN on platforms where
+    // that frame is unavailable
+    ready_status_t ready_status;
+    bool car_in_utility;
 } platform;
 
 static bool precon_status_available(void) {
     return platform.precon_status != PRECON_STATUS_UNKNOWN;
+}
+
+static bool ready_status_available(void) {
+    return platform.ready_status != READY_STATUS_UNKNOWN;
 }
 
 // activation button edge tracking, owned by the global hooks
@@ -432,6 +464,11 @@ static const char *precondition_mode_name(bool abbreviated) {
 
 static void show_once_blocker_notice(precondition_blockers_t blocker) {
     char message[48];
+    if (blocker == PRECONDITION_BLOCK_UTILITY_MODE) {
+        track_popup_show_error("Once: utility mode blocked start");
+        return;
+    }
+
     if (blocker == PRECONDITION_BLOCK_BATTERY_LOW_SOC) {
         precondition_soc_t soc;
         if (precondition_get_battery_soc(&soc)) {
@@ -468,6 +505,14 @@ static void show_repeating_soc_notice(void) {
     snprintf(message, sizeof(message),
              "%s: resuming when SoC ≥ %u%%",
              precondition_mode_name(true), PRECONDITION_BATTERY_SOC_CUTOFF_PCT);
+    track_popup_show_warning(message);
+}
+
+static void show_repeating_utility_notice(void) {
+    char message[48];
+    snprintf(message, sizeof(message),
+             "%s: blocked by utility mode",
+             precondition_mode_name(false));
     track_popup_show_warning(message);
 }
 
@@ -513,6 +558,8 @@ static void show_request_started_notice(void) {
 
     if (blocker == PRECONDITION_BLOCK_BATTERY_LOW_SOC) {
         show_repeating_soc_notice();
+    } else if (blocker == PRECONDITION_BLOCK_UTILITY_MODE) {
+        show_repeating_utility_notice();
     } else {
         // Repeating modes announce the target temp even when the current
         // temperature has already reached it.
@@ -526,6 +573,8 @@ static stop_reason_t once_stop_reason(void) {
             return STOP_REASON_LOW_SOC;
         case PRECONDITION_BLOCK_BATTERY_WARM:
             return STOP_REASON_TEMPERATURE_REACHED;
+        case PRECONDITION_BLOCK_UTILITY_MODE:
+            return STOP_REASON_UTILITY_MODE;
         default:
             return STOP_REASON_UNEXPECTED_IDLE;
     }
@@ -572,6 +621,9 @@ static void show_stopping_notice(stop_reason_t reason) {
             break;
         case STOP_REASON_RETRIES_EXHAUSTED:
             track_popup_show_error("Once: start failed (out of retries)");
+            break;
+        case STOP_REASON_UTILITY_MODE:
+            track_popup_show_info("Once: utility mode stopped precon.");
             break;
     }
 }
@@ -709,7 +761,8 @@ static void idle_enter(sm_t *sm) {
 }
 
 static void idle_tick(sm_t *sm) {
-    if (idle.continuous_disabled_by_car_off && platform.car_in_ready
+    if (idle.continuous_disabled_by_car_off
+            && platform.ready_status == READY_STATUS_READY
             && ts_elapsed(sm_now(sm), idle.continuous_disabled_ready_at_us)
                     >= PRECONDITION_CAR_START_DELAY_US) {
         idle.continuous_disabled_by_car_off = false;
@@ -775,6 +828,13 @@ static bool requested_event(sm_t *sm, sm_event_t ev) {
                 show_repeating_soc_notice();
             }
             return true;
+        case EV_UTILITY_MODE:
+            if (precon_config.mode == ONCE) {
+                sm_transition_arg(sm, &S_STOPPING, STOP_REASON_UTILITY_MODE);
+            } else {
+                sm_transition(sm, &S_MANAGED);
+            }
+            return true;
     }
     return false;
 }
@@ -785,10 +845,13 @@ static fwd_result_t requested_fwd(sm_t *sm, twai_message_t *to_send, can_bus_t f
     if (fwd_bus != CAR_BUS) {
         return FWD_PASSTHROUGH;
     }
-    // block 0x0C7 so that the head unit doesn't turn off preconditioning on us
-    // TODO(ejones): handle utility mode and test
-    // (mitm 00 00 on bytes 4 and 5 to E0 07 (allows utility mode (byte 3, 80) to go through))
-    if (to_send->identifier == 0x0C7U) {
+    // Block head-unit commands that could cancel preconditioning, but always
+    // forward utility requests. Repeating modes stay under REQUESTED in MANAGED,
+    // so also allow other control frames while utility mode is tracked by READY
+    // edges. Without READY frames, the utility latch cannot be cleared.
+    if (IS_BMU_CONTROL_FRAME(to_send->identifier)
+            && !is_utility_request(to_send)
+            && !(ready_status_available() && platform.car_in_utility)) {
         return FWD_BLOCK;
     }
     // MITM 0x4ED while preconditioning is requested
@@ -832,6 +895,8 @@ static bool abort_start_if_blocked(sm_t *sm) {
             ESP_LOGI(TAG, "Attempt blocked: HV battery SoC is %u.%u%%",
                      soc.raw / 2U, (soc.raw % 2U) * 5U);
         }
+    } else if (blocker == PRECONDITION_BLOCK_UTILITY_MODE) {
+        ESP_LOGI(TAG, "Attempt blocked: car is in utility mode");
     } else {
         precondition_temperature_t temperature;
         if (precondition_get_battery_temperature(&temperature)) {
@@ -983,7 +1048,7 @@ static void managed_enter(sm_t *sm) {
 }
 
 static void managed_tick(sm_t *sm) {
-    if (platform.car_in_ready && managed.nudge_at_us != 0
+    if (platform.ready_status == READY_STATUS_READY && managed.nudge_at_us != 0
             && precon_blockers == PRECONDITION_BLOCK_NONE
             && sm_now(sm) >= managed.nudge_at_us) {
         // targets the parent, so REQUESTED exits and re-enters: fresh attempt
@@ -1027,13 +1092,20 @@ static bool managed_event(sm_t *sm, sm_event_t ev) {
 
 // The entry argument states why the stop began. Blocked starts and exhausted
 // start retries use one cleanup burst without retries or a stop countdown.
-// Normal stops use the full confirmation/retry path.
+// Utility cancellations and stops blocked by utility mode skip the burst;
+// normal stops confirm and retry.
 static void stopping_enter(sm_t *sm) {
     stopping.reason = (stop_reason_t)sm_entry_arg(sm);
+    show_stopping_notice(stopping.reason);
+    if (stopping.reason == STOP_REASON_UTILITY_MODE
+            || (precon_blockers & PRECONDITION_BLOCK_UTILITY_MODE)) {
+        // Stop commands would interrupt utility mode, even for a user-requested stop.
+        sm_transition(sm, &S_IDLE);
+        return;
+    }
     stopping.retries = (stopping.reason == STOP_REASON_START_BLOCKED
                        || stopping.reason == STOP_REASON_RETRIES_EXHAUSTED)
                      ? PRECONDITION_MAX_RETRIES : 0U;
-    show_stopping_notice(stopping.reason);
 }
 
 static bool stopping_event(sm_t *sm, sm_event_t ev) {
@@ -1227,12 +1299,41 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
     if (IS_POWER_STATUS_FRAME(to_push->identifier)
             && rx_bus == CAR_BUS
             && to_push->data_length_code >= 1U) {
-        bool ready = POWER_STATUS_READY(to_push->data[0]);
-        if (ready != platform.car_in_ready) {
-            platform.car_in_ready = ready;
-            ESP_LOGI(TAG, "car power: %s", ready ? "ready" : "off");
-            sm_send_event(sm, ready ? EV_CAR_READY : EV_CAR_NOT_READY);
+        ready_status_t ready = POWER_STATUS_READY(to_push->data[0])
+                               ? READY_STATUS_READY : READY_STATUS_NOT_READY;
+        // UNKNOWN counts as not-ready, preserving the plain-bool edge behavior:
+        // the first frame fires an event only if it reports READY
+        bool was_ready = platform.ready_status == READY_STATUS_READY;
+        bool is_ready = ready == READY_STATUS_READY;
+        platform.ready_status = ready;
+        if (is_ready != was_ready) {
+            ESP_LOGI(TAG, "car power: %s", is_ready ? "ready" : "off");
+            // definitely out of utility mode if the car power changes
+            // as that's the only way to leave utility mode
+            // probably there's a value here corresponding to utility mode
+            // let's find it later as NOT_READY is a fine catch-all that
+            // should include utility mode
+            platform.car_in_utility = false;
+            update_precon_blocker(PRECONDITION_BLOCK_UTILITY_MODE, false);
+            sm_send_event(sm, is_ready ? EV_CAR_READY : EV_CAR_NOT_READY);
         }
+    }
+
+    // Only act on the first utility request: repeat frames must not
+    // revert a preconditioning request the user makes while utility mode is on
+    if (rx_bus == HEAD_UNIT_BUS
+            && is_utility_request(to_push)
+            && !platform.car_in_utility) {
+        // utility mode requested
+        platform.car_in_utility = true;
+        // only arm the blocker where the READY status is observable: that edge
+        // is the only thing that clears it, so on platforms without 0x038 the
+        // blocker would latch forever and silently forbid every later start
+        update_precon_blocker(
+            PRECONDITION_BLOCK_UTILITY_MODE,
+            ready_status_available()
+        );
+        sm_send_event(sm, EV_UTILITY_MODE);
     }
 
     // 0x2AD/0x0A82AA03 status frame: second byte indicates precondition state
