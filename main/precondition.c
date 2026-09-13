@@ -329,6 +329,7 @@ typedef enum {
     STOP_REASON_UNEXPECTED_IDLE,
     STOP_REASON_TEMPERATURE_REACHED,
     STOP_REASON_LOW_SOC,
+    STOP_REASON_CONDITIONING_MODE_OFF,
     STOP_REASON_START_BLOCKED,
     STOP_REASON_RETRIES_EXHAUSTED,
 } stop_reason_t;
@@ -338,9 +339,21 @@ typedef uint8_t precondition_blockers_t;
 enum {
     PRECONDITION_BLOCK_NONE = 0U,
     // Higher bits have higher display and stop-reason priority.
-    PRECONDITION_BLOCK_BATTERY_WARM = 1U << 0,
-    PRECONDITION_BLOCK_BATTERY_LOW_SOC = 1U << 1,
+    // The car's conditioning mode being off only ranks above nothing: the
+    // firmware turns it back on itself (see PRECONDITION_BLOCK_ABORTS), so a
+    // car-imposed condition is the more useful thing to report.
+    PRECONDITION_BLOCK_CONDITIONING_MODE_OFF = 1U << 0,
+    PRECONDITION_BLOCK_BATTERY_WARM = 1U << 1,
+    PRECONDITION_BLOCK_BATTERY_LOW_SOC = 1U << 2,
 };
+
+// Blockers that stop a start attempt outright. Conditioning mode off is absent
+// on purpose: the start burst turns the mode back on before its first start
+// frame, so aborting on it would make that fix unreachable and leave the mode
+// off for good. It is still ranked and reported, which is what names the failure
+// when the mode never comes back.
+#define PRECONDITION_BLOCK_ABORTS \
+    (PRECONDITION_BLOCK_BATTERY_WARM | PRECONDITION_BLOCK_BATTERY_LOW_SOC)
 
 // owned by IDLE
 static struct {
@@ -665,6 +678,8 @@ static stop_reason_t once_stop_reason(void) {
             return STOP_REASON_LOW_SOC;
         case PRECONDITION_BLOCK_BATTERY_WARM:
             return STOP_REASON_TEMPERATURE_REACHED;
+        case PRECONDITION_BLOCK_CONDITIONING_MODE_OFF:
+            return STOP_REASON_CONDITIONING_MODE_OFF;
         default:
             return STOP_REASON_UNEXPECTED_IDLE;
     }
@@ -711,8 +726,19 @@ static void show_stopping_notice(stop_reason_t reason) {
         case STOP_REASON_START_BLOCKED:
             show_once_blocker_notice(primary_precon_blocker());
             break;
+        case STOP_REASON_CONDITIONING_MODE_OFF:
+            // The session ended and the car reports the mode off: the start
+            // burst's enable phase did not stick.
+            track_popup_show_warning("Once: stopping (conditioning mode off)");
+            break;
         case STOP_REASON_RETRIES_EXHAUSTED:
-            track_popup_show_error("Once: start failed (out of retries)");
+            // A mode that never came back is the likelier cause than the retry
+            // budget, so name it instead of blaming the retries.
+            if ((precon_blockers & PRECONDITION_BLOCK_CONDITIONING_MODE_OFF) != 0U) {
+                track_popup_show_error("Once: start failed (conditioning mode off)");
+            } else {
+                track_popup_show_error("Once: start failed (out of retries)");
+            }
             break;
     }
 }
@@ -976,10 +1002,12 @@ static void car_start_delay_tick(sm_t *sm) {
 
 // ********************* REQUESTED / START_BURST *********************
 
-// Abort an in-progress start attempt when precon is known to be blocked.
+// Abort an in-progress start attempt when precon is known to be blocked. The
+// conditioning-mode blocker is deliberately not one of these: the start burst
+// turns the mode back on, so aborting would make that unreachable.
 static bool abort_start_if_blocked(sm_t *sm) {
     precondition_blockers_t blocker = primary_precon_blocker();
-    if (blocker == PRECONDITION_BLOCK_NONE) {
+    if ((blocker & PRECONDITION_BLOCK_ABORTS) == PRECONDITION_BLOCK_NONE) {
         return false;
     }
 
@@ -1155,7 +1183,9 @@ static void managed_enter(sm_t *sm) {
 
 static void managed_tick(sm_t *sm) {
     if (platform.car_in_ready && managed.nudge_at_us != 0
-            && precon_blockers == PRECONDITION_BLOCK_NONE
+            // only car-imposed blockers hold nudges back: a nudge is how the
+            // mode-off blocker gets retried
+            && (precon_blockers & PRECONDITION_BLOCK_ABORTS) == PRECONDITION_BLOCK_NONE
             && sm_now(sm) >= managed.nudge_at_us) {
         // targets the parent, so REQUESTED exits and re-enters: fresh attempt
         // ctx, kind set from the entry argument, descend into START_BURST
@@ -1499,6 +1529,13 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
         platform.conditioning_mode =
             (to_push->data[CONDITIONING_MODE_INDEX] & CONDITIONING_MODE_ENABLED_MASK) != 0U
             ? CONDITIONING_MODE_ENABLED : CONDITIONING_MODE_DISABLED;
+        // Recognized but never pre-empted: a start attempt enables the mode
+        // itself (PRECONDITION_BLOCK_ABORTS), so this only surfaces when the
+        // mode stays off anyway.
+        (void)update_precon_blocker(
+            PRECONDITION_BLOCK_CONDITIONING_MODE_OFF,
+            platform.conditioning_mode == CONDITIONING_MODE_DISABLED
+        );
         // A pending charge-limit re-assertion decides on the newest reading from
         // its decision window, so a later reading inside the window overrides an
         // earlier one.
