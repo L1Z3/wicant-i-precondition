@@ -7,8 +7,14 @@
 
 #define TAG __func__
 
+// fallback for v300
+// note: never use `!= HEAD_UNIT_BUS` as the fallback breaks this
 #define CAR_BUS CAN_BUS_0
+#if CAN_BUS_COUNT > 1
 #define HEAD_UNIT_BUS CAN_BUS_1
+#else
+#define HEAD_UNIT_BUS CAN_BUS_0
+#endif
 
 // Head-unit charge-limit command (D5 = AC limit, D6 = DC limit, same factor
 // 0.5): only ever seen on the head-unit bus.
