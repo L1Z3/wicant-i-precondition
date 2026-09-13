@@ -726,7 +726,10 @@ static void run_conditioning_mode_check(void) {
     expect_state("idle");
     battery_soc(39);
     conditioning_mode(0x40);
-    CHECK(precon_blockers == PRECONDITION_BLOCK_BATTERY_LOW_SOC);
+    // The SoC blocker is car-imposed and outranks the mode-off one, so it is
+    // what the stop reports.
+    CHECK(precon_blockers
+          == (PRECONDITION_BLOCK_BATTERY_LOW_SOC | PRECONDITION_BLOCK_CONDITIONING_MODE_OFF));
     sent_count = 0;
     toggle();
     expect_state("stop-burst");
@@ -912,6 +915,105 @@ static void run_charge_limit_reassert(void) {
     CHECK(sent_count == (int)CONDITIONING_MODE_TICKS);
     check_conditioning_mode_burst_msgs(0);
     CHECK(charge_limit_watch.remaining == 0U);
+}
+
+// Conditioning mode off is a blocker the firmware fixes itself: a start attempt
+// enables the mode before its first start frame, so the blocker must never stop
+// an attempt. It only names the failure once the mode stays off anyway.
+static void run_conditioning_mode_blocker(void) {
+    precondition_init();
+    platform.conditioning_mode = CONDITIONING_MODE_UNKNOWN;
+    expect_state("idle");
+    CHECK(precon_blockers == PRECONDITION_BLOCK_NONE);
+
+    // Only the car's own copy of 0x25D drives it.
+    conditioning_mode_d6(0x40, CAN_BUS_1);
+    CHECK(precon_blockers == PRECONDITION_BLOCK_NONE);
+    uint8_t short_frame[8];
+    memset(short_frame, 0x40, sizeof(short_frame));
+    rx_frame_len(0x25D, short_frame, CONDITIONING_MODE_DATA_LENGTH - 1, CAN_BUS_0);
+    CHECK(precon_blockers == PRECONDITION_BLOCK_NONE);
+    conditioning_mode(0x40);
+    CHECK(precon_blockers == PRECONDITION_BLOCK_CONDITIONING_MODE_OFF);
+    conditioning_mode(0x80);
+    CHECK(precon_blockers == PRECONDITION_BLOCK_NONE);
+
+    // A start attempt with the mode off still runs, enable phase first: the
+    // blocker must not make its own fix unreachable.
+    conditioning_mode(0x40);
+    CHECK(precon_blockers == PRECONDITION_BLOCK_CONDITIONING_MODE_OFF);
+    sent_count = 0;
+    toggle();
+    expect_state("start-burst");
+    for (int i = 0; i < (int)CONDITIONING_MODE_TICKS; i++) tick1();
+    CHECK(sent_count == (int)CONDITIONING_MODE_TICKS);
+    check_conditioning_mode_burst_msgs(0);
+    for (int i = 0; i < (int)PRECONDITION_START_TICKS; i++) tick1();
+    CHECK(sent_count == (int)(CONDITIONING_MODE_TICKS + PRECONDITION_START_TICKS));
+    check_start_burst_msgs((int)CONDITIONING_MODE_TICKS);
+    expect_state("wait-starting");
+
+    // Nor does it stop the retries, which are how the enable gets retried. When
+    // they run out the mode is what gets named, not the retry budget.
+    car_status(0x01, CAN_BUS_0);                // status frames arm the retry path
+    for (int r = 1; r <= 4; r++) {
+        advance_until_state("start-burst", 11000000);
+        CHECK(requested.retries == r);
+        for (int i = 0; i < (int)(CONDITIONING_MODE_TICKS + PRECONDITION_START_TICKS); i++) {
+            tick1();
+        }
+        expect_state("wait-starting");
+    }
+    advance_until_state("stop-burst", 11000000);
+    CHECK(stopping.reason == STOP_REASON_RETRIES_EXHAUSTED);
+    CHECK(strcmp(popup_text, "‼ Once: start failed (conditioning mode off)") == 0);
+    for (int i = 0; i < (int)PRECONDITION_STOP_TICKS; i++) tick1();
+    expect_state("wait-stopped");
+    car_status(0x01, CAN_BUS_0);
+    expect_state("idle");
+
+    // A running session whose mode disappears stops with that reason named.
+    conditioning_mode(0x80);
+    CHECK(precon_blockers == PRECONDITION_BLOCK_NONE);
+    toggle();
+    for (int i = 0; i < (int)PRECONDITION_START_TICKS; i++) tick1();
+    car_status(0x15, CAN_BUS_0);
+    expect_state("active");
+    int popups_before = popup_show_count;
+    conditioning_mode(0x40);                    // car reports the mode off...
+    car_status(0x01, CAN_BUS_0);                // ...and the session idle
+    expect_state("stop-burst");
+    CHECK(stopping.reason == STOP_REASON_CONDITIONING_MODE_OFF);
+    CHECK(popup_show_count == popups_before + 1);
+    CHECK(strcmp(popup_text, "⚠ Once: stopping (conditioning mode off)") == 0);
+}
+
+// In a repeating mode the mode-off blocker must not hold back the periodic
+// nudge: the nudge is what retries the enable.
+static void run_conditioning_mode_blocker_repeating(void) {
+    precondition_init();
+    platform.conditioning_mode = CONDITIONING_MODE_UNKNOWN;
+    car_power(true);
+    toggle();
+    for (int i = 0; i < (int)(CONDITIONING_MODE_TICKS + PRECONDITION_START_TICKS); i++) {
+        tick1();
+    }
+    car_status(0x15, CAN_BUS_0);
+    expect_state("active");
+    car_status(0x01, CAN_BUS_0);
+    expect_state("managed");
+
+    conditioning_mode(0x40);
+    CHECK(precon_blockers == PRECONDITION_BLOCK_CONDITIONING_MODE_OFF);
+    sent_count = 0;
+    advance_until_state("start-burst", 302000000LL);
+    CHECK(requested.kind == ATTEMPT_PERIODIC);
+    for (int i = 0; i < (int)(CONDITIONING_MODE_TICKS + PRECONDITION_START_TICKS); i++) {
+        tick1();
+    }
+    CHECK(sent_count == (int)(CONDITIONING_MODE_TICKS + PRECONDITION_START_TICKS));
+    check_conditioning_mode_burst_msgs(0);
+    check_start_burst_msgs((int)CONDITIONING_MODE_TICKS);
 }
 
 static void run_automatic_temperature_cutoff(void) {
@@ -1763,6 +1865,8 @@ static const suite_t suites[] = {
     {"precondition battery state of charge", ONCE, PRESS_SHORT, run_battery_soc},
     {"precondition conditioning mode check", ONCE, PRESS_SHORT, run_conditioning_mode_check},
     {"precondition conditioning reassert on charge limit", ONCE, PRESS_SHORT, run_charge_limit_reassert},
+    {"precondition conditioning mode blocker", ONCE, PRESS_SHORT, run_conditioning_mode_blocker},
+    {"precondition conditioning mode blocker repeating", CONTINUOUS, PRESS_SHORT, run_conditioning_mode_blocker_repeating},
     {"precondition automatic temperature cutoff", CONTINUOUS, PRESS_SHORT, run_automatic_temperature_cutoff},
     {"precondition persistent temperature cutoff", PERSISTENT, PRESS_SHORT, run_automatic_temperature_cutoff},
     {"precondition continuous cool wait", CONTINUOUS, PRESS_SHORT, run_managed_cool_wait},
