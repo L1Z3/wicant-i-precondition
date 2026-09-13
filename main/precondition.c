@@ -580,7 +580,8 @@ static void show_stopping_notice(stop_reason_t reason) {
             track_popup_show_error("Once: start failed (out of retries)");
             break;
         case STOP_REASON_UTILITY_MODE:
-            track_popup_show_info("Once: utility mode stopped precon.")
+            track_popup_show_info("Once: utility mode stopped precon.");
+            break;
     }
 }
 
@@ -793,16 +794,15 @@ static fwd_result_t requested_fwd(sm_t *sm, twai_message_t *to_send, can_bus_t f
     if (fwd_bus != CAR_BUS) {
         return FWD_PASSTHROUGH;
     }
-    // block 0x0C7 so that the head unit doesn't turn off preconditioning on us
-    // TODO(ejones): handle utility mode and test (trh: solved?)
+    // block 0x0C7 so that the head unit doesn't turn off preconditioning on us,
+    // except while the car is in utility mode, where the frame has to reach the
+    // car for the mode change to take effect
+    // TODO(ejones): handle utility mode and test
     // (mitm 00 00 on bytes 4 and 5 to E0 07 (allows utility mode (byte 3, 80) to go through))
-    // let all utility mode rising and falling edge messages through
-    if (platform.car_in_utility) {
-        return FWD_PASSTHROUGH;
-    } else {
+    // the utility mode catch may not be needed here, but is left in to handle race conditions
+    if (to_send->identifier == 0x0C7U && !platform.car_in_utility) {
         return FWD_BLOCK;
     }
-
     // MITM 0x4ED while preconditioning is requested
     if (to_send->identifier == 0x4EDU) {
         to_send->data[5] = 0x10U;
@@ -1247,18 +1247,28 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
             // definitely out of utility mode if the car power changes
             // probably there's a value here corresponding to utility mode
             // let's find it later
-            platform.car_in_utility = false; 
+            platform.car_in_utility = false;
         }
     }
 
-    // utility mode
-    if (IS_BMU_CONTROL_FRAME(to_push->identifier) && (to_push->data[2] == 0x80U && to_push->data[3] == 0xE0U && to_push->data[4] == 0x07U)) {
+    // utility mode: the head unit asserts byte 2 = 0x80 in a 0x0C7 frame to
+    // enter utility mode. only act on the rising edge: repeat frames must not
+    // revert a preconditioning request the user makes while utility mode is on
+    if (rx_bus == HEAD_UNIT_BUS
+            && IS_BMU_CONTROL_FRAME(to_push->identifier)
+            && to_push->data_length_code >= 5U
+            && to_push->data[2] == 0x80U
+            && to_push->data[3] == 0xE0U
+            && to_push->data[4] == 0x07U
+            && !platform.car_in_utility) {
+        platform.car_in_utility = true;
         sm_send_event(sm, EV_UTILITY_MODE);
-        platform.car_in_utility = true; 
         // utility mode requested
         if (precon_config.mode == ONCE) {
-            // tell the user utility mode canceled preconditioning
-            sm_transition_arg(sm, &S_IDLE, STOP_REASON_UTILITY_MODE);
+            // tell the user utility mode canceled preconditioning, then idle
+            // immediately; no stop burst is sent
+            show_stopping_notice(STOP_REASON_UTILITY_MODE);
+            sm_transition(sm, &S_IDLE);
         } else {
             // this seems pretty safe?
             sm_transition(sm, &S_MANAGED);
