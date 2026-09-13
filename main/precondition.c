@@ -207,6 +207,18 @@ static bool activation_is_release(const message_payload_t *msg, const twai_messa
 
 #define IS_CONDITIONING_MODE_FRAME(frame_id) ((frame_id) == CONDITIONING_MODE_FRAME_ID)
 
+// Head-unit charge-limit command. D5 (data[4]) = AC raw, D6 (data[5]) = DC raw,
+// percent * 2; a field the frame does not address reads 0xFF. The head unit
+// addresses AC and DC in separate commands, repeats each value three times at
+// 25 Hz, then sends three all-0xFF rest frames (M-CAN charge-limit logs).
+#define CHARGE_LIMIT_FRAME_ID 0x4C5U
+#define CHARGE_LIMIT_AC_INDEX 4U
+#define CHARGE_LIMIT_DC_INDEX 5U
+#define CHARGE_LIMIT_DATA_LENGTH 6U
+#define CHARGE_LIMIT_UNSET 0xFFU
+
+#define IS_CHARGE_LIMIT_FRAME(frame_id) ((frame_id) == CHARGE_LIMIT_FRAME_ID)
+
 #define CAR_BUS CAN_BUS_0
 #define HEAD_UNIT_BUS CAN_BUS_1
 
@@ -227,7 +239,7 @@ static int64_t ts_elapsed(int64_t now, int64_t old) {
 // IDLE                       Preconditioning is not requested.
 // REQUESTED                  Owns an enabled session and prevents the car from cancelling it.
 // +- CAR_START_DELAY         Waits briefly after READY before a persistent-mode relaunch.
-// +- START_BURST (initial)   Sends the start command sequence
+// +- START_BURST (initial)   Sends the start command sequence.
 // +- WAIT_STARTING           Waits for the car to begin starting.
 // +- WAIT_STARTED            Waits for preconditioning to become fully active.
 // +- ACTIVE                  Monitors active preconditioning in every mode.
@@ -236,7 +248,9 @@ static int64_t ts_elapsed(int64_t now, int64_t old) {
 // +- STOP_BURST (initial)    Sends the stop command sequence.
 // +- WAIT_STOPPED            Waits for the car to confirm that it stopped.
 //
-// Global hooks decode input and status frames independently of the active state.
+// Global hooks decode input and status frames independently of the active state,
+// and re-assert battery conditioning mode when the head unit changes a charge
+// limit (which clears it).
 
 enum {
     EV_TOGGLE,          // activation input fired (short press release / long press hold)
@@ -378,6 +392,47 @@ static struct {
     // has the current hold already triggered? (long press mode fires once per hold)
     bool long_press_fired;
 } button;
+
+// Changing a charge limit clears the car's latched conditioning mode, so a
+// head-unit modification is answered with the documented enable burst. Armed by
+// the rx hook, sequenced one frame per tick by charge_limit_watch_tick. Both run
+// inside state machine dispatch, which is lock-serialized, so no mutex is
+// needed. Platform state, not session state: the mode must come back whether or
+// not preconditioning is currently requested.
+static struct {
+    // frames still owed in the enable burst; 0 = idle
+    uint32_t remaining;
+    // last value-bearing (AC, DC) raw pair the head unit commanded; 0xFF marks a
+    // field the frame did not address, so the first real command always counts
+    uint8_t last_ac_raw;
+    uint8_t last_dc_raw;
+} charge_limit_watch = {
+    .last_ac_raw = CHARGE_LIMIT_UNSET,
+    .last_dc_raw = CHARGE_LIMIT_UNSET,
+};
+
+// Is this the head unit modifying a charge limit? The head unit repeats each
+// value three times and pads every change with all-0xFF rest frames, so only a
+// value-bearing frame carrying a pair we have not already seen is a
+// modification.
+static bool charge_limit_modified(const twai_message_t *f) {
+    if (!IS_CHARGE_LIMIT_FRAME(f->identifier)
+            || f->data_length_code < CHARGE_LIMIT_DATA_LENGTH) {
+        return false;
+    }
+    uint8_t ac_raw = f->data[CHARGE_LIMIT_AC_INDEX];
+    uint8_t dc_raw = f->data[CHARGE_LIMIT_DC_INDEX];
+    if (ac_raw == CHARGE_LIMIT_UNSET && dc_raw == CHARGE_LIMIT_UNSET) {
+        return false;
+    }
+    if (ac_raw == charge_limit_watch.last_ac_raw
+            && dc_raw == charge_limit_watch.last_dc_raw) {
+        return false;
+    }
+    charge_limit_watch.last_ac_raw = ac_raw;
+    charge_limit_watch.last_dc_raw = dc_raw;
+    return true;
+}
 
 static QueueHandle_t battery_temperature_queue = NULL;
 static QueueHandle_t battery_soc_queue = NULL;
@@ -1263,6 +1318,21 @@ static const sm_state_t S_WAIT_STOPPED = {
 
 static void push_precondition_state(void);
 
+// Re-assert battery conditioning mode after a head-unit charge-limit change:
+// one 0x0C7 frame per tick, so the burst keeps the documented 25 Hz spacing.
+// Only the start and stop bursts send 0x0C7 from the per-state walk, so
+// deferring to them (and resuming afterwards) is enough to keep two frames from
+// landing in the same 40 ms slot.
+static void charge_limit_watch_tick(sm_t *sm) {
+    if (charge_limit_watch.remaining == 0U
+            || sm_in(sm, &S_START_BURST)
+            || sm_in(sm, &S_STOP_BURST)) {
+        return;
+    }
+    send_conditioning_mode_enable_msg(CONDITIONING_MODE_TICKS - charge_limit_watch.remaining);
+    charge_limit_watch.remaining--;
+}
+
 static void precondition_global_tick(sm_t *sm) {
     track_popup_tick();
 
@@ -1283,6 +1353,9 @@ static void precondition_global_tick(sm_t *sm) {
         sm_send_event(&precon_sm, EV_TOGGLE);
     }
 
+    // this fixes the charge limit changed -> conditioning mode disabled bug
+    // the head unit also fixes this for changes made through EV settings
+    charge_limit_watch_tick(sm);
     push_precondition_state();
 }
 
@@ -1367,6 +1440,17 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
         platform.conditioning_mode =
             (to_push->data[CONDITIONING_MODE_INDEX] & CONDITIONING_MODE_ENABLED_MASK) != 0U
             ? CONDITIONING_MODE_ENABLED : CONDITIONING_MODE_DISABLED;
+    }
+
+    // A head-unit charge-limit change clears the car's conditioning mode, so
+    // answer it with the enable burst. Only the head-unit bus carries the
+    // command; a 0x4C5 on the car bus is our own injection or the car's own
+    // traffic, neither of which is a head-unit modification. The 0x25D reading
+    // is deliberately not consulted: it is a 200 ms broadcast, so it still
+    // reports the pre-change mode for up to a frame period after the clear.
+    if (rx_bus == HEAD_UNIT_BUS && charge_limit_modified(to_push)) {
+        charge_limit_watch.remaining = CONDITIONING_MODE_TICKS;
+        ESP_LOGI(TAG, "head unit changed charge limit; re-asserting conditioning mode");
     }
 
     int8_t precon_button_type = precon_config.button_type;
