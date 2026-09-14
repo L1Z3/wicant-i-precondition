@@ -832,6 +832,7 @@ static bool requested_event(sm_t *sm, sm_event_t ev) {
             if (precon_config.mode == ONCE) {
                 sm_transition_arg(sm, &S_STOPPING, STOP_REASON_UTILITY_MODE);
             } else {
+                show_repeating_utility_notice();
                 sm_transition(sm, &S_MANAGED);
             }
             return true;
