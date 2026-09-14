@@ -1588,7 +1588,11 @@ static void run_utility_mode(void) {
         CHECK(strcmp(popup_text, "ⓘ Once: utility mode stopped precon.") == 0);
     } else {
         CHECK(repeating_mode_enabled());
-        CHECK(popup_show_count == notices);
+        CHECK(popup_show_count == notices + 1);
+        const char *expected = cfg_mode == PERSISTENT
+                             ? "⚠ Persistent: blocked by utility mode"
+                             : "⚠ Continuous: blocked by utility mode";
+        CHECK(strcmp(popup_text, expected) == 0);
     }
     twai_message_t forwarded = utility;
     CHECK(precondition_fwd_hook(&forwarded, CAR_BUS) == FWD_PASSTHROUGH);
@@ -1601,13 +1605,14 @@ static void run_utility_mode(void) {
     advance_us(REPEATING_MODE_RETRY_INTERVAL_US + 1000000);
     expect_state(cfg_mode == ONCE ? "idle" : "managed");
     CHECK(sent_count == 0);
+    CHECK(popup_show_count == notices);
 
     if (cfg_mode == ONCE) {
         // A blocked manual start keeps its own notice and skips cleanup traffic.
         toggle();
         expect_state("idle");
         CHECK(popup_show_count == notices + 1);
-        CHECK(strcmp(popup_text, "‼ Once: utility mode blocked start") == 0);
+        CHECK(strcmp(popup_text, "‼ Once: can't start in utility mode") == 0);
         advance_us(PRECONDITION_RETRY_US + 1000000);
         CHECK(sent_count == 0);
     }
