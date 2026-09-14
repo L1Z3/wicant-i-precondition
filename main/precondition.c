@@ -456,8 +456,8 @@ static void show_once_blocker_notice(precondition_blockers_t blocker) {
         precondition_soc_t soc;
         if (precondition_get_battery_soc(&soc)) {
             snprintf(message, sizeof(message),
-                     "Once: SoC too low: %u.%u%% < %u%%",
-                     soc.raw / 2U, (soc.raw % 2U) * 5U,
+                     "Once: SoC too low: %u%s%% < %u%%",
+                     soc.raw / 2U, soc.raw % 2U ? ".5" : "",
                      PRECONDITION_BATTERY_SOC_CUTOFF_PCT);
         } else {
             snprintf(message, sizeof(message),
