@@ -340,6 +340,9 @@ static void idle_enter(sm_t *sm) {
 static void idle_tick(sm_t *sm) {
     track_popup_t *service = owner(sm);
     if (xQueueReceive(service->queue, &service->pending_request, 0) == pdTRUE) {
+        if (!beep_play(service->pending_request.beep_count)) {
+            ESP_LOGW(TAG, "could not queue popup beeps");
+        }
         sm_transition(sm, &S_TRIGGER);
     }
 }
@@ -448,15 +451,6 @@ static fwd_result_t popup_owned_fwd(sm_t *sm, twai_message_t *msg,
 
 // ********************* display hold state *********************
 
-static void hold_enter(sm_t *sm) {
-    // HOLD is only entered after the text transfer succeeds. Keep the sound
-    // with its displayed message, rather than when the request is queued.
-    uint8_t count = owner(sm)->pending_request.beep_count;
-    if (count > 0U && !beep_play(count)) {
-        ESP_LOGW(TAG, "could not queue popup beeps");
-    }
-}
-
 static void hold_tick(sm_t *sm) {
     if (sm_time_in_us(sm, &S_HOLD) >= TRACK_POPUP_DISPLAY_HOLD_US) {
         sm_transition(sm, &S_IDLE);
@@ -489,7 +483,6 @@ static const sm_state_t S_SENDING = {
 
 static const sm_state_t S_HOLD = {
     .name = "hold",
-    .enter = hold_enter,
     .tick = hold_tick,
     .fwd = popup_owned_fwd,
 };

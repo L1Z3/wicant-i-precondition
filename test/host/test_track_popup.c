@@ -198,8 +198,10 @@ static void test_popup_flow(void) {
     // H, i, space, U+1F30D EARTH GLOBE EUROPE-AFRICA. The non-BMP codepoint
     // must become the UTF-16 surrogate pair D83C DF0D.
     CHECK(track_popup_show("Hi \xF0\x9F\x8C\x8D"));
+    CHECK(beep_request_count == 0U);
     track_popup_tick();
     expect_state("trigger");
+    CHECK(beep_request_count == 1U && beep_requests[0] == 1U);
     CHECK(!trigger_ctx.strategy_selected);
     CHECK(trigger_ctx.trigger_frames_remaining
           == TRACK_POPUP_TRIGGER_FRAME_COUNT);
@@ -236,7 +238,7 @@ static void test_popup_flow(void) {
     expect_state("sending");
     CHECK(isotp_tx_busy(&popup.isotp));
     CHECK(sent_count == 0U);
-    CHECK(beep_request_count == 0U);
+    CHECK(beep_request_count == 1U);
 
     // The fake worker does not run; manually dispatch its due start.
     isotp_tx_tick(&popup.isotp);
@@ -456,8 +458,10 @@ static void test_fallbacks(void) {
 }
 
 static void start_queued_popup(void) {
+    size_t before = beep_request_count;
     track_popup_tick();
     expect_state("trigger");
+    CHECK(beep_request_count == before + 1U);
     for (unsigned i = 0U; i < TRACK_POPUP_TRIGGER_FRAME_COUNT; i++) {
         CHECK(fwd(TRACK_POPUP_MEDIA_FRAME_ID, TRACK_POPUP_TARGET_BUS, NULL)
               == FWD_MODIFIED);
@@ -485,10 +489,11 @@ static void test_popup_beeps(void) {
     CHECK(track_popup_show_info("Hi"));
     CHECK(track_popup_show_warning("Hi"));
     CHECK(!track_popup_show_error("Queue full"));
-    start_queued_popup();
     CHECK(beep_request_count == 0U);
-    finish_popup_transfer();
+    start_queued_popup();
     CHECK(beep_request_count == 1U && beep_requests[0] == 1U);
+    finish_popup_transfer();
+    CHECK(beep_request_count == 1U);
 
     track_popup_tick();
     fake_now += TRACK_POPUP_DISPLAY_HOLD_US;
@@ -496,18 +501,20 @@ static void test_popup_beeps(void) {
     expect_state("idle");
     CHECK(beep_request_count == 1U);
     start_queued_popup();
-    finish_popup_transfer();
     CHECK(beep_request_count == 2U && beep_requests[1] == 2U);
+    finish_popup_transfer();
+    CHECK(beep_request_count == 2U);
 
     CHECK(track_popup_show_error("Hi"));
     fake_now += TRACK_POPUP_DISPLAY_HOLD_US;
     track_popup_tick();
-    start_queued_popup();
     // A full beep queue must not prevent the popup from displaying or cause
-    // it to keep submitting the same sound during the hold.
+    // it to keep submitting the same sound during the transfer or hold.
     beep_accept = false;
-    finish_popup_transfer();
+    start_queued_popup();
     CHECK(beep_request_count == 3U && beep_requests[2] == 3U);
+    finish_popup_transfer();
+    CHECK(beep_request_count == 3U);
     fake_now += TRACK_POPUP_DISPLAY_HOLD_US;
     track_popup_tick();
     expect_state("idle");
@@ -515,24 +522,28 @@ static void test_popup_beeps(void) {
     beep_accept = true;
 }
 
-static void test_failed_popups_are_silent(void) {
+static void test_failed_popups_beep_once(void) {
     sent_count = 0U;
+    beep_request_count = 0U;
     track_popup_init();
-    size_t before = beep_request_count;
     CHECK(track_popup_show_error("Hi"));
+    CHECK(beep_request_count == 0U);
     track_popup_tick();
+    CHECK(beep_request_count == 1U && beep_requests[0] == 3U);
     fake_now += TRACK_POPUP_TRIGGER_TIMEOUT_US;
     track_popup_tick();
     expect_state("idle");
-    CHECK(beep_request_count == before);
+    CHECK(beep_request_count == 1U);
 
     CHECK(track_popup_show_error("Hi"));
+    CHECK(beep_request_count == 1U);
     start_queued_popup();
+    CHECK(beep_request_count == 2U && beep_requests[1] == 3U);
     fake_now += TRACK_POPUP_ISOTP_FLOW_CONTROL_TIMEOUT_US;
     isotp_tx_tick(&popup.isotp);
     track_popup_tick();
     expect_state("idle");
-    CHECK(beep_request_count == before);
+    CHECK(beep_request_count == 2U);
 }
 
 int main(void) {
@@ -543,6 +554,6 @@ int main(void) {
     test_known_media();
     test_fallbacks();
     test_popup_beeps();
-    test_failed_popups_are_silent();
+    test_failed_popups_beep_once();
     return test_report("track popup state machine");
 }
