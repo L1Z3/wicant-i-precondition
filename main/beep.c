@@ -8,7 +8,7 @@
 #define TAG "beep"
 
 // Nominal time between beep starts, including across queued requests.
-#define BEEP_INTERVAL_MS 250U
+#define BEEP_INTERVAL_MS 100U
 // Preserve the recorded 10 ms between the 0x0C start and 0x04 release frames.
 #define BEEP_RELEASE_DELAY_MS 10U
 #define BEEP_FRAME_ID 0x465U
