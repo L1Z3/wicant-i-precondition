@@ -465,7 +465,7 @@ static const char *precondition_mode_name(bool abbreviated) {
 static void show_once_blocker_notice(precondition_blockers_t blocker) {
     char message[48];
     if (blocker == PRECONDITION_BLOCK_UTILITY_MODE) {
-        track_popup_show_error("Once: utility mode blocked start");
+        track_popup_show_error("Once: can't start in utility mode");
         return;
     }
 
