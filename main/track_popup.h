@@ -22,10 +22,13 @@ fwd_result_t track_popup_fwd(twai_message_t *msg, can_bus_t fwd_bus);
 
 // Queue arbitrary UTF-8 text for the cluster's track-selection popup. The
 // text is converted to UTF-16LE and copied before this function returns.
+// This unclassified form is silent.
 // Returns false if uninitialized, for invalid/oversized text, or a full queue.
 bool track_popup_show(const char *utf8_text);
 
 // Queue a popup with a severity marker prefixed to the supplied text.
+// After a successful text transfer, sound 1 (info), 2 (warning), or 3 (error)
+// head-unit beeps through the independent beep service (best effort).
 bool track_popup_show_info(const char *utf8_text);
 bool track_popup_show_warning(const char *utf8_text);
 bool track_popup_show_error(const char *utf8_text);
