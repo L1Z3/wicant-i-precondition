@@ -143,7 +143,7 @@ static void test_severity_wrappers(void) {
     CHECK(track_popup_show_error("Stopped"));
     expect_queued_text("‼ Stopped", 3U);
     CHECK(track_popup_show("Plain"));
-    expect_queued_text("Plain", 0U);
+    expect_queued_text("Plain", 1U);
     CHECK(beep_request_count == 0U);
 
     // The two-character prefix counts against the popup's 50-character cap.
@@ -162,6 +162,7 @@ static void test_severity_wrappers(void) {
 }
 
 static void test_popup_flow(void) {
+    beep_request_count = 0U;
     track_popup_init();
     expect_state("idle");
 
@@ -235,6 +236,7 @@ static void test_popup_flow(void) {
     expect_state("sending");
     CHECK(isotp_tx_busy(&popup.isotp));
     CHECK(sent_count == 0U);
+    CHECK(beep_request_count == 0U);
 
     // The fake worker does not run; manually dispatch its due start.
     isotp_tx_tick(&popup.isotp);
@@ -266,6 +268,7 @@ static void test_popup_flow(void) {
 
     track_popup_tick();
     expect_state("hold");
+    CHECK(beep_request_count == 1U && beep_requests[0] == 1U);
     CHECK(fwd(TRACK_POPUP_FALLBACK_ISOTP_TX_ID,
               TRACK_POPUP_TARGET_BUS, NULL) == FWD_BLOCK);
     CHECK(fwd(TRACK_POPUP_FALLBACK_ISOTP_FLOW_CONTROL_ID,
@@ -291,6 +294,7 @@ static void test_popup_flow(void) {
     fake_now++;
     track_popup_tick();
     expect_state("idle");
+    CHECK(beep_request_count == 1U);
     CHECK(fwd(TRACK_POPUP_FALLBACK_ISOTP_TX_ID,
               TRACK_POPUP_TARGET_BUS, NULL) == FWD_PASSTHROUGH);
     CHECK(fwd(TRACK_POPUP_FALLBACK_ISOTP_FLOW_CONTROL_ID,
@@ -476,8 +480,8 @@ static void finish_popup_transfer(void) {
 
 static void test_popup_beeps(void) {
     sent_count = 0U;
+    beep_request_count = 0U;
     track_popup_init();
-    CHECK(beep_request_count == 0U);  // All preceding unclassified popups were silent.
     CHECK(track_popup_show_info("Hi"));
     CHECK(track_popup_show_warning("Hi"));
     CHECK(!track_popup_show_error("Queue full"));

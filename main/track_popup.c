@@ -554,7 +554,7 @@ static bool queue_popup(const char *utf8_text, uint8_t beep_count) {
 }
 
 bool track_popup_show(const char *utf8_text) {
-    return queue_popup(utf8_text, 0U);
+    return queue_popup(utf8_text, 1U);
 }
 
 static bool track_popup_show_prefixed(const char *prefix,
