@@ -9,7 +9,7 @@
 # Adding a test: drop test_<name>.c in this directory; it is discovered
 # automatically, built as its own binary, and run by `make`. See README.md.
 #
-# The precondition suite is also built a second time with -DCAN_BUS_COUNT=1
+# The precondition and beep suites are also built with -DCAN_BUS_COUNT=1
 # (see SINGLE_BUS_BINS below) so the v300/single-bus preprocessor branches are
 # exercised rather than merely compiled out.
 #
@@ -21,7 +21,7 @@
 MAIN := ../../main
 
 # firmware files tests compile against (copied into build/src)
-FW_FILES := utf8_utf16_converter.c utf8_utf16_converter.h hsm.c hsm.h \
+FW_FILES := utf8_utf16_converter.c utf8_utf16_converter.h hsm.c hsm.h beep.c beep.h \
 	isotp_tx.c isotp_tx.h track_popup.c track_popup.h \
 	precondition.c precondition.h persistent_settings.c persistent_settings.h
 # firmware sources linked into every test binary (tests that #include a
@@ -32,9 +32,9 @@ CC ?= cc
 CFLAGS ?= -std=gnu17 -Wall -Wextra -Wno-unused-parameter -g -pthread
 CPPFLAGS += -Istubs -Isupport -Ibuild/src
 
-# every test_*.c, plus the single-bus build of the precondition suite: same
-# source, compiled for a one-bus board, so its CAN_BUS_COUNT fallbacks run in CI
-SINGLE_BUS_BINS := build/test_precondition_1bus
+# every test_*.c, plus single-bus builds of the precondition and beep suites
+# so their CAN_BUS_COUNT fallbacks run in CI
+SINGLE_BUS_BINS := build/test_precondition_1bus build/test_beep_single_bus
 TEST_BINS := $(patsubst %.c,build/%,$(wildcard test_*.c)) $(SINGLE_BUS_BINS)
 FW_COPIES := $(addprefix build/src/,$(FW_FILES))
 HEADERS := $(wildcard stubs/*.h stubs/*/*.h support/*.h)
@@ -58,6 +58,9 @@ build/src/%: $(MAIN)/% | build/src
 
 build/src:
 	mkdir -p build/src
+
+build/test_beep_single_bus: test_beep.c $(FW_COPIES) $(HEADERS) | build/src
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DCAN_BUS_COUNT=1 -o $@ $<
 
 build/test_%: test_%.c $(FW_COPIES) $(HEADERS) | build/src
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DEXPECT_CAN_BUS_COUNT=2 -o $@ $< $(LINK_SRCS) \

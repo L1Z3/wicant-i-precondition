@@ -7,6 +7,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "can.h"
+#include "beep.h"
 #include "track_popup.h"
 
 typedef struct {
@@ -16,6 +17,17 @@ typedef struct {
 
 static sent_t sent[32];
 static size_t sent_count;
+static uint8_t beep_requests[8];
+static size_t beep_request_count;
+static bool beep_accept = true;
+
+bool beep_play(uint8_t count) {
+    CHECK(beep_request_count < sizeof(beep_requests));
+    if (beep_request_count < sizeof(beep_requests)) {
+        beep_requests[beep_request_count++] = count;
+    }
+    return beep_accept;
+}
 
 esp_err_t can_send(can_bus_t bus, twai_message_t *message,
                    TickType_t ticks_to_wait) {
@@ -108,13 +120,14 @@ static void test_before_init(void) {
           == FWD_PASSTHROUGH);
 }
 
-static void expect_queued_text(const char *expected_text) {
+static void expect_queued_text(const char *expected_text, uint8_t beep_count) {
     track_popup_request_t expected = {0};
     track_popup_request_t actual = {0};
     CHECK(encode_text(expected_text, &expected));
     CHECK(xQueueReceive(popup.queue, &actual, 0) == pdTRUE);
     CHECK(actual.size == expected.size);
     CHECK(memcmp(actual.data, expected.data, expected.size) == 0);
+    CHECK(actual.beep_count == beep_count);
 }
 
 static void test_severity_wrappers(void) {
@@ -124,11 +137,14 @@ static void test_severity_wrappers(void) {
     CHECK(!track_popup_show_warning(""));
 
     CHECK(track_popup_show_info("Ready"));
-    expect_queued_text("ⓘ Ready");
+    expect_queued_text("ⓘ Ready", 1U);
     CHECK(track_popup_show_warning("Careful"));
-    expect_queued_text("⚠ Careful");
+    expect_queued_text("⚠ Careful", 2U);
     CHECK(track_popup_show_error("Stopped"));
-    expect_queued_text("‼ Stopped");
+    expect_queued_text("‼ Stopped", 3U);
+    CHECK(track_popup_show("Plain"));
+    expect_queued_text("Plain", 0U);
+    CHECK(beep_request_count == 0U);
 
     // The two-character prefix counts against the popup's 50-character cap.
     char max_message[TRACK_POPUP_MAX_TEXT_CODE_UNITS - 1U];
@@ -435,6 +451,86 @@ static void test_fallbacks(void) {
     expect_fallback(0x12U);
 }
 
+static void start_queued_popup(void) {
+    track_popup_tick();
+    expect_state("trigger");
+    for (unsigned i = 0U; i < TRACK_POPUP_TRIGGER_FRAME_COUNT; i++) {
+        CHECK(fwd(TRACK_POPUP_MEDIA_FRAME_ID, TRACK_POPUP_TARGET_BUS, NULL)
+              == FWD_MODIFIED);
+    }
+    fake_now += TRACK_POPUP_TRIGGER_SETTLE_US;
+    track_popup_tick();
+    expect_state("sending");
+    isotp_tx_tick(&popup.isotp);
+}
+
+static void finish_popup_transfer(void) {
+    uint8_t flow_control[8] = {0x30U, 0x00U, 0x00U};
+    rx(popup.active_transport.flow_control_id, flow_control,
+       TRACK_POPUP_TARGET_BUS);
+    isotp_tx_tick(&popup.isotp);
+    CHECK(isotp_tx_result(&popup.isotp) == ISOTP_TX_RESULT_SUCCESS);
+    track_popup_tick();
+    expect_state("hold");
+}
+
+static void test_popup_beeps(void) {
+    sent_count = 0U;
+    track_popup_init();
+    CHECK(beep_request_count == 0U);  // All preceding unclassified popups were silent.
+    CHECK(track_popup_show_info("Hi"));
+    CHECK(track_popup_show_warning("Hi"));
+    CHECK(!track_popup_show_error("Queue full"));
+    start_queued_popup();
+    CHECK(beep_request_count == 0U);
+    finish_popup_transfer();
+    CHECK(beep_request_count == 1U && beep_requests[0] == 1U);
+
+    track_popup_tick();
+    fake_now += TRACK_POPUP_DISPLAY_HOLD_US;
+    track_popup_tick();
+    expect_state("idle");
+    CHECK(beep_request_count == 1U);
+    start_queued_popup();
+    finish_popup_transfer();
+    CHECK(beep_request_count == 2U && beep_requests[1] == 2U);
+
+    CHECK(track_popup_show_error("Hi"));
+    fake_now += TRACK_POPUP_DISPLAY_HOLD_US;
+    track_popup_tick();
+    start_queued_popup();
+    // A full beep queue must not prevent the popup from displaying or cause
+    // it to keep submitting the same sound during the hold.
+    beep_accept = false;
+    finish_popup_transfer();
+    CHECK(beep_request_count == 3U && beep_requests[2] == 3U);
+    fake_now += TRACK_POPUP_DISPLAY_HOLD_US;
+    track_popup_tick();
+    expect_state("idle");
+    CHECK(beep_request_count == 3U);
+    beep_accept = true;
+}
+
+static void test_failed_popups_are_silent(void) {
+    sent_count = 0U;
+    track_popup_init();
+    size_t before = beep_request_count;
+    CHECK(track_popup_show_error("Hi"));
+    track_popup_tick();
+    fake_now += TRACK_POPUP_TRIGGER_TIMEOUT_US;
+    track_popup_tick();
+    expect_state("idle");
+    CHECK(beep_request_count == before);
+
+    CHECK(track_popup_show_error("Hi"));
+    start_queued_popup();
+    fake_now += TRACK_POPUP_ISOTP_FLOW_CONTROL_TIMEOUT_US;
+    isotp_tx_tick(&popup.isotp);
+    track_popup_tick();
+    expect_state("idle");
+    CHECK(beep_request_count == before);
+}
+
 int main(void) {
     test_before_init();
     test_severity_wrappers();
@@ -442,5 +538,7 @@ int main(void) {
     test_media_transport_map();
     test_known_media();
     test_fallbacks();
+    test_popup_beeps();
+    test_failed_popups_are_silent();
     return test_report("track popup state machine");
 }
