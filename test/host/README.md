@@ -13,7 +13,7 @@ CI runs them as the `host-tests` job of the build-firmware workflow.
 
 Beep tests cover CAN payloads, timing, FIFO requests, and send failures in both
 single-bus and dual-bus builds. Popup tests check severity counts and ensure
-sound is requested only after a successful text transfer.
+sound is requested once when each popup is dequeued, even if its transfer fails.
 
 ## Layout
 
