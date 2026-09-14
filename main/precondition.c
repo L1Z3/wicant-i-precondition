@@ -489,7 +489,7 @@ static char *format_temperature(int celsius, char text[TEMPERATURE_TEXT_SIZE]) {
 static void show_once_blocker_notice(precondition_blockers_t blocker) {
     char message[48];
     if (blocker == PRECONDITION_BLOCK_UTILITY_MODE) {
-        track_popup_show_error("Once: utility mode blocked start");
+        track_popup_show_error("Once: can't start in utility mode");
         return;
     }
 
