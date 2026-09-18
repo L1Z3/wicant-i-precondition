@@ -10,7 +10,26 @@ This is a fork of the [WiCAN firmware repository](https://github.com/meatpihq/wi
 2. Install ESP-IDF: `cd wicant-i-precondition/esp-idf && ./install.sh`
 3. Export the environment: `. ./export.sh`
 4. Open project and build: `cd .. && ./build.sh v300`
-5. Flash: use http interface or if using USB: `idf.py flash`
+5. Flash: use http interface or if using USB: `idf.py -B build.v300 flash`
+
+Select a hardware variant with `./build.sh v300`, `./build.sh proto`, or
+`./build.sh eb-fd`; `./build.sh all` builds all three into separate
+`build.<variant>` directories. Use that same directory with `idf.py -B` when
+flashing. Direct `idf.py` builds default to `proto`; override with
+`-DHARDWARE_VER_NAME=<variant>`.
+
+| Variant | Target | External CAN controller | Hardware version |
+| --- | --- | --- | --- |
+| `v300` | ESP32-C3 | None | `WiCAN-OBD` |
+| `proto` (formerly `custom`) | ESP32-S3 | MCP2515, 8 MHz oscillator | `WiCAN-PROTO` |
+| `eb-fd` | ESP32-S3 | MCP2518FD, 40 MHz oscillator | `WiCAN-EB-FD` |
+
+`eb-fd` currently adds hardware/build configuration only. Its MCP2518FD driver
+is not yet integrated, so bus 1 remains disabled and logs an unsupported-driver
+error when enabled. The ESP32-S3 module configuration, GPIO mapping, SPI speed,
+LEDs, and battery sensing provisionally match `proto` pending schematic
+confirmation. The MCP2515 reset GPIO is not used on `eb-fd`. CAN FD support is
+not yet implemented.
 
 # WiCAN-OBD-C3 Information
 

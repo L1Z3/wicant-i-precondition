@@ -33,24 +33,30 @@
 // All buses on all boards: classic CAN, 87.5% sample point (CiA recommendation)
 #define CAN_SAMPLE_POINT_PERMILL    875
 
-#if HARDWARE_VER == WICAN_CUSTOM
+#if HARDWARE_VER == WICAN_PROTO || HARDWARE_VER == WICAN_EB_FD
 
-// ---- Custom WiCAN: ESP32-S3-WROOM-1 N16R8, two CAN buses, no STN chip. ---- //
+// ---- Proto / EB-FD: ESP32-S3-WROOM-1 N16R8, two CAN buses, no STN chip. ---- //
 // These values come essentially verbatim from the hwconfig.h/main.c
-// in Ali's provided test firmware for the custom WiCAN.
+// in Ali's provided test firmware for the original prototype (proto).
+// EB-FD provisionally shares the module, pin mapping, LEDs, and VBAT circuit;
+// confirm these against its schematic before hardware bring-up.
+
+#define CAN_BUS_COUNT                2
 
 // -- Bus 0: TWAI controller on ESP -> SN65HVD233 #1 -- //
 
 #define TX_GPIO_NUM                 2
 #define RX_GPIO_NUM                 1
 // As per Ali, the transceiver standby mode (i.e. RS mode-select pin (pin 8))
-// is not working on the custom WiCAN rev 1.
-// As such, CAN_STDBY_GPIO_NUM is not defined here. 
+// is not working on proto. EB-FD's standby wiring is not yet confirmed.
+// As such, CAN_STDBY_GPIO_NUM is not defined here.
+
+#if HARDWARE_VER == WICAN_PROTO
 
 // -- Bus 1: MCP2515 (SPI2) -> SN65HVD233 #2 -- //
 
 #define HW_HAS_MCP2515               1
-#define CAN_BUS_COUNT                2
+#define HW_HAS_MCP2518FD             0
 #define MCP2515_SPI_HOST             SPI2_HOST
 #define MCP2515_SCLK_GPIO_NUM        17
 #define MCP2515_MOSI_GPIO_NUM        16
@@ -63,6 +69,25 @@
 // enable or reads garbage after an SPI/board change, drop this back to 5000000.
 #define MCP2515_SPI_CLOCK_HZ         10000000
 #define MCP2515_OSCILLATOR_HZ        8000000
+
+#else
+
+// -- Bus 1: MCP2518FD (SPI2), pending driver integration. -- //
+// SPI pins and speed are provisional carryovers from proto.
+// The 40 MHz oscillator is confirmed; MCP2518FD resets over SPI and has
+// no dedicated reset pin, so proto's GPIO 8 reset must not be used.
+#define HW_HAS_MCP2515               0
+#define HW_HAS_MCP2518FD             1
+#define MCP2518FD_SPI_HOST           SPI2_HOST
+#define MCP2518FD_SCLK_GPIO_NUM      17
+#define MCP2518FD_MOSI_GPIO_NUM      16
+#define MCP2518FD_MISO_GPIO_NUM      15
+#define MCP2518FD_CS_GPIO_NUM        18
+#define MCP2518FD_INT_GPIO_NUM       7
+#define MCP2518FD_SPI_CLOCK_HZ       10000000
+#define MCP2518FD_OSCILLATOR_HZ      40000000
+
+#endif
 
 #define CONNECTED_LED_GPIO_NUM       41
 #define ACTIVE_LED_GPIO_NUM          40
@@ -91,6 +116,7 @@
 #define CAN_STDBY_GPIO_NUM			6
 
 #define HW_HAS_MCP2515              0
+#define HW_HAS_MCP2518FD            0
 #define CAN_BUS_COUNT               1
 
 #define CONNECTED_LED_GPIO_NUM		8
@@ -111,7 +137,7 @@
 #define VBAT_READ_OFFSET_V          0.2f
 
 #else
-#error "HARDWARE_VER must be WICAN_V300 or WICAN_CUSTOM"
+#error "HARDWARE_VER must be WICAN_V300, WICAN_PROTO, or WICAN_EB_FD"
 #endif
 
 esp_err_t hw_config_get_device_id(char *uid);

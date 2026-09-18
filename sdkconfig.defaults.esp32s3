@@ -1,4 +1,5 @@
-# Custom board (ESP32-S3-WROOM-1 N16R8: 16MB quad flash, 8MB octal PSRAM).
+# Proto / EB-FD (ESP32-S3-WROOM-1 N16R8: 16MB quad flash, 8MB octal PSRAM).
+# EB-FD provisionally shares proto's module configuration.
 # SPIRAM settings taken from the known-good WiCAN Pro S3 sdkconfig.
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y

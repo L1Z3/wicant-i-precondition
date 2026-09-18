@@ -6,7 +6,7 @@ if ! command -v nmcli >/dev/null 2>&1; then
   exit 1
 fi
 
-BIN=$(ls -t "$(dirname "${BASH_SOURCE[0]}")"/../build.custom/wican-fw_*.bin "$(dirname "${BASH_SOURCE[0]}")"/../build.v300/wican-fw_*.bin 2>/dev/null | head -1 || true)
+BIN=$(ls -t "$(dirname "${BASH_SOURCE[0]}")"/../build.proto/wican-fw_*.bin "$(dirname "${BASH_SOURCE[0]}")"/../build.eb-fd/wican-fw_*.bin "$(dirname "${BASH_SOURCE[0]}")"/../build.v300/wican-fw_*.bin 2>/dev/null | head -1 || true)
 OTA_URL="http://192.168.80.1/upload/ota.bin"
 PAGE_URL="http://192.168.80.1/"
 WIFI_PASS="@meatpi#"
