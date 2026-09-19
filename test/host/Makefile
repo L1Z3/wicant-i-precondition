@@ -17,7 +17,7 @@
 MAIN := ../../main
 
 # firmware files tests compile against (copied into build/src)
-FW_FILES := utf8_utf16_converter.c utf8_utf16_converter.h hsm.c hsm.h \
+FW_FILES := utf8_utf16_converter.c utf8_utf16_converter.h hsm.c hsm.h beep.c beep.h \
 	isotp_tx.c isotp_tx.h track_popup.c track_popup.h \
 	precondition.c precondition.h persistent_settings.c persistent_settings.h
 # firmware sources linked into every test binary (tests that #include a
@@ -28,7 +28,7 @@ CC ?= cc
 CFLAGS ?= -std=gnu17 -Wall -Wextra -Wno-unused-parameter -g -pthread
 CPPFLAGS += -Istubs -Isupport -Ibuild/src
 
-TEST_BINS := $(patsubst %.c,build/%,$(wildcard test_*.c))
+TEST_BINS := $(patsubst %.c,build/%,$(wildcard test_*.c)) build/test_beep_single_bus
 FW_COPIES := $(addprefix build/src/,$(FW_FILES))
 HEADERS := $(wildcard stubs/*.h stubs/*/*.h support/*.h)
 
@@ -51,6 +51,9 @@ build/src/%: $(MAIN)/% | build/src
 
 build/src:
 	mkdir -p build/src
+
+build/test_beep_single_bus: test_beep.c $(FW_COPIES) $(HEADERS) | build/src
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DCAN_BUS_COUNT=1 -o $@ $<
 
 build/test_%: test_%.c $(FW_COPIES) $(HEADERS) | build/src
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(LINK_SRCS) \

@@ -8,6 +8,8 @@
 typedef void *TaskHandle_t;
 typedef void (*TaskFunction_t)(void *);
 
+void vTaskDelay(TickType_t ticks);
+
 static inline BaseType_t xTaskCreate(TaskFunction_t task, const char *name,
                                     uint32_t stack_size, void *arg,
                                     UBaseType_t priority, TaskHandle_t *handle) {

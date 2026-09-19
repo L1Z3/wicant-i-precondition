@@ -36,3 +36,4 @@ bool config_server_temperature_fahrenheit(void);
 int8_t config_server_precon_button(void);
 int8_t config_server_precon_mode(void);
 int8_t config_server_precon_press(void);
+int8_t config_server_get_fwd_en(void);
