@@ -23,6 +23,28 @@ during disable, controller disconnection, and cleanup after partially completed
 creation. Resource counters check that tasks, semaphores, event groups, and SPI
 devices are released. These are host tests, not measurements on real hardware.
 
+## Bring-up diagnostics
+
+Capture the `mcp251xfd: enabled` and `readback` lines and the first complete
+fault report. At the configured 40 MHz clock and 500 kbit/s, `NBTCFG` should
+read `00440909`; `OSC` bits 0 and 4 should be clear (PLL/divider disabled).
+`CON` bits 23:21 should be 6 in normal Classical CAN mode. The register-valid
+mask should be `f`; bits 0..3 correspond to CON/NBTCFG/OSC/IOCON respectively.
+
+In the service path, error 10 (`ERR__NOT_READY`) means the driver observed
+`CiTREC.TXBO` or `CiBDIAG1.TXBOERR`. It does not identify the physical cause.
+The log now includes TEC/REC and ACK, BIT0, BIT1, FORM, STUFF, and CRC flags,
+including flags from earlier polls. The captured mode matters: configuration
+mode itself sets TXBO, so registers must be captured before fault cleanup.
+
+For the prototype, confirm the bus-1 transceiver model, CAN connector routing,
+and enable/standby wiring and polarity with the board designer. In particular,
+check whether an enable signal is connected to ESP32 GPIO 8 or MCP2518FD
+GPIO0/XSTBY or GPIO1. The current firmware leaves those controller GPIOs as
+inputs and does not use ESP32 GPIO 8. Do not infer an enable polarity from the
+old MCP2515 reset signal. A quiet log in parallel mode does not demonstrate a
+working bus-1 transmit path; verify actual RX as well.
+
 ## Bench checklist — pending physical prototype
 
 Use an isolated, correctly terminated Classical CAN test bus and a second

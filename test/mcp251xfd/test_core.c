@@ -341,6 +341,61 @@ static void test_reenable_and_errors(void)
     }
 }
 
+static void test_fault_diagnostics(void)
+{
+    fixture_t f;
+    prepare(&f);
+    start(&f);
+    enqueue(&f, 0);
+    assert(mcp251xfd_core_service(&f.core) == ERR_NONE);
+    // A missing ACK can precede bus-off by several service passes. Preserve it
+    // even though the hardware diagnostic flags are cleared after reporting.
+    fake_write32(&f.chip, 0x03c, (1u << 18) | 7u);
+    f.chip.memory[0x01d] |= 1u << 5;
+    assert(mcp251xfd_core_service(&f.core) == ERR_NONE);
+    assert(fake_read32(&f.chip, 0x03c) == 0);
+    assert(f.core.diagnostics.bdiag1_seen == (1u << 18));
+
+    fake_bus_off(&f.chip, false);
+    fake_write32(&f.chip, 0x034, (1u << 21) | (255u << 8) | 3u);
+    fake_write32(&f.chip, 0x03c, (1u << 23) | (1u << 16));
+    assert(mcp251xfd_core_service(&f.core) == ERR__NOT_READY);
+    const mcp251xfd_diagnostics_t *d = &f.core.diagnostics;
+    assert(strcmp(d->reason, "bus-off status") == 0);
+    assert(d->trec_valid && d->bdiag1_valid);
+    assert(d->trec == ((1u << 21) | (255u << 8) | 3u));
+    assert(f.core.tx_errors == 255 && f.core.rx_errors == 3);
+    assert(d->bdiag1 == ((1u << 23) | (1u << 16)));
+    assert(d->bdiag1_seen == ((1u << 23) | (1u << 18) | (1u << 16)));
+    assert(d->queued == 1 && d->loaded == 1);
+    assert(d->registers.valid == 15);
+    assert((d->registers.con >> 21 & 7) == 6); // Snapshot before mode changes.
+    assert(f.chip.mode == 4 && f.completed_count == 1 && !f.success[0]);
+    assert(d->registers.nbtcfg == 0x00440909);
+    assert((d->registers.osc & 0x11) == 0);
+
+    // An earlier error from a previous enable must not taint a new session.
+    prepare(&f);
+    start(&f);
+    f.core.diagnostics.bdiag1_seen = 1u << 18;
+    assert(mcp251xfd_core_disable(&f.core) == ERR_NONE);
+    assert(mcp251xfd_core_enable(&f.core) == ERR_NONE);
+    assert(f.core.diagnostics.bdiag1_seen == 0);
+    f.chip.disconnected = true;
+    assert(mcp251xfd_core_service(&f.core) == ERR__SPI_COMM_ERROR);
+    assert(!f.core.diagnostics.trec_valid && !f.core.diagnostics.bdiag1_valid);
+    assert(f.core.diagnostics.registers.valid == 0);
+    assert(strcmp(f.core.diagnostics.reason, "controller I/O") == 0);
+
+    // Mark partial readback explicitly; a failed read is not a zero register.
+    prepare(&f);
+    start(&f);
+    mcp251xfd_registers_t registers;
+    f.chip.fail_on_transfer = f.chip.transfers + 2;
+    mcp251xfd_core_read_registers(&f.core, &registers);
+    assert(registers.valid == 13 && registers.nbtcfg == 0);
+}
+
 int main(void)
 {
     test_timing();
@@ -351,6 +406,7 @@ int main(void)
     test_filters_and_listen_only();
     test_stop_and_faults();
     test_reenable_and_errors();
+    test_fault_diagnostics();
     puts("MCP2518FD core: timing, SPI initialization, FIFO order, TEF ownership, one-shot, RX/RTR, filters, and lifecycle tests passed");
     return 0;
 }

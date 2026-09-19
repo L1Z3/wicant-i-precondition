@@ -37,7 +37,10 @@ typedef struct fake_task *TaskHandle_t;
 #define MALLOC_CAP_8BIT 2
 #define CONFIG_FREERTOS_UNICORE 1
 #define ESP_RETURN_ON_FALSE(test, error, ...) do { if (!(test)) return (error); } while (0)
-#define ESP_LOGE(...) ((void)0)
+static inline void fake_log(const char *tag, const char *format, ...) __attribute__((format(printf, 2, 3)));
+static inline void fake_log(const char *tag, const char *format, ...) { (void)tag; (void)format; }
+#define ESP_LOGE(...) fake_log(__VA_ARGS__)
+#define ESP_LOGI(...) fake_log(__VA_ARGS__)
 #define portYIELD_FROM_ISR() ((void)0)
 static inline void *heap_caps_calloc(size_t n, size_t size, unsigned caps) { (void)caps; return calloc(n, size); }
 

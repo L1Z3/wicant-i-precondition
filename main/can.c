@@ -255,7 +255,7 @@ static void can_recovery_task(void *arg)
 				continue;
 			}
 			can_busoff_count[bus]++;
-			ESP_LOGW(TAG, "bus %d: bus-off #%lu, recreating node (%lu TX dropped so far)",
+			ESP_LOGW(TAG, "bus %d: recovery #%lu (bus-off/controller fault), recreating node (%lu TX dropped so far)",
 					 bus, can_busoff_count[bus], tx_drop_count[bus]);
 			can_disable((can_bus_t)bus);
 		}
@@ -422,6 +422,7 @@ static esp_err_t can_bus1_create_node(void)
 static esp_err_t can_mcp251xfd_bus_init(void)
 {
 	static bool spi_ready = false;
+	static bool isr_service_ready = false;
 	if (!spi_ready)
 	{
 		spi_bus_config_t config = {
@@ -436,8 +437,13 @@ static esp_err_t can_mcp251xfd_bus_init(void)
 		spi_ready = true;
 	}
 	// The MCP2518FD is reset through SPI. No GPIO 8 reset pulse.
-	esp_err_t err = gpio_install_isr_service(0);
-	return err == ESP_ERR_INVALID_STATE ? ESP_OK : err;
+	if (!isr_service_ready)
+	{
+		esp_err_t err = gpio_install_isr_service(0);
+		if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;
+		isr_service_ready = true;
+	}
+	return ESP_OK;
 }
 
 static esp_err_t can_bus1_create_node(void)

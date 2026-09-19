@@ -64,6 +64,14 @@ node, fail outstanding frames, and notify the application to recreate it.
 WiCAN's existing recovery task performs this recreation. Direct
 `twai_node_recover()` is not implemented.
 
+Enable logs the requested bitrate/oscillator/SPI settings and reads back
+`CiCON`, `CiNBTCFG`, `OSC`, and `IOCON`. A service fault logs its reason, the
+triggering `CiTREC`/`CiBDIAG1`, and configuration registers captured before
+entering configuration mode. Error flags observed in earlier service passes
+are accumulated until the next enable, so recovery does not hide an earlier
+ACK or bit error. Validity flags distinguish failed reads from zero values.
+These diagnostics do not measure the physical oscillator frequency.
+
 Deletion requires a disabled node and must be serialized against application
 API calls. It disables the interrupt source, waits for in-flight GPIO ISRs on
 both cores, unregisters the handler, and asks the worker to exit. The worker is

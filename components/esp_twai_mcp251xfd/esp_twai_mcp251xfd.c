@@ -12,6 +12,7 @@
 #if !CONFIG_FREERTOS_UNICORE
 #include "esp_ipc.h"
 #endif
+#include <inttypes.h>
 #include <string.h>
 
 #define TAG "mcp251xfd"
@@ -165,6 +166,26 @@ static void bus_error(void *arg, uint32_t diagnostic, bool arbitration_lost)
     }
 }
 
+static void log_fault(mcp251xfd_node_t *ctx, eERRORRESULT error)
+{
+    const mcp251xfd_diagnostics_t *d = &ctx->core.diagnostics;
+    const mcp251xfd_registers_t *r = &d->registers;
+    ESP_LOGE(TAG, "controller stopped: %s (error %d), queued=%u loaded=%u; recreate node to recover",
+             d->reason, (int)error, d->queued, d->loaded);
+    ESP_LOGE(TAG, "before recovery: TREC=%08" PRIx32 " valid=%u TEC=%u REC=%u TXBO=%u; "
+             "BDIAG1=%08" PRIx32 " valid=%u seen=%08" PRIx32 " INT=%04x",
+             d->trec, d->trec_valid, (unsigned)(d->trec >> 8 & 0xff), (unsigned)(d->trec & 0xff),
+             (unsigned)(d->trec >> 21 & 1), d->bdiag1, d->bdiag1_valid, d->bdiag1_seen, d->interrupts);
+    ESP_LOGE(TAG, "CAN error flags seen: ACK=%u BIT0=%u BIT1=%u FORM=%u STUFF=%u CRC=%u TXBOERR=%u",
+             (unsigned)(d->bdiag1_seen >> 18 & 1), (unsigned)(d->bdiag1_seen >> 16 & 1),
+             (unsigned)(d->bdiag1_seen >> 17 & 1), (unsigned)(d->bdiag1_seen >> 19 & 1),
+             (unsigned)(d->bdiag1_seen >> 20 & 1), (unsigned)(d->bdiag1_seen >> 21 & 1),
+             (unsigned)(d->bdiag1_seen >> 23 & 1));
+    ESP_LOGE(TAG, "before recovery: CON=%08" PRIx32 " NBTCFG=%08" PRIx32
+             " OSC=%08" PRIx32 " IOCON=%08" PRIx32 " valid=%x (CON/NBTCFG/OSC/IOCON bits 0..3)",
+             r->con, r->nbtcfg, r->osc, r->iocon, r->valid);
+}
+
 static void worker_task(void *arg)
 {
     mcp251xfd_node_t *ctx = arg;
@@ -182,7 +203,7 @@ static void worker_task(void *arg)
         }
         if (ctx->enabled) {
             eERRORRESULT error = mcp251xfd_core_service(&ctx->core);
-            if (error != ERR_NONE) ESP_LOGE(TAG, "controller stopped (error %d); recreate node to recover", (int)error);
+            if (error != ERR_NONE) log_fault(ctx, error);
             if (ctx->core.running && gpio_get_level(ctx->int_gpio) == 0) xTaskNotifyGive(ctx->worker);
         }
         xSemaphoreGive(ctx->lock);
@@ -203,6 +224,16 @@ static esp_err_t node_enable(twai_node_handle_t node)
     xSemaphoreTake(ctx->lock, portMAX_DELAY);
     esp_err_t error = ctx->enabled ? ESP_ERR_INVALID_STATE : to_esp_error(mcp251xfd_core_enable(&ctx->core));
     if (error == ESP_OK) {
+        mcp251xfd_registers_t registers;
+        mcp251xfd_core_read_registers(&ctx->core, &registers);
+        ESP_LOGI(TAG, "enabled: bitrate=%" PRIu32 " oscillator=%" PRIu32 " SPI=%" PRIu32
+                 " listen=%u loopback=%u one-shot=%u CS=%d INT=%d",
+                 ctx->core.config.bitrate, ctx->core.config.oscillator_hz, ctx->spi_hz,
+                 ctx->core.config.listen_only, ctx->core.config.loopback, ctx->core.config.one_shot,
+                 ctx->cs_gpio, ctx->int_gpio);
+        ESP_LOGI(TAG, "readback: CON=%08" PRIx32 " NBTCFG=%08" PRIx32 " OSC=%08" PRIx32
+                 " IOCON=%08" PRIx32 " valid=%x (CON/NBTCFG/OSC/IOCON bits 0..3)",
+                 registers.con, registers.nbtcfg, registers.osc, registers.iocon, registers.valid);
         error = gpio_intr_enable(ctx->int_gpio);
         if (error == ESP_OK) {
             ctx->enabled = true;

@@ -107,10 +107,29 @@ static void change_state(mcp251xfd_core_t *core, mcp251xfd_state_t state)
     }
 }
 
+void mcp251xfd_core_read_registers(mcp251xfd_core_t *core, mcp251xfd_registers_t *registers)
+{
+    *registers = (mcp251xfd_registers_t){0};
+    // IOCON's multi-byte WRITE erratum does not affect this read-only snapshot.
+    const uint16_t addresses[] = {RegMCP251XFD_CiCON, RegMCP251XFD_CiNBTCFG,
+                                  RegMCP251XFD_OSC, RegMCP251XFD_IOCON_DIRECTION};
+    uint32_t *values[] = {&registers->con, &registers->nbtcfg, &registers->osc, &registers->iocon};
+    for (unsigned i = 0; i < sizeof(addresses) / sizeof(addresses[0]); i++) {
+        uint32_t value;
+        if (MCP251XFD_ReadSFR32(&core->device, addresses[i], &value) == ERR_NONE) {
+            *values[i] = value;
+            registers->valid |= 1u << i;
+        }
+    }
+}
+
 static eERRORRESULT fault(mcp251xfd_core_t *core, eERRORRESULT error)
 {
     core->running = false;
     core->faulted = true;
+    core->diagnostics.queued = core->count;
+    core->diagnostics.loaded = core->loaded;
+    mcp251xfd_core_read_registers(core, &core->diagnostics.registers);
     // Best effort: even an unreachable controller cannot retain software tokens.
     MCP251XFD_ConfigureInterrupt(&core->device, MCP251XFD_INT_NO_EVENT);
     set_mode(core, MCP251XFD_CONFIGURATION_MODE);
@@ -200,6 +219,7 @@ eERRORRESULT mcp251xfd_core_enable(mcp251xfd_core_t *core)
     core->state = MCP251XFD_STATE_ACTIVE;
     core->bus_errors = 0;
     core->tx_errors = core->rx_errors = 0;
+    core->diagnostics = (mcp251xfd_diagnostics_t){0};
     return ERR_NONE;
 }
 
@@ -259,11 +279,15 @@ static eERRORRESULT drain_tef(mcp251xfd_core_t *core)
     for (unsigned i = 0; i < MCP251XFD_HW_TX_DEPTH; i++) {
         setMCP251XFD_FIFOstatus status = 0;
         TRY(MCP251XFD_GetFIFOStatus(&core->device, MCP251XFD_TEF, &status));
-        if (status & MCP251XFD_TEF_FIFO_OVERFLOW) return ERR__BUFFER_FULL;
+        if (status & MCP251XFD_TEF_FIFO_OVERFLOW) {
+            core->diagnostics.reason = "TEF overflow";
+            return ERR__BUFFER_FULL;
+        }
         if (!(status & MCP251XFD_TEF_FIFO_NOT_EMPTY)) return ERR_NONE;
         MCP251XFD_CANMessage event = {0};
         TRY(MCP251XFD_ReceiveMessageFromFIFO(&core->device, &event, MCP251XFD_PAYLOAD_8BYTE, NULL, MCP251XFD_TEF));
         if (!core->loaded || !core->count || event.MessageSEQ != core->tx[core->head].sequence) {
+            core->diagnostics.reason = "TEF sequence mismatch";
             return ERR__SPI_INVALID_DATA;
         }
         complete_head(core, true);
@@ -273,18 +297,37 @@ static eERRORRESULT drain_tef(mcp251xfd_core_t *core)
 
 static eERRORRESULT service(mcp251xfd_core_t *core)
 {
+    core->diagnostics.reason = "controller I/O";
+    core->diagnostics.trec_valid = core->diagnostics.bdiag1_valid = false;
     TRY(drain_tef(core));
     setMCP251XFD_InterruptEvents events = 0;
-    eMCP251XFD_TXRXErrorStatus status = 0;
     MCP251XFD_CiBDIAG1_Register diagnostic = {0};
     TRY(MCP251XFD_GetInterruptEvents(&core->device, &events));
-    TRY(MCP251XFD_GetTransmitReceiveErrorCountAndStatus(&core->device, &core->tx_errors, &core->rx_errors, &status));
-    TRY(MCP251XFD_GetBusDiagnostic(&core->device, NULL, &diagnostic));
+    core->diagnostics.interrupts = events;
+    // Read counters and status together, and keep the triggering values before
+    // cleanup changes mode (configuration mode itself sets the TXBO bit).
+    uint32_t trec;
+    TRY(MCP251XFD_ReadSFR32(&core->device, RegMCP251XFD_CiTREC, &trec));
+    core->diagnostics.trec = trec;
+    core->diagnostics.trec_valid = true;
+    core->tx_errors = trec >> 8;
+    core->rx_errors = trec;
+    eMCP251XFD_TXRXErrorStatus status = (trec >> 16) & 0x3f;
+    uint32_t bdiag1;
+    TRY(MCP251XFD_ReadSFR32(&core->device, RegMCP251XFD_CiBDIAG1, &bdiag1));
+    diagnostic.CiBDIAG1 = bdiag1;
+    core->diagnostics.bdiag1 = diagnostic.CiBDIAG1;
+    core->diagnostics.bdiag1_valid = true;
+    core->diagnostics.bdiag1_seen |= diagnostic.CiBDIAG1 & 0xffff0000u;
     // TXBOERR latches a bus-off even if the controller recovered before polling.
     if ((status & MCP251XFD_TX_BUS_OFF_STATE) || diagnostic.Bits.TXBOERR) {
+        core->diagnostics.reason = "bus-off status";
         return ERR__NOT_READY;
     }
-    if (events & (MCP251XFD_INT_SYSTEM_ERROR_EVENT | MCP251XFD_INT_RAM_ECC_EVENT)) return ERR__SPI_INVALID_DATA;
+    if (events & (MCP251XFD_INT_SYSTEM_ERROR_EVENT | MCP251XFD_INT_RAM_ECC_EVENT)) {
+        core->diagnostics.reason = "controller system/ECC error";
+        return ERR__SPI_INVALID_DATA;
+    }
     change_state(core, (status & (MCP251XFD_TX_BUS_PASSIVE_STATE | MCP251XFD_RX_BUS_PASSIVE_STATE)) ? MCP251XFD_STATE_PASSIVE :
                        (status & (MCP251XFD_TX_WARNING_STATE | MCP251XFD_RX_WARNING_STATE)) ? MCP251XFD_STATE_WARNING : MCP251XFD_STATE_ACTIVE);
     setMCP251XFD_FIFOstatus tx_status = 0;
@@ -301,7 +344,10 @@ static eERRORRESULT service(mcp251xfd_core_t *core)
     if (tx_status & MCP251XFD_TX_FIFO_ATTEMPTS_EXHAUSTED) {
         // Failed one-shot frames produce no TEF entry and remain at the FIFO
         // tail. Only one was loaded: resetting cannot discard another frame.
-        if (!core->config.one_shot || core->loaded != 1) return ERR__SPI_INVALID_DATA;
+        if (!core->config.one_shot || core->loaded != 1) {
+            core->diagnostics.reason = "unexpected TX attempts exhausted";
+            return ERR__SPI_INVALID_DATA;
+        }
         TRY(MCP251XFD_ResetFIFO(&core->device, TX_FIFO));
         complete_head(core, false);
     }

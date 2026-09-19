@@ -47,9 +47,31 @@ typedef struct {
 } mcp251xfd_pending_tx_t;
 
 typedef struct {
+    uint32_t con;
+    uint32_t nbtcfg;
+    uint32_t osc;
+    uint32_t iocon;
+    uint8_t valid; // Bits 0..3 correspond to the registers above; failed reads stay zero.
+} mcp251xfd_registers_t;
+
+typedef struct {
+    const char *reason;
+    uint32_t trec;
+    uint32_t bdiag1;
+    uint32_t bdiag1_seen; // Error flags accumulated since enable, before clearing hardware flags.
+    uint16_t interrupts;
+    bool trec_valid;
+    bool bdiag1_valid;
+    uint8_t queued;
+    uint8_t loaded;
+    mcp251xfd_registers_t registers; // Captured before fault handling enters configuration mode.
+} mcp251xfd_diagnostics_t;
+
+typedef struct {
     MCP251XFD device;
     mcp251xfd_config_t config;
     mcp251xfd_callbacks_t callbacks;
+    mcp251xfd_diagnostics_t diagnostics;
     mcp251xfd_pending_tx_t tx[MCP251XFD_TX_CAPACITY];
     uint32_t next_sequence;
     uint32_t bus_errors;
@@ -79,3 +101,5 @@ eERRORRESULT mcp251xfd_core_filter(mcp251xfd_core_t *core, uint8_t index,
 eERRORRESULT mcp251xfd_core_enqueue(mcp251xfd_core_t *core,
                                   const mcp251xfd_frame_t *frame, const void *token);
 eERRORRESULT mcp251xfd_core_service(mcp251xfd_core_t *core);
+// Best-effort readback for bring-up logs. Call under the same lock as other core operations.
+void mcp251xfd_core_read_registers(mcp251xfd_core_t *core, mcp251xfd_registers_t *registers);
