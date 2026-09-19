@@ -115,12 +115,16 @@ static void expect_state(const char *name) {
               "expected state %s, got %s", name, precon_sm.current->name);
 }
 
-static void rx_frame(uint32_t id, const uint8_t d[8], can_bus_t bus) {
+static void rx_frame_len(uint32_t id, const uint8_t *d, uint8_t len, can_bus_t bus) {
     twai_message_t f = {0};
     f.identifier = id;
-    f.data_length_code = 8;
+    f.data_length_code = len;
     memcpy(f.data, d, 8);
     precondition_can_rx_hook(&f, bus);
+}
+
+static void rx_frame(uint32_t id, const uint8_t d[8], can_bus_t bus) {
+    rx_frame_len(id, d, 8, bus);
 }
 
 static void press(void)   { uint8_t d[8] = {0}; d[5] = 0x10; rx_frame(0x448, d, CAN_BUS_0); }
@@ -135,6 +139,33 @@ static void battery_temperature(int8_t min_c, int8_t max_c) {
 static void battery_soc(uint8_t raw) {
     uint8_t d[8] = {[7] = raw};
     rx_frame(0x2FC, d, CAN_BUS_0);
+}
+// the car's latched battery conditioning mode, as its 200 ms 0x25D broadcast
+// reports it (0x80 = enabled, 0x40 = disabled)
+static void conditioning_mode_d6(uint8_t d6, can_bus_t bus) {
+    uint8_t d[8] = {[5] = d6};
+    rx_frame(0x25D, d, bus);
+}
+static void conditioning_mode(uint8_t d6) { conditioning_mode_d6(d6, CAN_BUS_0); }
+
+// the head unit's 0x4C5 charge-limit command, as observed on the head-unit bus:
+// D5 = AC raw, D6 = DC raw, 0xFF = the frame does not address that field
+static void head_unit_charge_limit(uint8_t ac_raw, uint8_t dc_raw, can_bus_t bus) {
+    uint8_t d[8];
+    memset(d, 0xFF, sizeof(d));
+    d[4] = ac_raw;
+    d[5] = dc_raw;
+    rx_frame(0x4C5, d, bus);
+}
+// The head-unit sends below use the firmware's own HEAD_UNIT_BUS, not CAN_BUS_1:
+// with CAN_BUS_COUNT == 1 the head unit shares CAR_BUS, so the suite has to
+// follow the same fallback the firmware does (this file includes precondition.c,
+// so its macros are in scope). The "wrong bus" probes further down stay literal
+// CAN_BUS_1 -- they pin the bus gate, which exists in both configurations.
+//
+// the all-0xFF rest frames the head unit pads every change with
+static void head_unit_charge_limit_rest(void) {
+    head_unit_charge_limit(0xFF, 0xFF, HEAD_UNIT_BUS);
 }
 
 // Model the two firmware workers in deterministic order: the timing task runs
@@ -155,6 +186,19 @@ static void advance_until_state(const char *name, int64_t max_us) {
     int64_t end = fake_now + max_us;
     while (fake_now < end && strcmp(precon_sm.current->name, name) != 0) tick1();
     expect_state(name);
+}
+
+// A head-unit charge-limit write as it appears on the wire: three identical
+// value frames at 25 Hz, then three all-0xFF rest frames, one frame per tick.
+static void head_unit_charge_limit_write(uint8_t ac_raw, uint8_t dc_raw) {
+    for (int i = 0; i < 3; i++) {
+        head_unit_charge_limit(ac_raw, dc_raw, HEAD_UNIT_BUS);
+        tick1();
+    }
+    for (int i = 0; i < 3; i++) {
+        head_unit_charge_limit_rest();
+        tick1();
+    }
 }
 
 static fwd_result_t fwd(uint32_t id, can_bus_t bus, twai_message_t *out) {
@@ -183,6 +227,25 @@ static void check_start_burst_msgs(int base) {
             expected[3] = 0xE0;
             expected[4] = 0x07;
         }
+        CHECK(sent[base + i].bus == CAR_BUS);
+        CHECK(sent[base + i].msg.identifier == 0x0C7);
+        CHECK(sent[base + i].msg.data_length_code == 8);
+        CHECK(memcmp(sent[base + i].msg.data, expected, sizeof(expected)) == 0);
+    }
+}
+
+static void check_conditioning_mode_burst_msgs(int base) {
+    bool recorded = base >= 0
+                    && base + (int)CONDITIONING_MODE_TICKS <= sent_count
+                    && base + (int)CONDITIONING_MODE_TICKS <= (int)(sizeof(sent) / sizeof(sent[0]));
+    CHECK(recorded);
+    if (!recorded) {
+        return;
+    }
+    for (int i = 0; i < (int)CONDITIONING_MODE_TICKS; i++) {
+        uint8_t expected[8] = {0};
+        expected[3] = (i < (int)CONDITIONING_MODE_PHASE1_TICKS) ? 0xF0 : 0xE0;
+        expected[4] = 0x07;
         CHECK(sent[base + i].bus == CAR_BUS);
         CHECK(sent[base + i].msg.identifier == 0x0C7);
         CHECK(sent[base + i].msg.data_length_code == 8);
@@ -604,6 +667,364 @@ static void run_battery_soc(void) {
     expect_state("idle");
     CHECK(sent_count == base + 6);
     CHECK(popup_show_count == 3);
+}
+
+static void run_conditioning_mode_check(void) {
+    precondition_init();
+    platform.conditioning_mode = CONDITIONING_MODE_UNKNOWN;  // no 0x25D yet
+    expect_state("idle");
+
+    // Neither the head unit's copy nor a truncated frame is the car's report.
+    conditioning_mode_d6(0x80, CAN_BUS_1);
+    CHECK(platform.conditioning_mode == CONDITIONING_MODE_UNKNOWN);
+    uint8_t short_frame[8] = {0};
+    short_frame[5] = 0x80;
+    rx_frame_len(0x25D, short_frame, CONDITIONING_MODE_DATA_LENGTH - 1, CAN_BUS_0);
+    CHECK(platform.conditioning_mode == CONDITIONING_MODE_UNKNOWN);
+
+    // Unknown means "not confirmed enabled": the enable burst goes out first
+    // anyway, then the normal start burst.
+    sent_count = 0;
+    toggle();
+    expect_state("start-burst");
+    for (int i = 0; i < (int)CONDITIONING_MODE_TICKS; i++) tick1();
+    CHECK(sent_count == (int)CONDITIONING_MODE_TICKS);
+    check_conditioning_mode_burst_msgs(0);
+    for (int i = 0; i < (int)PRECONDITION_START_TICKS; i++) tick1();
+    CHECK(sent_count == (int)(CONDITIONING_MODE_TICKS + PRECONDITION_START_TICKS));
+    check_start_burst_msgs((int)CONDITIONING_MODE_TICKS);
+    expect_state("wait-starting");
+
+    // A disabled report gets the same treatment. The car's own reply lands
+    // mid-burst and must not truncate it.
+    fake_now += 2000000;                        // clear the start/stop debounce
+    toggle();
+    for (int i = 0; i < (int)PRECONDITION_STOP_TICKS; i++) tick1();
+    expect_state("idle");                       // no status frames: no stop retries
+    conditioning_mode(0x40);
+    CHECK(platform.conditioning_mode == CONDITIONING_MODE_DISABLED);
+    sent_count = 0;
+    toggle();
+    expect_state("start-burst");
+    for (int i = 0; i < (int)CONDITIONING_MODE_PHASE1_TICKS; i++) tick1();
+    CHECK(sent_count == (int)CONDITIONING_MODE_PHASE1_TICKS);
+    conditioning_mode(0x80);                    // car confirms the enable mid-burst
+    CHECK(platform.conditioning_mode == CONDITIONING_MODE_ENABLED);
+    for (int i = 0; i < (int)CONDITIONING_MODE_PHASE2_TICKS; i++) tick1();
+    CHECK(sent_count == (int)CONDITIONING_MODE_TICKS);
+    check_conditioning_mode_burst_msgs(0);
+    for (int i = 0; i < (int)PRECONDITION_START_TICKS; i++) tick1();
+    CHECK(sent_count == (int)(CONDITIONING_MODE_TICKS + PRECONDITION_START_TICKS));
+    check_start_burst_msgs((int)CONDITIONING_MODE_TICKS);
+    expect_state("wait-starting");
+
+    // An enabled report needs no enable burst, and the 10 s start retry
+    // re-checks the mode: the retry burst is bare.
+    car_status(0x01, CAN_BUS_0);                // status frames arm the retry path
+    sent_count = 0;
+    advance_until_state("start-burst", 11000000);
+    CHECK(requested.retries == 1);
+    for (int i = 0; i < (int)PRECONDITION_START_TICKS; i++) tick1();
+    CHECK(sent_count == (int)PRECONDITION_START_TICKS);
+    check_start_burst_msgs(0);
+    expect_state("wait-starting");
+
+    // A blocked attempt never turns the mode on: no frames at all.
+    car_power(true);
+    car_power(false);
+    expect_state("idle");
+    battery_soc(39);
+    conditioning_mode(0x40);
+    // The SoC blocker is car-imposed and outranks the mode-off one, so it is
+    // what the stop reports.
+    CHECK(precon_blockers
+          == (PRECONDITION_BLOCK_BATTERY_LOW_SOC | PRECONDITION_BLOCK_CONDITIONING_MODE_OFF));
+    sent_count = 0;
+    toggle();
+    expect_state("stop-burst");
+    CHECK(stopping.reason == STOP_REASON_START_BLOCKED);
+    CHECK(sent_count == 0);
+    for (int i = 0; i < (int)PRECONDITION_STOP_TICKS; i++) tick1();
+    CHECK(sent_count == (int)PRECONDITION_STOP_TICKS);
+    check_stop_burst_msgs(0);
+    expect_state("wait-stopped");
+    car_status(0x01, CAN_BUS_0);
+    expect_state("idle");
+}
+
+// Writing a charge limit clears the car's conditioning mode, so the firmware
+// re-asserts it with the 0x0C7 enable burst. The re-assertion waits out the
+// hold-off first (the head unit sometimes sends the same enable message itself
+// after a write), then emits one frame per tick.
+// Writing a charge limit clears the car's conditioning mode. The firmware waits
+// out the reply floor for the car's next 0x25D reading, decides on that reading,
+// and only then sends the 0x0C7 enable burst, one frame per tick.
+static void run_charge_limit_reassert(void) {
+    precondition_init();
+    expect_state("idle");
+    sent_count = 0;
+
+    // The all-0xFF rest frames that pad every write carry no value, so they arm
+    // nothing at all.
+    for (int i = 0; i < 3; i++) {
+        head_unit_charge_limit_rest();
+        tick1();
+    }
+    CHECK(charge_limit_watch.wait == 0U);
+    CHECK(charge_limit_watch.remaining == 0U);
+    advance_us((int64_t)(CONDITIONING_MODE_REPLY_TIMEOUT_TICKS
+                         + CONDITIONING_MODE_TICKS) * 40000);
+    CHECK(sent_count == 0);
+
+    // A value-bearing command arms the re-assertion: silent for the whole reply
+    // wait, then one frame per tick.
+    head_unit_charge_limit(0xA0, 0xFF, HEAD_UNIT_BUS);      // AC 80%
+    CHECK(charge_limit_watch.wait == CONDITIONING_MODE_REPLY_TIMEOUT_TICKS);
+    CHECK(charge_limit_watch.remaining == CONDITIONING_MODE_TICKS);
+    for (int i = 0; i < (int)CONDITIONING_MODE_REPLY_TIMEOUT_TICKS; i++) {
+        tick1();
+    }
+    CHECK(sent_count == 0);
+    CHECK(charge_limit_watch.wait == 0U);
+    for (int i = 0; i < (int)CONDITIONING_MODE_TICKS; i++) {
+        CHECK(sent_count == i);
+        tick1();
+    }
+    CHECK(sent_count == (int)CONDITIONING_MODE_TICKS);
+    check_conditioning_mode_burst_msgs(0);
+    CHECK(charge_limit_watch.remaining == 0U);
+
+    // A reading from before the floor expired is still the pre-write mode: the
+    // BMU takes 194-334 ms to act on a write, so it must not suppress the burst.
+    sent_count = 0;
+    head_unit_charge_limit(0xA0, 0xFF, HEAD_UNIT_BUS);
+    conditioning_mode(0x80);                                // "enabled" too early
+    CHECK(!charge_limit_watch.reply_enabled);
+    advance_us((int64_t)(CONDITIONING_MODE_REPLY_TIMEOUT_TICKS
+                         + CONDITIONING_MODE_TICKS) * 40000);
+    CHECK(sent_count == (int)CONDITIONING_MODE_TICKS);
+    check_conditioning_mode_burst_msgs(0);
+
+    // A reading inside the decision window is trusted: the head unit enabled the
+    // mode itself, so nothing is sent. It is taken a full broadcast period after
+    // the floor, where a real reply lands, so the window has to actually be wide
+    // enough to catch it.
+    sent_count = 0;
+    head_unit_charge_limit(0xA0, 0xFF, HEAD_UNIT_BUS);
+    advance_us((int64_t)(CONDITIONING_MODE_HOLD_OFF_TICKS
+                         + CONDITIONING_MODE_REPLY_PERIOD_TICKS) * 40000);
+    CHECK(charge_limit_watch.wait > 0U);
+    CHECK(charge_limit_watch.wait <= CONDITIONING_MODE_DECISION_TICKS);
+    conditioning_mode(0x80);                                // enabled, in the window
+    CHECK(charge_limit_watch.reply_enabled);
+    advance_us((int64_t)(CONDITIONING_MODE_DECISION_TICKS
+                         + CONDITIONING_MODE_TICKS) * 40000);
+    CHECK(sent_count == 0);
+    CHECK(charge_limit_watch.remaining == 0U);
+
+    // A window reading that reports the mode off means the write did clear it,
+    // and the newest window reading wins over an earlier one.
+    sent_count = 0;
+    head_unit_charge_limit(0xA0, 0xFF, HEAD_UNIT_BUS);
+    advance_us((int64_t)CONDITIONING_MODE_HOLD_OFF_TICKS * 40000);
+    conditioning_mode(0x80);                                // enabled...
+    CHECK(charge_limit_watch.reply_enabled);
+    conditioning_mode(0x40);                                // ...then off again
+    CHECK(!charge_limit_watch.reply_enabled);
+    advance_us((int64_t)(CONDITIONING_MODE_DECISION_TICKS
+                         + CONDITIONING_MODE_TICKS) * 40000);
+    CHECK(sent_count == (int)CONDITIONING_MODE_TICKS);
+    check_conditioning_mode_burst_msgs(0);
+
+    // A full wire event: its six frames all land inside the wait it starts, and
+    // its repeats and all-0xFF rest frames must not restart the burst, so the
+    // burst keeps the documented F007 x3 / E007 x3 shape
+    // (check_conditioning_mode_burst_msgs asserts the exact payloads).
+    sent_count = 0;
+    head_unit_charge_limit_write(0xB4, 0xFF);               // AC 90%
+    CHECK(sent_count == 0);                                 // still waiting
+    CHECK(charge_limit_watch.remaining == CONDITIONING_MODE_TICKS);
+    advance_us((int64_t)(CONDITIONING_MODE_REPLY_TIMEOUT_TICKS
+                         + CONDITIONING_MODE_TICKS) * 40000);
+    CHECK(sent_count == (int)CONDITIONING_MODE_TICKS);
+    check_conditioning_mode_burst_msgs(0);
+    CHECK(charge_limit_watch.remaining == 0U);
+
+    // Re-sending the limit the car already has is still a write, and the write
+    // is what clears the mode, so it re-arms the re-assertion.
+    sent_count = 0;
+    head_unit_charge_limit_write(0xB4, 0xFF);
+    advance_us((int64_t)(CONDITIONING_MODE_REPLY_TIMEOUT_TICKS
+                         + CONDITIONING_MODE_TICKS) * 40000);
+    CHECK(sent_count == (int)CONDITIONING_MODE_TICKS);
+    check_conditioning_mode_burst_msgs(0);
+    CHECK(charge_limit_watch.remaining == 0U);
+
+    // A DC-only write counts the same as an AC-only one.
+    sent_count = 0;
+    head_unit_charge_limit_write(0xFF, 0xA0);               // DC 80%
+    advance_us((int64_t)(CONDITIONING_MODE_REPLY_TIMEOUT_TICKS
+                         + CONDITIONING_MODE_TICKS) * 40000);
+    CHECK(sent_count == (int)CONDITIONING_MODE_TICKS);
+    check_conditioning_mode_burst_msgs(0);
+
+    // A truncated write is not a write on either bus, and on a two-bus build a
+    // copy on the car bus is not the head unit's command either.
+    sent_count = 0;
+#if CAN_BUS_COUNT > 1
+    head_unit_charge_limit(0xC8, 0xFF, CAN_BUS_0);
+#endif
+    uint8_t short_frame[8];
+    memset(short_frame, 0xFF, sizeof(short_frame));
+    short_frame[4] = 0xC8;
+    rx_frame_len(0x4C5, short_frame, 5, HEAD_UNIT_BUS);
+    advance_us((int64_t)(CONDITIONING_MODE_REPLY_TIMEOUT_TICKS
+                         + CONDITIONING_MODE_TICKS) * 40000);
+    CHECK(sent_count == 0);
+    CHECK(charge_limit_watch.remaining == 0U);
+
+    // A write landing mid start-burst defers to it rather than putting two
+    // 0xC7 frames in one tick, and its wait only starts once the start burst is
+    // out of the way. The mode is on again so the start burst is a bare one.
+    conditioning_mode(0x80);
+    sent_count = 0;
+    toggle();
+    expect_state("start-burst");
+    tick1();
+    CHECK(sent_count == 1);
+    head_unit_charge_limit(0xC8, 0xFF, HEAD_UNIT_BUS);
+    CHECK(charge_limit_watch.wait == CONDITIONING_MODE_REPLY_TIMEOUT_TICKS);
+    CHECK(charge_limit_watch.remaining == CONDITIONING_MODE_TICKS);
+    for (int i = 1; i < (int)PRECONDITION_START_TICKS; i++) tick1();
+    CHECK(sent_count == (int)PRECONDITION_START_TICKS);
+    check_start_burst_msgs(0);
+    expect_state("wait-starting");
+    CHECK(charge_limit_watch.wait == CONDITIONING_MODE_REPLY_TIMEOUT_TICKS);
+    for (int i = 0; i < (int)CONDITIONING_MODE_REPLY_TIMEOUT_TICKS; i++) tick1();
+    CHECK(sent_count == (int)PRECONDITION_START_TICKS);
+    for (int i = 0; i < (int)CONDITIONING_MODE_TICKS; i++) tick1();
+    CHECK(sent_count == (int)(PRECONDITION_START_TICKS + CONDITIONING_MODE_TICKS));
+    check_conditioning_mode_burst_msgs((int)PRECONDITION_START_TICKS);
+    CHECK(charge_limit_watch.remaining == 0U);
+
+    // A write that lands while the re-assertion is in flight restarts the wait,
+    // so the burst cannot race the head unit's own message, but does not restart
+    // the burst: the six frames stay in the documented order.
+    sent_count = 0;
+    head_unit_charge_limit(0xA0, 0xFF, HEAD_UNIT_BUS);
+    advance_us((int64_t)CONDITIONING_MODE_REPLY_TIMEOUT_TICKS * 40000);
+    CHECK(sent_count == 0);
+    tick1();
+    tick1();                                                // two frames are out
+    CHECK(sent_count == 2);
+    head_unit_charge_limit(0x8C, 0xFF, HEAD_UNIT_BUS);      // overlapping write
+    CHECK(charge_limit_watch.wait == CONDITIONING_MODE_REPLY_TIMEOUT_TICKS);
+    CHECK(charge_limit_watch.remaining == CONDITIONING_MODE_TICKS - 2U);
+    advance_us((int64_t)CONDITIONING_MODE_REPLY_TIMEOUT_TICKS * 40000);
+    CHECK(sent_count == 2);                                 // paused, not restarted
+    for (int i = 0; i < (int)CONDITIONING_MODE_TICKS; i++) tick1();
+    CHECK(sent_count == (int)CONDITIONING_MODE_TICKS);
+    check_conditioning_mode_burst_msgs(0);
+    CHECK(charge_limit_watch.remaining == 0U);
+}
+
+// Conditioning mode off is a blocker the firmware fixes itself: a start attempt
+// enables the mode before its first start frame, so the blocker must never stop
+// an attempt. It only names the failure once the mode stays off anyway.
+static void run_conditioning_mode_blocker(void) {
+    precondition_init();
+    platform.conditioning_mode = CONDITIONING_MODE_UNKNOWN;
+    expect_state("idle");
+    CHECK(precon_blockers == PRECONDITION_BLOCK_NONE);
+
+    // Only the car's own copy of 0x25D drives it.
+    conditioning_mode_d6(0x40, CAN_BUS_1);
+    CHECK(precon_blockers == PRECONDITION_BLOCK_NONE);
+    uint8_t short_frame[8];
+    memset(short_frame, 0x40, sizeof(short_frame));
+    rx_frame_len(0x25D, short_frame, CONDITIONING_MODE_DATA_LENGTH - 1, CAN_BUS_0);
+    CHECK(precon_blockers == PRECONDITION_BLOCK_NONE);
+    conditioning_mode(0x40);
+    CHECK(precon_blockers == PRECONDITION_BLOCK_CONDITIONING_MODE_OFF);
+    conditioning_mode(0x80);
+    CHECK(precon_blockers == PRECONDITION_BLOCK_NONE);
+
+    // A start attempt with the mode off still runs, enable phase first: the
+    // blocker must not make its own fix unreachable.
+    conditioning_mode(0x40);
+    CHECK(precon_blockers == PRECONDITION_BLOCK_CONDITIONING_MODE_OFF);
+    sent_count = 0;
+    toggle();
+    expect_state("start-burst");
+    for (int i = 0; i < (int)CONDITIONING_MODE_TICKS; i++) tick1();
+    CHECK(sent_count == (int)CONDITIONING_MODE_TICKS);
+    check_conditioning_mode_burst_msgs(0);
+    for (int i = 0; i < (int)PRECONDITION_START_TICKS; i++) tick1();
+    CHECK(sent_count == (int)(CONDITIONING_MODE_TICKS + PRECONDITION_START_TICKS));
+    check_start_burst_msgs((int)CONDITIONING_MODE_TICKS);
+    expect_state("wait-starting");
+
+    // Nor does it stop the retries, which are how the enable gets retried. When
+    // they run out the mode is what gets named, not the retry budget.
+    car_status(0x01, CAN_BUS_0);                // status frames arm the retry path
+    for (int r = 1; r <= 4; r++) {
+        advance_until_state("start-burst", 11000000);
+        CHECK(requested.retries == r);
+        for (int i = 0; i < (int)(CONDITIONING_MODE_TICKS + PRECONDITION_START_TICKS); i++) {
+            tick1();
+        }
+        expect_state("wait-starting");
+    }
+    advance_until_state("stop-burst", 11000000);
+    CHECK(stopping.reason == STOP_REASON_RETRIES_EXHAUSTED);
+    CHECK(strcmp(popup_text, "‼ Once: start failed (conditioning mode off)") == 0);
+    for (int i = 0; i < (int)PRECONDITION_STOP_TICKS; i++) tick1();
+    expect_state("wait-stopped");
+    car_status(0x01, CAN_BUS_0);
+    expect_state("idle");
+
+    // A running session whose mode disappears stops with that reason named.
+    conditioning_mode(0x80);
+    CHECK(precon_blockers == PRECONDITION_BLOCK_NONE);
+    toggle();
+    for (int i = 0; i < (int)PRECONDITION_START_TICKS; i++) tick1();
+    car_status(0x15, CAN_BUS_0);
+    expect_state("active");
+    int popups_before = popup_show_count;
+    conditioning_mode(0x40);                    // car reports the mode off...
+    car_status(0x01, CAN_BUS_0);                // ...and the session idle
+    expect_state("stop-burst");
+    CHECK(stopping.reason == STOP_REASON_CONDITIONING_MODE_OFF);
+    CHECK(popup_show_count == popups_before + 1);
+    CHECK(strcmp(popup_text, "⚠ Once: stopping (conditioning mode off)") == 0);
+}
+
+// In a repeating mode the mode-off blocker must not hold back the periodic
+// nudge: the nudge is what retries the enable.
+static void run_conditioning_mode_blocker_repeating(void) {
+    precondition_init();
+    platform.conditioning_mode = CONDITIONING_MODE_UNKNOWN;
+    car_power(true);
+    toggle();
+    for (int i = 0; i < (int)(CONDITIONING_MODE_TICKS + PRECONDITION_START_TICKS); i++) {
+        tick1();
+    }
+    car_status(0x15, CAN_BUS_0);
+    expect_state("active");
+    car_status(0x01, CAN_BUS_0);
+    expect_state("managed");
+
+    conditioning_mode(0x40);
+    CHECK(precon_blockers == PRECONDITION_BLOCK_CONDITIONING_MODE_OFF);
+    sent_count = 0;
+    advance_until_state("start-burst", 302000000LL);
+    CHECK(requested.kind == ATTEMPT_PERIODIC);
+    for (int i = 0; i < (int)(CONDITIONING_MODE_TICKS + PRECONDITION_START_TICKS); i++) {
+        tick1();
+    }
+    CHECK(sent_count == (int)(CONDITIONING_MODE_TICKS + PRECONDITION_START_TICKS));
+    check_conditioning_mode_burst_msgs(0);
+    check_start_burst_msgs((int)CONDITIONING_MODE_TICKS);
 }
 
 static void run_automatic_temperature_cutoff(void) {
@@ -1562,6 +1983,10 @@ static const suite_t suites[] = {
     {"precondition long-press once", ONCE, PRESS_LONG, run_long_press},
     {"precondition battery temperature cutoff", ONCE, PRESS_SHORT, run_battery_temperature_cutoff},
     {"precondition battery state of charge", ONCE, PRESS_SHORT, run_battery_soc},
+    {"precondition conditioning mode check", ONCE, PRESS_SHORT, run_conditioning_mode_check},
+    {"precondition conditioning reassert on charge limit", ONCE, PRESS_SHORT, run_charge_limit_reassert},
+    {"precondition conditioning mode blocker", ONCE, PRESS_SHORT, run_conditioning_mode_blocker},
+    {"precondition conditioning mode blocker repeating", CONTINUOUS, PRESS_SHORT, run_conditioning_mode_blocker_repeating},
     {"precondition automatic temperature cutoff", CONTINUOUS, PRESS_SHORT, run_automatic_temperature_cutoff},
     {"precondition persistent temperature cutoff", PERSISTENT, PRESS_SHORT, run_automatic_temperature_cutoff},
     {"precondition continuous cool wait", CONTINUOUS, PRESS_SHORT, run_managed_cool_wait},
@@ -1587,8 +2012,20 @@ static const suite_t suites[] = {
 #define NUM_SUITES (sizeof(suites) / sizeof(suites[0]))
 
 static int run_suite(const suite_t *s) {
+    // The Makefile builds this suite for both bus counts and states which one
+    // each binary is. Without this, the suite is self-consistent under either
+    // value, so a stub or -D regression could quietly run the two-bus
+    // configuration twice and leave the single-bus branches uncovered.
+#ifdef EXPECT_CAN_BUS_COUNT
+    CHECK(CAN_BUS_COUNT == EXPECT_CAN_BUS_COUNT);
+#endif
     cfg_mode = s->mode;
     cfg_press = s->press;
+    // Steady-state model: the car broadcasts 0x25D every 200 ms, so by the time
+    // a button is pressed the battery conditioning mode is always known. Default
+    // to "enabled" so the other suites exercise the plain start burst; the
+    // conditioning-mode suite seeds its own reading instead.
+    platform.conditioning_mode = CONDITIONING_MODE_ENABLED;
     s->fn();
     return test_report(s->name);
 }
