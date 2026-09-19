@@ -9,9 +9,10 @@
 
 // Nominal time between beep starts, including across queued requests.
 #define BEEP_INTERVAL_MS 100U
-// Preserve the recorded 10 ms between the 0x0C start and 0x04 release frames.
 #define BEEP_RELEASE_DELAY_MS 10U
 #define BEEP_FRAME_ID 0x465U
+#define BEEP_ACTIVE_VALUE 0x04U
+#define BEEP_IDLE_VALUE 0x0CU
 #define BEEP_QUEUE_DEPTH 4U
 #define BEEP_SEND_ATTEMPTS 3U
 #define BEEP_SEND_RETRY_MS 10U
@@ -47,11 +48,11 @@ static bool send_frame(uint8_t value) {
 
 static void play_sequence(uint8_t count) {
     for (unsigned i = 0U; i < count; i++) {
-        bool started = send_frame(0x0CU);
+        bool started = send_frame(BEEP_ACTIVE_VALUE);
         vTaskDelay(pdMS_TO_TICKS(BEEP_RELEASE_DELAY_MS));
         // Attempt the release even if the start failed; abort further beeps
         // after a persistent send failure so a disabled bus cannot stall us.
-        bool released = send_frame(0x04U);
+        bool released = send_frame(BEEP_IDLE_VALUE);
         vTaskDelay(pdMS_TO_TICKS(BEEP_INTERVAL_MS - BEEP_RELEASE_DELAY_MS));
         if (!started || !released) {
             return;
