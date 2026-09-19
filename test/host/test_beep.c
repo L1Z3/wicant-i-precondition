@@ -105,7 +105,7 @@ static void play_next(void) {
 static void expect_beeps(size_t count, can_bus_t bus) {
     CHECK(sent_count == count * 2U);
     for (size_t i = 0U; i < sent_count; i++) {
-        uint8_t expected[8] = {0, 0, 0, 0, 0, 0, i % 2U ? 0x04U : 0x0CU, 0};
+        uint8_t expected[8] = {0, 0, 0, 0, 0, 0, i % 2U ? 0x0CU : 0x04U, 0};
         CHECK(sent[i].bus == bus);
         CHECK(sent[i].frame.identifier == 0x465U);
         CHECK(sent[i].frame.data_length_code == 8U);
@@ -153,20 +153,20 @@ static void test_queue(void) {
 static void test_send_failures(void) {
     // A transient release failure retries the release, never another start.
     reset(false);
-    failing_value = 0x04U;
+    failing_value = 0x0CU;
     failures_remaining = 1U;
     CHECK(beep_play(2U));
     play_next();
     CHECK(sent_count == 5U);
-    CHECK(sent[0].frame.data[6] == 0x0CU);
-    CHECK(sent[1].frame.data[6] == 0x04U && sent[2].frame.data[6] == 0x04U);
+    CHECK(sent[0].frame.data[6] == 0x04U);
+    CHECK(sent[1].frame.data[6] == 0x0CU && sent[2].frame.data[6] == 0x0CU);
     CHECK(sent[2].at_us - sent[1].at_us == BEEP_SEND_RETRY_MS * 1000LL);
-    CHECK(sent[3].frame.data[6] == 0x0CU && sent[4].frame.data[6] == 0x04U);
+    CHECK(sent[3].frame.data[6] == 0x04U && sent[4].frame.data[6] == 0x0CU);
     CHECK(sent[3].at_us - sent[0].at_us >= BEEP_INTERVAL_MS * 1000LL);
 
     // Persistent failures abort the sequence after bounded attempts, still
     // attempt release, and allow the next queued request to run.
-    const uint8_t values[] = {0x0CU, 0x04U};
+    const uint8_t values[] = {0x04U, 0x0CU};
     for (size_t i = 0U; i < sizeof(values); i++) {
         reset(false);
         failing_value = values[i];
@@ -175,12 +175,12 @@ static void test_send_failures(void) {
         CHECK(beep_play(1U));
         play_next();
         CHECK(sent_count == BEEP_SEND_ATTEMPTS + 1U);
-        CHECK(sent[sent_count - 1U].frame.data[6] == 0x04U);
+        CHECK(sent[sent_count - 1U].frame.data[6] == 0x0CU);
         size_t before = sent_count;
         play_next();
         CHECK(sent_count == before + 2U);
-        CHECK(sent[before].frame.data[6] == 0x0CU);
-        CHECK(sent[before + 1U].frame.data[6] == 0x04U);
+        CHECK(sent[before].frame.data[6] == 0x04U);
+        CHECK(sent[before + 1U].frame.data[6] == 0x0CU);
     }
 }
 
