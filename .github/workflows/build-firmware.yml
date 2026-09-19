@@ -29,7 +29,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build and run host tests
-        run: make -C test/host
+        run: |
+          make -C test/host
+          make -C test/mcp251xfd
 
   build:
     runs-on: ubuntu-latest

@@ -24,12 +24,14 @@ flashing. Direct `idf.py` builds default to `proto`; override with
 | `proto` (formerly `custom`) | ESP32-S3 | MCP2515, 8 MHz oscillator | `WiCAN-PROTO` |
 | `eb-fd` | ESP32-S3 | MCP2518FD, 40 MHz oscillator | `WiCAN-EB-FD` |
 
-`eb-fd` currently adds hardware/build configuration only. Its MCP2518FD driver
-is not yet integrated, so bus 1 remains disabled and logs an unsupported-driver
-error when enabled. The ESP32-S3 module configuration, GPIO mapping, SPI speed,
-LEDs, and battery sensing provisionally match `proto` pending schematic
-confirmation. The MCP2515 reset GPIO is not used on `eb-fd`. CAN FD support is
-not yet implemented.
+`eb-fd` uses the MCP2518FD for Classical CAN on bus 1 through the
+[esp_twai_mcp251xfd component](components/esp_twai_mcp251xfd/README.md).
+The 40 MHz controller oscillator is configured without PLL or division; SPI
+runs at 10 MHz after initialization. The ESP32-S3 module configuration, GPIO
+mapping, SPI speed, LEDs, and battery sensing provisionally match `proto`
+pending schematic confirmation. The MCP2515 reset GPIO is not used on `eb-fd`.
+CAN FD payloads are not supported. This integration has build and host-test
+coverage; validation on the physical prototype is still required.
 
 # WiCAN-OBD-C3 Information
 

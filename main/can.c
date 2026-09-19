@@ -32,9 +32,13 @@
 #include "esp_twai_onchip.h"
 #include "can.h"
 #include "hw_config.h"
-#if HW_HAS_MCP2515
+#if HW_HAS_MCP2515 || HW_HAS_MCP2518FD
 #include "driver/spi_master.h"
+#endif
+#if HW_HAS_MCP2515
 #include "esp_twai_mcp2515.h"
+#elif HW_HAS_MCP2518FD
+#include "esp_twai_mcp251xfd.h"
 #endif
 
 #define TAG 		__func__
@@ -92,7 +96,7 @@ static EventGroupHandle_t s_can_event_group = NULL;
 static can_tx_slot_t tx_slot[CAN_BUS_COUNT][CAN_TX_SLOT_COUNT];
 // Counting semaphore whose count == number of free TX slots
 // can_send() takes it with the caller's timeout.
-// can_on_tx_done() gives it back from ISR context.
+// can_on_tx_done() gives it back from the driver's callback context.
 // Ordering rule: take BEFORE node_lock, never while holding it.
 static SemaphoreHandle_t tx_slot_sem[CAN_BUS_COUNT];
 // Bitmask that tracks which slots are free, guarded by tx_slot_num
@@ -102,7 +106,7 @@ static uint32_t tx_slot_used[CAN_BUS_COUNT];
 static portMUX_TYPE tx_slot_mux = portMUX_INITIALIZER_UNLOCKED;
 
 // RX frames lost because the shared rx queue was full (rx task too slow).
-// Incremented from can_on_rx_done (ISR context), logged rate-limited from
+// Incremented from can_on_rx_done (driver callback), logged rate-limited from
 // can_receive() in task context.
 static volatile uint32_t rx_drop_count[CAN_BUS_COUNT];
 static uint32_t rx_drop_logged[CAN_BUS_COUNT];
@@ -114,16 +118,17 @@ static int64_t rx_drop_log_us[CAN_BUS_COUNT];
 static uint32_t tx_drop_count[CAN_BUS_COUNT];
 static int64_t tx_drop_log_us[CAN_BUS_COUNT];
 
-// Bus-off recovery: neither driver recovers on its own, so a state-change
-// callback (ISR) flags the bus and wakes a task that recreates the node.
-// Full recreate rather than twai_node_recover(): the frame in flight at
-// bus-off gets no on_tx_done, so bare recovery would leak one TX slot per
-// bus-off; teardown + can_tx_slots_reset starts clean.
+// Bus-off recovery: state-change callbacks flag the bus and wake a task that
+// recreates the node. MCP2518FD also reports controller faults through this path.
+// Some backends do not complete the frame in flight at bus-off. Recreating
+// the node and resetting its TX slots prevents those frames from leaking slots.
+// MCP2518FD returns all retained frames before recreation.
 static TaskHandle_t can_recovery_task_handle = NULL;
-static volatile uint32_t can_busoff_pending;	// bitmask, set from ISR
+static volatile uint32_t can_busoff_pending;	// bitmask, set from driver callbacks
 static uint32_t can_busoff_count[CAN_BUS_COUNT];
 
-// Callback to receive frames from driver (ISR context): drain the frame out
+// On-chip callbacks run in ISR context; SPI controller callbacks run in a task.
+// Receive a frame from the driver: drain the frame out
 // of the hardware, tag it with its bus, and hand it to can_receive() via the
 // shared queue--all protocol work happens later in task context
 static bool can_on_rx_done(twai_node_handle_t handle, const twai_rx_done_event_data_t *edata, void *user_ctx)
@@ -144,7 +149,7 @@ static bool can_on_rx_done(twai_node_handle_t handle, const twai_rx_done_event_d
 		return false;
 	}
 
-	// Convert new twai_frame_t api that the MCP2515 driver uses to the legacy
+	// Convert the node driver's twai_frame_t API to the legacy
 	// twai_message_t that the rest of the firmware uses.
 	// ss/self have no equivalent in the twai_frame_t api
 	item.msg.flags = 0;
@@ -155,18 +160,19 @@ static bool can_on_rx_done(twai_node_handle_t handle, const twai_rx_done_event_d
 	item.msg.data_length_code =
 			(rx_frame.header.dlc > TWAI_FRAME_MAX_DLC) ? TWAI_FRAME_MAX_DLC : rx_frame.header.dlc;
 
-	// Queue full = frame dropped: count it here, log it from task context
-	// task_woken -> tell the driver to context-switch on ISR exit if this
-	// send unblocked a higher-priority task (i.e. can_rx_task).
+	// Queue full = frame dropped. SPI workers use task APIs; on-chip TWAI
+	// requests a context switch on ISR exit if the receive task was unblocked.
 	BaseType_t task_woken = pdFALSE;
-	if (xQueueSendFromISR(can_rx_queue, &item, &task_woken) != pdTRUE)
+	BaseType_t sent = xPortInIsrContext() ? xQueueSendFromISR(can_rx_queue, &item, &task_woken) :
+										  xQueueSend(can_rx_queue, &item, 0);
+	if (sent != pdTRUE)
 	{
 		rx_drop_count[item.bus]++;
 	}
 	return (task_woken == pdTRUE);
 }
 
-// Callback when the driver finishes transmitting a frame (ISR context):
+// Callback when the driver finishes or cancels a transmitted frame:
 // return its backing TX slot to the pool. This is the only thing that
 // replenishes the slots a can_send() may be blocked waiting on.
 static bool can_on_tx_done(twai_node_handle_t handle, const twai_tx_done_event_data_t *edata, void *user_ctx)
@@ -178,14 +184,30 @@ static bool can_on_tx_done(twai_node_handle_t handle, const twai_tx_done_event_d
 	// recover the slot containing it
 	can_tx_slot_t *slot = __containerof(edata->done_tx_frame, can_tx_slot_t, frame);
 
-	portENTER_CRITICAL_ISR(&tx_slot_mux);
+	bool in_isr = xPortInIsrContext();
+	if (in_isr)
+	{
+		portENTER_CRITICAL_ISR(&tx_slot_mux);
+	}
+	else
+	{
+		portENTER_CRITICAL(&tx_slot_mux);
+	}
 	tx_slot_used[bus] &= ~BIT(slot - &tx_slot[bus][0]);
-	portEXIT_CRITICAL_ISR(&tx_slot_mux);
+	if (in_isr)
+	{
+		portEXIT_CRITICAL_ISR(&tx_slot_mux);
+	}
+	else
+	{
+		portEXIT_CRITICAL(&tx_slot_mux);
+	}
 
 	// Release the count so a blocked can_send() can claim the slot;
 	// task_woken as in can_on_rx_done
 	BaseType_t task_woken = pdFALSE;
-	xSemaphoreGiveFromISR(tx_slot_sem[bus], &task_woken);
+	if (in_isr) xSemaphoreGiveFromISR(tx_slot_sem[bus], &task_woken);
+	else xSemaphoreGive(tx_slot_sem[bus]);
 	return (task_woken == pdTRUE);
 }
 
@@ -203,7 +225,8 @@ static bool can_on_state_change(twai_node_handle_t handle, const twai_state_chan
 	BaseType_t task_woken = pdFALSE;
 	if (can_recovery_task_handle != NULL)
 	{
-		vTaskNotifyGiveFromISR(can_recovery_task_handle, &task_woken);
+		if (xPortInIsrContext()) vTaskNotifyGiveFromISR(can_recovery_task_handle, &task_woken);
+		else xTaskNotifyGive(can_recovery_task_handle);
 	}
 	return (task_woken == pdTRUE);
 }
@@ -220,7 +243,13 @@ static void can_recovery_task(void *arg)
 		uint32_t pending = __atomic_exchange_n(&can_busoff_pending, 0, __ATOMIC_SEQ_CST);
 		for (int bus = 0; bus < CAN_BUS_COUNT; bus++)
 		{
-			if (!(pending & BIT(bus)) || !can_is_enabled((can_bus_t)bus))
+			if (!(pending & BIT(bus))) continue;
+			// A worker can report a fault while can_enable() is still publishing
+			// the enabled state. Wait for that lifecycle operation to finish.
+			xSemaphoreTake(node_lock[bus], portMAX_DELAY);
+			bool enabled = can_is_enabled((can_bus_t)bus);
+			xSemaphoreGive(node_lock[bus]);
+			if (!enabled)
 			{
 				pending &= ~BIT(bus);
 				continue;
@@ -388,6 +417,44 @@ static esp_err_t can_bus1_create_node(void)
 
 	return twai_new_node_mcp2515(MCP2515_SPI_HOST, &config, &can_node[CAN_BUS_1]);
 }
+#elif HW_HAS_MCP2518FD
+
+static esp_err_t can_mcp251xfd_bus_init(void)
+{
+	static bool spi_ready = false;
+	if (!spi_ready)
+	{
+		spi_bus_config_t config = {
+			.sclk_io_num = MCP2518FD_SCLK_GPIO_NUM,
+			.mosi_io_num = MCP2518FD_MOSI_GPIO_NUM,
+			.miso_io_num = MCP2518FD_MISO_GPIO_NUM,
+			.quadwp_io_num = GPIO_NUM_NC,
+			.quadhd_io_num = GPIO_NUM_NC,
+		};
+		esp_err_t err = spi_bus_initialize(MCP2518FD_SPI_HOST, &config, SPI_DMA_CH_AUTO);
+		if (err != ESP_OK) return err;
+		spi_ready = true;
+	}
+	// The MCP2518FD is reset through SPI. No GPIO 8 reset pulse.
+	esp_err_t err = gpio_install_isr_service(0);
+	return err == ESP_ERR_INVALID_STATE ? ESP_OK : err;
+}
+
+static esp_err_t can_bus1_create_node(void)
+{
+	esp_err_t err = can_mcp251xfd_bus_init();
+	if (err != ESP_OK) return err;
+	twai_mcp251xfd_node_config_t config = {
+		.io_cfg = {.int_gpio = MCP2518FD_INT_GPIO_NUM, .cs_gpio = MCP2518FD_CS_GPIO_NUM},
+		.spi_clock_hz = MCP2518FD_SPI_CLOCK_HZ,
+		.oscillator_hz = MCP2518FD_OSCILLATOR_HZ,
+		.bit_timing = {.bitrate = can_bitrate_bps[can_cfg[CAN_BUS_1].rate], .sp_permill = CAN_SAMPLE_POINT_PERMILL},
+		.fail_retry_cnt = can_cfg[CAN_BUS_1].auto_tx ? -1 : 0,
+		.tx_queue_depth = CAN_TX_SLOT_COUNT,
+		.flags = {.enable_loopback = can_cfg[CAN_BUS_1].loopback, .enable_listen_only = can_cfg[CAN_BUS_1].silent},
+	};
+	return twai_new_node_mcp251xfd(MCP2518FD_SPI_HOST, &config, &can_node[CAN_BUS_1]);
+}
 #endif
 
 // Build the bus-0 on-chip node from the stored per-bus config. Mode flags
@@ -449,12 +516,8 @@ void can_enable(can_bus_t bus)
 	}
 	else
 	{
-#if HW_HAS_MCP2515
+#if HW_HAS_MCP2515 || HW_HAS_MCP2518FD
 		err = can_bus1_create_node();
-#elif HW_HAS_MCP2518FD
-		// Hardware is described in hw_config.h; its TWAI driver is still pending.
-		ESP_LOGE(TAG, "bus %d: MCP2518FD driver not yet integrated", bus);
-		err = ESP_ERR_NOT_SUPPORTED;
 #else
 		err = ESP_ERR_NOT_SUPPORTED;
 #endif
@@ -472,7 +535,7 @@ void can_enable(can_bus_t bus)
 	// happen here, before twai_node_enable()
 	can_apply_filter(bus);
 
-	// Register the ISR callbacks with the bus id as their user_ctx
+	// Register the driver callbacks with the bus id as their user_ctx
 	twai_event_callbacks_t cbs = {
 		.on_rx_done = can_on_rx_done,
 		.on_tx_done = can_on_tx_done,
@@ -487,7 +550,7 @@ void can_enable(can_bus_t bus)
 	if (err != ESP_OK)
 	{
 		// Don't panic: bus 1 comes up at every boot by default, and a wedged
-		// MCP2515 (created OK over SPI but refusing to enable) must degrade
+		// SPI controller (created OK but refusing to enable) must degrade
 		// to a dead bus, not a boot loop.
 		ESP_LOGE(TAG, "bus %d: node enable failed: %s", bus, esp_err_to_name(err));
 		twai_node_delete(can_node[bus]);
@@ -545,8 +608,8 @@ void can_disable(can_bus_t bus)
 	twai_node_disable(can_node[bus]);
 	twai_node_delete(can_node[bus]);
 	can_node[bus] = NULL;
-	// Frames still queued in the driver are dropped since on_tx_done is no
-	// longer registered, so reset the tx slots
+	// MCP2518FD returns canceled frames during disable; other backends may
+	// discard them. Reset the pool only after all callbacks have stopped.
 	can_tx_slots_reset(bus);
 	can_cfg[bus].bus_state = OFF_BUS;
 
@@ -818,11 +881,10 @@ esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_w
 	// guaranteed), and staying non-blocking keeps the node_lock hold short
 	esp_err_t err = twai_node_transmit(can_node[bus], &slot->frame, 0);
 
-	xSemaphoreGive(node_lock[bus]);
-
 	if (err != ESP_OK)
 	{
-		// Frame never reached the driver: put the slot straight back
+		// Frame never reached the driver: return the slot before releasing
+		// node_lock, so recovery cannot reuse it before this cleanup finishes.
 		portENTER_CRITICAL(&tx_slot_mux);
 		tx_slot_used[bus] &= ~BIT(slot - &tx_slot[bus][0]);
 		portEXIT_CRITICAL(&tx_slot_mux);
@@ -833,6 +895,7 @@ esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_w
 			ESP_LOGE(TAG, "bus %d: transmit failed: %s", bus, esp_err_to_name(err));
 		}
 	}
+	xSemaphoreGive(node_lock[bus]);
 	return err;
 }
 

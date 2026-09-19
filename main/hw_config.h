@@ -72,7 +72,7 @@
 
 #else
 
-// -- Bus 1: MCP2518FD (SPI2), pending driver integration. -- //
+// -- Bus 1: MCP2518FD (SPI2), Classical CAN through esp_twai_mcp251xfd. -- //
 // SPI pins and speed are provisional carryovers from proto.
 // The 40 MHz oscillator is confirmed; MCP2518FD resets over SPI and has
 // no dedicated reset pin, so proto's GPIO 8 reset must not be used.

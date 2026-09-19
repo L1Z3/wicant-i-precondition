@@ -26,7 +26,7 @@
 
 typedef enum {
 	CAN_BUS_0 = 0,   // on-chip TWAI controller (OBD-II pins 6/14)
-	CAN_BUS_1 = 1,   // SPI CAN: MCP2515 on proto, MCP2518FD on eb-fd (driver pending)
+	CAN_BUS_1 = 1,   // SPI CAN: MCP2515 on proto, MCP2518FD on eb-fd
 } can_bus_t;
 
 #define CAN_5K				0

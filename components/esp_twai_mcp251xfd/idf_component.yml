@@ -1,0 +1,5 @@
+dependencies:
+  idf:
+    version: '>=5.5'
+description: Classical CAN TWAI adapter for the MCP2518FD using Emandhal/MCP251XFD.
+version: 0.1.0
