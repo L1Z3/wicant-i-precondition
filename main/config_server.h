@@ -139,7 +139,7 @@ typedef struct _device_config
 	char mqtt_rx_topic[64];
 	char mqtt_status_topic[64];
     char battery_temp_unit[2];
-    char egmp_car_model[8];
+    char egmp_car_model[16];
     char precon_mode[16];
     char precon_button[32];
     char precon_press[16];

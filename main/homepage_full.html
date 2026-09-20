@@ -1351,6 +1351,7 @@
                     <td>Select Vehicle:</td>
                     <td>
                         <select id="egmp_car_model" name="egmp_car_model" onchange="toggleCarPreconButtonOptions();">
+                            <option value="unknown">Unknown (show all)</option>
                             <option value="ioniq5">Ioniq 5</option>
                             <option value="ev6">EV6</option>
                             <option value="ioniq6">Ioniq 6</option>
@@ -1488,7 +1489,8 @@
 
         // Client-side only: recompute which preconditioning button options
         // are visible. An option is shown when it matches the selected car
-        // model (or is not car-specific) and, for the "extra" options, when
+        // model (or is not car-specific), or when the model is "unknown"
+        // (show all car-specific buttons), and, for the "extra" options, when
         // "Show all button options" is checked. Does not affect the value
         // submitted to the device.
         function updatePreconButtonVisibility() {
@@ -1497,7 +1499,8 @@
             document.querySelectorAll("#precon_button option").forEach(option => {
                 const carClass = Array.from(option.classList).find(className =>
                     className.startsWith("precon_button_car_"));
-                const carMatches = !carClass || carClass === `precon_button_car_${selectedVehicle}`;
+                const carMatches = selectedVehicle === "unknown"
+                    || !carClass || carClass === `precon_button_car_${selectedVehicle}`;
                 const extraVisible = !option.classList.contains("precon_button_extra") || showAll;
                 option.hidden = !(carMatches && extraVisible);
             });
@@ -3389,7 +3392,7 @@ function loadAutoTable(jsonData) {
             // config saved by older firmware has no precon_press key
             document.getElementById("precon_press").value = obj.precon_press || "short";
             // config saved by older firmware has no egmp_car_model key
-            document.getElementById("egmp_car_model").value = obj.egmp_car_model || "ioniq5";
+            document.getElementById("egmp_car_model").value = obj.egmp_car_model || "unknown";
             syncPreconButtonToggle();
 			if(obj.batt_alert_time == "1") {
 				document.getElementById("batt_alert_time").selectedIndex = "0";

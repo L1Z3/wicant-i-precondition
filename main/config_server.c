@@ -157,7 +157,7 @@ const char device_config_default[] = R"json({
 "mqtt_rx_topic":"wican/%s/can/rx",
 "mqtt_status_topic":"wican/%s/can/status",
 "battery_temp_unit":"c",
-"egmp_car_model":"ioniq5",
+"egmp_car_model":"unknown",
 "precon_mode":"once",
 "precon_button":"sw_star",
 "precon_press":"short"
@@ -2135,7 +2135,7 @@ static void config_server_load_cfg(char *cfg)
 	key = cJSON_GetObjectItem(root,"egmp_car_model");
 	if(key == 0)
 	{
-		strcpy(device_config.egmp_car_model, "ioniq5");
+		strcpy(device_config.egmp_car_model, "unknown");
 	}
 	else if(strlen(key->valuestring) >= sizeof(device_config.egmp_car_model))
 	{
@@ -3208,7 +3208,7 @@ void config_server_set_egmp_car_model(const char *model)
 	// Only initialize the model from detection while it is still at the
 	// factory default; never overwrite a model the user has selected.
 	if(model == NULL
-			|| strcmp(device_config.egmp_car_model, "ioniq5") != 0
+			|| strcmp(device_config.egmp_car_model, "unknown") != 0
 			|| strcmp(device_config.egmp_car_model, model) == 0)
 	{
 		return;
