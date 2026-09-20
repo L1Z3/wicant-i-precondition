@@ -157,6 +157,7 @@ const char device_config_default[] = R"json({
 "mqtt_rx_topic":"wican/%s/can/rx",
 "mqtt_status_topic":"wican/%s/can/status",
 "battery_temp_unit":"c",
+"egmp_car_model":"ioniq5",
 "precon_mode":"once",
 "precon_button":"sw_star",
 "precon_press":"short"
@@ -2127,6 +2128,25 @@ static void config_server_load_cfg(char *cfg)
     key = cJSON_GetObjectItem(root, "battery_temp_unit");
     strcpy(device_config.battery_temp_unit,
            cJSON_IsString(key) && strcmp(key->valuestring, "f") == 0 ? "f" : "c");
+
+	//*****
+	// key added after initial release; missing means a config saved by older
+	// firmware, so fall back to the default rather than rejecting the config
+	key = cJSON_GetObjectItem(root,"egmp_car_model");
+	if(key == 0)
+	{
+		strcpy(device_config.egmp_car_model, "ioniq5");
+	}
+	else if(strlen(key->valuestring) >= sizeof(device_config.egmp_car_model))
+	{
+		goto config_error;
+	}
+	else
+	{
+		strcpy(device_config.egmp_car_model, key->valuestring);
+	}
+	ESP_LOGE(TAG, "device_config.egmp_car_model: %s", device_config.egmp_car_model);
+	//*****
 
 	key = cJSON_GetObjectItem(root,"precon_mode");
 	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.precon_mode)))
