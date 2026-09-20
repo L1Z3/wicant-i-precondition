@@ -69,6 +69,7 @@ static int8_t cfg_press = PRESS_SHORT;
 int8_t config_server_precon_button(void) { return cfg_button; }
 int8_t config_server_precon_mode(void) { return cfg_mode; }
 int8_t config_server_precon_press(void) { return cfg_press; }
+void config_server_set_egmp_car_model(const char *model) { (void)model; }
 
 // Track popup behavior has its own suite. These stubs keep this test focused
 // on precondition behavior while still exercising the global-hook delegation.

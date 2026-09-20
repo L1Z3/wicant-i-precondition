@@ -3202,3 +3202,23 @@ int8_t config_server_precon_press(void)
 	}
 	return PRESS_SHORT;
 }
+
+void config_server_set_egmp_car_model(const char *model)
+{
+	// Only initialize the model from detection while it is still at the
+	// factory default; never overwrite a model the user has selected.
+	if(model == NULL
+			|| strcmp(device_config.egmp_car_model, "ioniq5") != 0
+			|| strcmp(device_config.egmp_car_model, model) == 0)
+	{
+		return;
+	}
+	if(strlen(model) >= sizeof(device_config.egmp_car_model))
+	{
+		return;
+	}
+
+	strcpy(device_config.egmp_car_model, model);
+	ESP_LOGI(TAG, "egmp_car_model initialized from CAN: %s",
+			device_config.egmp_car_model);
+}
