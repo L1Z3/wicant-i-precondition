@@ -2704,6 +2704,12 @@ function loadAutoTable(jsonData) {
 			document.getElementById("precondition_active_status").textContent = obj.precondition_starting ? "Starting" : (obj.precondition_active ? "Yes" : "No");
 			// the button toggles, so label it with the action it will take
 			document.getElementById("precon_activate_button").value = obj.precondition_requested ? "Stop Preconditioning" : "Activate";
+			// live car model (includes a model auto-detected from CAN); the
+			// stored config file may be stale until the next reboot
+			if (obj.egmp_car_model) {
+				document.getElementById("egmp_car_model").value = obj.egmp_car_model;
+				updatePreconButtonVisibility();
+			}
 			document.getElementById("port_status").innerHTML = obj.port;
 			document.getElementById("fw_version").innerHTML = obj.fw_version;
 			document.getElementById("hw_version").innerHTML = obj.hw_version;
@@ -3450,8 +3456,11 @@ function loadAutoTable(jsonData) {
 			document.getElementById("store_canflt_button").disabled = true;
 			document.querySelector(".store").disabled = true;
             document.getElementById("submit_button").disabled = true;
+			// run after the stored config has been applied so the live model
+			// from /check_status (possibly auto-detected from CAN) wins over
+			// the stale device_config_file served by /load_config
+			checkStatus();
 		};
-		checkStatus();
 		xhttp.open("GET", "/load_config");
 		xhttp.send();
 	}

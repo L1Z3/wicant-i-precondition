@@ -1061,6 +1061,9 @@ char *config_server_get_status_json(bool remove_sensitive_info)
         cJSON_AddBoolToObject(root, "precondition_starting", pstate.starting);
 	}
 
+	// live value, including a model auto-detected from CAN this session
+	cJSON_AddStringToObject(root, "egmp_car_model", device_config.egmp_car_model);
+
 	precondition_soc_t soc;
 
 	if (precondition_get_battery_soc(&soc)) {
@@ -3221,4 +3224,35 @@ void config_server_set_egmp_car_model(const char *model)
 	strcpy(device_config.egmp_car_model, model);
 	ESP_LOGI(TAG, "egmp_car_model initialized from CAN: %s",
 			device_config.egmp_car_model);
+
+	// Persist to config.json so the detection survives a reboot. No restart
+	// here: this runs on the CAN task while the car is talking. The live value
+	// is reported to the web UI through /check_status, not the cached
+	// device_config_file buffer.
+	cJSON *root = cJSON_Parse(device_config_file);
+	if(root == NULL)
+	{
+		return;
+	}
+	cJSON *key = cJSON_GetObjectItem(root, "egmp_car_model");
+	if(key == NULL)
+	{
+		cJSON_AddStringToObject(root, "egmp_car_model", device_config.egmp_car_model);
+	}
+	else
+	{
+		cJSON_SetValuestring(key, device_config.egmp_car_model);
+	}
+	const char *updated = cJSON_Print(root);
+	if(updated != NULL)
+	{
+		FILE *f = fopen(FS_MOUNT_POINT"/config.json", "w");
+		if(f != NULL)
+		{
+			fputs(updated, f);
+			fclose(f);
+		}
+		free((void *)updated);
+	}
+	cJSON_Delete(root);
 }
