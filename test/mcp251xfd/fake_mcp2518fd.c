@@ -50,7 +50,7 @@ static void reset_chip(fake_mcp2518fd_t *chip)
 
 static void refresh(fake_mcp2518fd_t *chip)
 {
-    chip->memory[OSC + 1] = chip->no_oscillator ? 0 : 4;
+    chip->memory[OSC + 1] = chip->no_oscillator || chip->low_power ? 0 : 4;
     if (chip->pretend_mcp2517) chip->memory[OSC] &= ~8u;
     chip->memory[CON + 2] = (chip->memory[CON + 2] & 0x1f) | chip->mode << 5;
     chip->memory[TXSTA] = (chip->memory[TXSTA] & 0xf0) | (chip->tx_count < 8 ? 1 : 0) | (!chip->tx_count ? 4 : 0);
@@ -90,6 +90,22 @@ static eERRORRESULT transfer(void *arg, uint8_t select, uint8_t *tx, uint8_t *rx
     unsigned command = tx[0] >> 4;
     unsigned address = (tx[0] & 15) * 256 + tx[1];
     assert(address + size - 2 <= sizeof(chip->memory));
+    if (chip->low_power) {
+        // CS wakes LPM, losing configuration/RAM. The wake transaction's
+        // response is not usable, and the oscillator takes time to stabilize.
+        reset_chip(chip);
+        chip->low_power = false;
+        chip->wake_reads_remaining = 3;
+        if (rx) memset(rx, 0, size);
+        return ERR_NONE;
+    }
+    if (chip->wake_reads_remaining) {
+        // Accessing CAN registers before OSCRDY is a driver bug.
+        assert(command == 3 && address == OSC + 1);
+        chip->wake_reads_remaining--;
+        memset(rx, 0, size);
+        return ERR_NONE;
+    }
     if (command == 0) {
         assert(size == 2 && address == 0);
         reset_chip(chip);
@@ -112,6 +128,10 @@ static eERRORRESULT transfer(void *arg, uint8_t select, uint8_t *tx, uint8_t *rx
             reset_fifos(chip);
             chip->memory[TREC + 2] = requested == 4 ? 32 : 0;
             chip->memory[TEFCON + 1] = chip->memory[TXCON + 1] = chip->memory[RXCON + 1] = 0;
+            if (requested == 1 && (chip->memory[OSC] & 8)) {
+                chip->low_power = true;
+                chip->memory[OSC] |= 4;
+            }
         }
     }
     if (size == 3) {

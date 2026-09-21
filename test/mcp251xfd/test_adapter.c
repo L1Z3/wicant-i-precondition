@@ -212,12 +212,41 @@ static void test_fault_and_failed_creation(void)
     platform_check_clean(); // Includes joining a worker from failed creation.
 }
 
+static void test_low_power_recreation(void)
+{
+    twai_node_handle_t node = create_node();
+    assert(node->disable(node) == ESP_OK);
+    assert(node->del(node) == ESP_OK);
+    platform_check_clean();
+    platform_pause_ms(20);
+    assert(platform_is_low_power());
+
+    // Do not reset the simulated controller between nodes: creation must
+    // release the CS hold, wake it and wait for its oscillator before use.
+    twai_mcp251xfd_node_config_t cfg = config();
+    assert(twai_new_node_mcp251xfd(1, &cfg, &node) == ESP_OK);
+    assert(!platform_is_low_power());
+    twai_event_callbacks_t callbacks = {.on_tx_done = on_tx_done};
+    assert(node->register_cbs(node, &callbacks, NULL) == ESP_OK);
+    assert(node->enable(node) == ESP_OK);
+    assert(node->transmit(node, &frames[0], 0) == ESP_OK);
+    wait_pending(1);
+    platform_finish_tx(1);
+    wait_completions(1);
+    assert(successful[0] && completed[0] == &frames[0]);
+    assert(node->disable(node) == ESP_OK);
+    assert(node->del(node) == ESP_OK);
+    platform_check_clean();
+    assert(platform_is_low_power());
+}
+
 int main(void)
 {
     test_worker_and_ownership();
     test_disable_waits_for_callback();
     test_disable_wakes_full_queue_sender();
     test_fault_and_failed_creation();
+    test_low_power_recreation();
     for (unsigned i = 0; i < 16; i++) {
         twai_node_handle_t node = create_node();
         assert(node->disable(node) == ESP_OK);

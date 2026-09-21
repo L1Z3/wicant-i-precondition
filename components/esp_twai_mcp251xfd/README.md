@@ -4,6 +4,22 @@ This component backs WiCAN `eb-fd` bus 1 with an MCP2518FD. The firmware still
 uses Classical CAN frames with at most eight data bytes. `proto` continues to
 use the existing MCP2515 driver.
 
+## EB-FD board controls
+
+The supplied `eb-fd-start` firmware identifies bus 0 as SN65HVD233/U2 with
+ESP32 GPIO 11 wired to RS, and bus 1 as TCAN3413/U4 with GPIO 12 wired to STB.
+Both controls have external 10 kOhm pull-ups: high selects standby, low enables
+normal operation. `main/hw_config.h` defines these only for EB-FD; proto retains
+its original behavior. `main/can.c` controls the pins under each bus's lifecycle
+lock, enabling the transceiver before its controller and restoring standby on
+disable or failed enable. Bus 1 allows the TCAN3413's 30 us mode-change time
+before proceeding ([datasheet, section 5.9](https://www.ti.com/lit/ds/symlink/tcan3413.pdf#page=9)).
+
+MCP2518FD/U57 uses a 40 MHz crystal (X2), SPI2 SCLK 17/MOSI 16/MISO 15/CS 18,
+and INT 7. GPIO 8 is unused; the controller's GPIO0/GPIO1 remain inputs.
+The supplied firmware confirms the LED and VBAT mappings already used by
+WiCAN. The ESP32 module's flash/PSRAM capacity remains provisional.
+
 ## Source and local changes
 
 The MIT-licensed Emandhal core is vendored in `vendor/` at revision
@@ -77,6 +93,21 @@ API calls. It disables the interrupt source, waits for in-flight GPIO ISRs on
 both cores, unregisters the handler, and asks the worker to exit. The worker is
 joined before its mutexes, SPI device, and context are freed. WiCAN's
 `node_lock` provides the application-side lifetime protection.
+
+After joining the worker, deletion requests MCP2518FD low-power mode (LPM),
+with controller interrupts and CAN wake disabled. It performs no SPI readback
+after this request: asserting CS would wake the chip again. CS stays held high
+across SPI-device removal and ESP32 light sleep. Creation configures CS before
+releasing the hold, wakes the controller at 1 MHz, waits for OSCRDY, and restores
+the complete configuration and RAM. LPM discards both on wake-up; see the
+[MCP2518FD datasheet, OSC register](https://ww1.microchip.com/downloads/aemDocuments/documents/OTH/ProductDocuments/DataSheets/External-CAN-FD-Controller-with-SPI-Interface-DS20006027B.pdf#page=16).
+
+This also covers WiCAN's existing sleep path, which disables and deletes both
+CAN nodes before ESP32 light sleep. Recovery and configuration changes recreate
+the controller through the same path. A low-power request that fails is logged;
+resource cleanup still completes so an unreachable controller cannot leak a
+node. `twai_node_disable()` alone retains configuration mode and supports
+re-enabling the same node; LPM is requested only when disposing of that node.
 
 ## Validation
 

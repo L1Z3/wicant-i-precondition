@@ -517,9 +517,14 @@ void app_main(void)
 	gpio_set_level(ACTIVE_LED_GPIO_NUM, LED_OFF);
 
 #ifdef CAN_STDBY_GPIO_NUM
-    gpio_reset_pin(CAN_STDBY_GPIO_NUM);
-    gpio_set_direction(CAN_STDBY_GPIO_NUM, GPIO_MODE_OUTPUT);
-    gpio_set_level(CAN_STDBY_GPIO_NUM, 1);
+    ESP_ERROR_CHECK(gpio_reset_pin(CAN_STDBY_GPIO_NUM));
+    ESP_ERROR_CHECK(gpio_set_level(CAN_STDBY_GPIO_NUM, 1));
+    ESP_ERROR_CHECK(gpio_set_direction(CAN_STDBY_GPIO_NUM, GPIO_MODE_OUTPUT));
+#endif
+#ifdef MCP2518FD_STDBY_GPIO_NUM
+    ESP_ERROR_CHECK(gpio_reset_pin(MCP2518FD_STDBY_GPIO_NUM));
+    ESP_ERROR_CHECK(gpio_set_level(MCP2518FD_STDBY_GPIO_NUM, 1));
+    ESP_ERROR_CHECK(gpio_set_direction(MCP2518FD_STDBY_GPIO_NUM, GPIO_MODE_OUTPUT));
 #endif
 
     xMsg_Rx_Queue = xQueueCreate(16, sizeof( xdev_buffer) );

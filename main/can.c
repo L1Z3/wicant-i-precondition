@@ -39,6 +39,7 @@
 #include "esp_twai_mcp2515.h"
 #elif HW_HAS_MCP2518FD
 #include "esp_twai_mcp251xfd.h"
+#include "esp_rom_sys.h"
 #endif
 
 #define TAG 		__func__
@@ -494,8 +495,34 @@ static esp_err_t can_bus0_create_node(void)
 	return twai_new_node_onchip(&config, &can_node[CAN_BUS_0]);
 }
 
+// Called under node_lock on every lifecycle transition, including recovery.
+// Startup configures these outputs high; EB-FD's pull-ups keep them high
+// if the ESP32 releases the pins during sleep.
+static esp_err_t can_transceiver_standby(can_bus_t bus, bool standby)
+{
+	int pin = -1;
+	(void)bus;
+#ifdef CAN_STDBY_GPIO_NUM
+	if (bus == CAN_BUS_0) pin = CAN_STDBY_GPIO_NUM;
+#endif
+#ifdef MCP2518FD_STDBY_GPIO_NUM
+	if (bus == CAN_BUS_1) pin = MCP2518FD_STDBY_GPIO_NUM;
+#endif
+	if (pin < 0) return ESP_OK;
+	esp_err_t err = gpio_set_level(pin, standby ? 1 : 0);
+	if (err != ESP_OK)
+	{
+		ESP_LOGE(TAG, "bus %d: transceiver GPIO %d failed: %s", bus, pin, esp_err_to_name(err));
+	}
+#ifdef MCP2518FD_STDBY_GPIO_NUM
+	// TCAN3413 specifies up to 30 us to switch between standby and normal.
+	if (err == ESP_OK && bus == CAN_BUS_1) esp_rom_delay_us(30);
+#endif
+	return err;
+}
+
 // Bring a bus up from its stored config: create node -> filter -> callbacks
-// -> enable -> publish the enable bit.
+// -> activate transceiver -> enable controller -> publish the enable bit.
 void can_enable(can_bus_t bus)
 {
 	// s_can_event_group is NULL only before can_init() (config server
@@ -551,6 +578,10 @@ void can_enable(can_bus_t bus)
 	if (err == ESP_OK)
 	{
 		can_tx_slots_reset(bus);	// fresh node: all slots are free
+		err = can_transceiver_standby(bus, false);
+	}
+	if (err == ESP_OK)
+	{
 		err = twai_node_enable(can_node[bus]);
 	}
 	if (err != ESP_OK)
@@ -559,6 +590,7 @@ void can_enable(can_bus_t bus)
 		// SPI controller (created OK but refusing to enable) must degrade
 		// to a dead bus, not a boot loop.
 		ESP_LOGE(TAG, "bus %d: node enable failed: %s", bus, esp_err_to_name(err));
+		can_transceiver_standby(bus, true);
 		twai_node_delete(can_node[bus]);
 		can_node[bus] = NULL;
 		xSemaphoreGive(node_lock[bus]);
@@ -572,12 +604,6 @@ void can_enable(can_bus_t bus)
 	xQueueReset(can_rx_queue);
 
 	can_cfg[bus].bus_state = ON_BUS;
-#ifdef CAN_STDBY_GPIO_NUM
-	if (bus == CAN_BUS_0)
-	{
-		gpio_set_level(CAN_STDBY_GPIO_NUM, 0);	// transceiver out of standby
-	}
-#endif
 	// Publish "bus up" last: unparks can_receive(), opens can_send()'s gate
 	xEventGroupSetBits(s_can_event_group, CAN_ENABLE_BIT(bus));
 
@@ -604,14 +630,11 @@ void can_disable(can_bus_t bus)
 	}
 	// The enable bit goes first so new senders fail fast instead of piling up on the lock.
 	xEventGroupClearBits(s_can_event_group, CAN_ENABLE_BIT(bus));
-#ifdef CAN_STDBY_GPIO_NUM
-	if (bus == CAN_BUS_0)
-	{
-		gpio_set_level(CAN_STDBY_GPIO_NUM, 1);	// transceiver into standby
-	}
-#endif
 
 	twai_node_disable(can_node[bus]);
+	can_transceiver_standby(bus, true);
+	// MCP2518FD deletion also requests controller low-power mode. The next
+	// enable recreates it, restoring configuration lost during sleep.
 	twai_node_delete(can_node[bus]);
 	can_node[bus] = NULL;
 	// MCP2518FD returns canceled frames during disable; other backends may

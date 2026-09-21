@@ -96,6 +96,9 @@ eERRORRESULT mcp251xfd_core_enable(mcp251xfd_core_t *core);
 // Always stops software activity and returns ownership of all accepted tokens,
 // including when the controller cannot be reached. A faulted node must be recreated.
 eERRORRESULT mcp251xfd_core_disable(mcp251xfd_core_t *core);
+// Enter LPM after disabling. No SPI access is allowed afterwards until a fresh
+// core_init() wakes and reconfigures the device; the caller discards this core.
+eERRORRESULT mcp251xfd_core_sleep(mcp251xfd_core_t *core);
 eERRORRESULT mcp251xfd_core_filter(mcp251xfd_core_t *core, uint8_t index,
                                  uint32_t id, uint32_t mask, bool extended);
 eERRORRESULT mcp251xfd_core_enqueue(mcp251xfd_core_t *core,

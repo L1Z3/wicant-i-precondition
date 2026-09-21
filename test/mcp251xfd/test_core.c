@@ -396,6 +396,43 @@ static void test_fault_diagnostics(void)
     assert(registers.valid == 13 && registers.nbtcfg == 0);
 }
 
+static void test_low_power_recreation(void)
+{
+    fixture_t f;
+    prepare(&f);
+    start(&f);
+    enqueue(&f, 0);
+    assert(mcp251xfd_core_service(&f.core) == ERR_NONE);
+    assert(mcp251xfd_core_sleep(&f.core) == ERR__NOT_READY);
+    assert(mcp251xfd_core_disable(&f.core) == ERR_NONE);
+    assert(f.completed_count == 1 && !f.success[0]);
+    assert(mcp251xfd_core_sleep(&f.core) == ERR_NONE);
+    assert(f.chip.low_power); // No SPI read after the sleep request.
+    assert((fake_read32(&f.chip, 0x01c) >> 16) == 0); // No CAN wake interrupt.
+
+    // Recreate only the software context, preserving the sleeping hardware.
+    MCP251XFD device = f.core.device;
+    mcp251xfd_config_t config = f.core.config;
+    mcp251xfd_callbacks_t callbacks = f.core.callbacks;
+    memset(&f.core, 0, sizeof(f.core));
+    f.core.device = device;
+    f.core.config = config;
+    f.core.callbacks = callbacks;
+    start(&f);
+    assert(!f.chip.low_power && !f.chip.wake_reads_remaining);
+    assert(fake_read32(&f.chip, 0x004) == 0x00440909);
+    assert(f.chip.memory[0x1d0] == 0x82);
+    enqueue(&f, 1);
+    assert(mcp251xfd_core_service(&f.core) == ERR_NONE);
+    fake_transmit(&f.chip, true);
+    assert(mcp251xfd_core_service(&f.core) == ERR_NONE);
+    assert(f.completed_count == 2 && f.success[1]);
+
+    assert(mcp251xfd_core_disable(&f.core) == ERR_NONE);
+    f.chip.disconnected = true;
+    assert(mcp251xfd_core_sleep(&f.core) == ERR__SPI_COMM_ERROR);
+}
+
 int main(void)
 {
     test_timing();
@@ -407,6 +444,7 @@ int main(void)
     test_stop_and_faults();
     test_reenable_and_errors();
     test_fault_diagnostics();
+    test_low_power_recreation();
     puts("MCP2518FD core: timing, SPI initialization, FIFO order, TEF ownership, one-shot, RX/RTR, filters, and lifecycle tests passed");
     return 0;
 }

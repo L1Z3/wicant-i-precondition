@@ -15,13 +15,18 @@ submission order, sequence wrap, original completion tokens, one-shot failures,
 standard/extended IDs, RTR, filtering register contents, RX overflow, FD rejection,
 bus-off (including automatic hardware recovery before polling), TEF corruption,
 SPI failure, mode timeout, repeated enable/disable, and failed initialization.
+It also models LPM wake-up clearing registers/RAM, an unusable first SPI reply,
+and delayed oscillator readiness, then verifies configuration and TX after
+recreating the software context without resetting the simulated hardware.
 
 The adapter test compiles the actual ESP-IDF adapter against pthread-backed
 platform stubs. It checks worker/ISR separation, queue backpressure, original
 frame pointers, concurrent disable while a callback is active, a waiting sender
 during disable, controller disconnection, and cleanup after partially completed
 creation. Resource counters check that tasks, semaphores, event groups, and SPI
-devices are released. These are host tests, not measurements on real hardware.
+devices are released. Deletion/recreation also checks LPM entry, no subsequent
+worker SPI access, and CS hold/release across device removal and creation.
+These are host tests, not measurements on real hardware.
 
 ## Bring-up diagnostics
 
@@ -37,13 +42,12 @@ The log now includes TEC/REC and ACK, BIT0, BIT1, FORM, STUFF, and CRC flags,
 including flags from earlier polls. The captured mode matters: configuration
 mode itself sets TXBO, so registers must be captured before fault cleanup.
 
-For the prototype, confirm the bus-1 transceiver model, CAN connector routing,
-and enable/standby wiring and polarity with the board designer. In particular,
-check whether an enable signal is connected to ESP32 GPIO 8 or MCP2518FD
-GPIO0/XSTBY or GPIO1. The current firmware leaves those controller GPIOs as
-inputs and does not use ESP32 GPIO 8. Do not infer an enable polarity from the
-old MCP2515 reset signal. A quiet log in parallel mode does not demonstrate a
-working bus-1 transmit path; verify actual RX as well.
+The supplied EB-FD firmware identifies ESP32 GPIO 11 -> SN65HVD233/U2 RS and
+GPIO 12 -> TCAN3413/U4 STB, each with a 10 kOhm pull-up. Both must be low during
+operation and high when their respective bus is disabled. GPIO 8 is unused;
+MCP2518FD GPIO0/GPIO1 remain inputs. Verify these levels on the physical board,
+along with CAN connector routing. A quiet log in parallel mode does not
+demonstrate a working bus-1 path; verify actual RX in SavvyCAN as well as TX.
 
 ## Bench checklist — pending physical prototype
 
@@ -51,10 +55,10 @@ Use an isolated, correctly terminated Classical CAN test bus and a second
 CAN adapter that can ACK frames. Record firmware commit, oscillator, SPI rate,
 pin mapping, nominal bitrate, test duration, observed loss, and errors.
 
-1. Confirm the provisional board settings in `main/hw_config.h`: SPI2 SCLK 17,
-   MOSI 16, MISO 15, CS 18, INT 7; on-chip TX 2/RX 1; ESP32-S3 N16R8; LEDs and
-   VBAT divider. Confirm the 40 MHz oscillator and transceiver standby wiring.
-   MCP2518FD has no GPIO reset; GPIO 8 is not driven for reset.
+1. Verify the supplied board settings in `main/hw_config.h`: SPI2 SCLK 17,
+   MOSI 16, MISO 15, CS 18, INT 7; on-chip TX 2/RX 1; 40 MHz crystal;
+   standby controls 11/12; LEDs and VBAT divider. Confirm the provisional
+   ESP32-S3 N16R8 module capacity separately. GPIO 8 is not driven for reset.
 2. Build/flash `eb-fd`. Check reset/configuration at 1 MHz and operation at
    10 MHz with a logic analyzer. Confirm bus 0 stays usable if bus 1 hardware
    is missing or initialization fails.
@@ -77,10 +81,16 @@ pin mapping, nominal bitrate, test duration, observed loss, and errors.
 8. Repeatedly disable/enable and change bitrate/mode while traffic is flowing.
    Check for stale callbacks, duplicate completions, leaked slots, watchdog
    resets, or heap loss. Disconnect/reconnect SPI hardware to exercise failed
-   creation and controller-fault cleanup.
+   creation and controller-fault cleanup. Check that standby returns high on a
+   failed enable and goes low again after successful recovery.
 9. Sustain simultaneous RX/TX on both CAN buses with Wi-Fi/GVRET streaming.
    Measure ordering, loss/overflow, latency, and heap over an extended run.
    Compare with the existing proto board under the same workload.
+10. Exercise the existing voltage-triggered sleep and wake path. Check GPIOs
+    11/12 high and CS 18 continuously high during sleep, with no SPI polling
+    after the LPM request. Measure supply current; do not probe sleeping
+    controller registers over SPI, since that wakes it. On wake, verify both
+    transceivers return low, the controller is reconfigured, and RX/TX resume.
 
 Full CAN FD traffic is outside this implementation. In Normal CAN 2.0 mode the
 controller can emit error frames on FD traffic; this checklist assumes a

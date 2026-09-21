@@ -82,6 +82,21 @@ static eERRORRESULT wait_fifo_reset(mcp251xfd_core_t *core)
     return ERR_NONE;
 }
 
+static eERRORRESULT wake_clock(mcp251xfd_core_t *core)
+{
+    // Asserting CS wakes MCP2518FD from LPM and resets its registers/RAM.
+    // Discard the first read, then wait at the safe SPI speed before accessing
+    // the CAN registers. The wake-up transaction need not return valid data.
+    uint8_t status;
+    TRY(MCP251XFD_ReadSFR8(&core->device, RegMCP251XFD_OSC + 1, &status));
+    uint32_t start = core->device.fnGetCurrentms();
+    for (;;) {
+        TRY(MCP251XFD_ReadSFR8(&core->device, RegMCP251XFD_OSC + 1, &status));
+        if (status != UINT8_MAX && (status & MCP251XFD_SFR_OSC8_OSCRDY)) return ERR_NONE;
+        if ((uint32_t)(core->device.fnGetCurrentms() - start) >= MODE_TIMEOUT_MS) return ERR__DEVICE_TIMEOUT;
+    }
+}
+
 static void complete_head(mcp251xfd_core_t *core, bool success)
 {
     const void *token = core->tx[core->head].token;
@@ -155,6 +170,7 @@ eERRORRESULT mcp251xfd_core_init(mcp251xfd_core_t *core)
     // Enter configuration using our longer wait before upstream's safe reset.
     TRY(core->device.fnSPI_Init(core->device.InterfaceDevice, core->device.SPI_ChipSelect,
                                MCP251XFD_DRIVER_SAFE_RESET_SPI_CLK));
+    TRY(wake_clock(core));
     TRY(set_mode(core, MCP251XFD_CONFIGURATION_MODE));
     core->device.DriverConfig = MCP251XFD_DRIVER_SAFE_RESET | MCP251XFD_DRIVER_ENABLE_ECC |
                                 MCP251XFD_DRIVER_INIT_SET_RAM_AT_0 | MCP251XFD_DRIVER_CLEAR_BUFFER_BEFORE_READ;
@@ -235,6 +251,18 @@ eERRORRESULT mcp251xfd_core_disable(mcp251xfd_core_t *core)
     cancel_all(core);
     core->state = MCP251XFD_STATE_BUS_OFF;
     return error;
+}
+
+eERRORRESULT mcp251xfd_core_sleep(mcp251xfd_core_t *core)
+{
+    if (core->running || core->count) return ERR__NOT_READY;
+    TRY(MCP251XFD_ConfigureInterrupt(&core->device, MCP251XFD_INT_NO_EVENT));
+    TRY(set_mode(core, MCP251XFD_CONFIGURATION_MODE));
+    // WiCAN wakes on its battery-check timer and recreates the node. Disable
+    // CAN wake interrupts; LPM discards configuration and RAM on wake-up.
+    TRY(MCP251XFD_ConfigureSleepMode(&core->device, true, MCP251XFD_NO_FILTER, false));
+    // This must be the last SPI access: polling OPMOD would wake it again.
+    return MCP251XFD_EnterSleepMode(&core->device);
 }
 
 eERRORRESULT mcp251xfd_core_filter(mcp251xfd_core_t *core, uint8_t index,

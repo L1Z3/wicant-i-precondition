@@ -19,6 +19,7 @@ static MCP251XFD_SPITransfer_Func hardware_transfer;
 static void (*interrupt_handler)(void *);
 static void *interrupt_arg;
 static bool interrupt_enabled, fail_install;
+static bool cs_held;
 
 static struct timespec deadline(unsigned ms)
 {
@@ -213,6 +214,9 @@ esp_err_t spi_bus_add_device(spi_host_device_t bus, const spi_device_interface_c
 }
 esp_err_t spi_bus_remove_device(spi_device_handle_t device)
 {
+    // Device removal resets the CS pin. It must remain held if the chip is
+    // asleep, otherwise a low glitch could undo the low-power request.
+    assert(!chip.low_power || cs_held);
     free(device);
     atomic_fetch_sub(&spi_count, 1);
     return ESP_OK;
@@ -221,12 +225,16 @@ esp_err_t spi_device_polling_transmit(spi_device_handle_t device, spi_transactio
 {
     assert(device && !isr_context);
     pthread_mutex_lock(&hardware_lock);
+    assert(!cs_held);
+    chip.spi_hz = device->hz;
     eERRORRESULT error = hardware_transfer(&chip, 0, (uint8_t *)transaction->tx_buffer,
                                            transaction->rx_buffer, transaction->length / 8);
     pthread_mutex_unlock(&hardware_lock);
     return error == ERR_NONE ? ESP_OK : ESP_FAIL;
 }
 esp_err_t gpio_config(const gpio_config_t *config) { (void)config; return ESP_OK; }
+esp_err_t gpio_hold_en(gpio_num_t gpio) { assert(gpio == 18); cs_held = true; return ESP_OK; }
+esp_err_t gpio_hold_dis(gpio_num_t gpio) { assert(gpio == 18); cs_held = false; return ESP_OK; }
 esp_err_t gpio_intr_enable(gpio_num_t gpio)
 {
     (void)gpio;
@@ -283,6 +291,14 @@ void platform_reset(void)
     fake_init(&chip, &core);
     hardware_transfer = core.device.fnSPI_Transfer;
     fail_install = interrupt_enabled = false;
+    cs_held = false;
+}
+bool platform_is_low_power(void)
+{
+    pthread_mutex_lock(&hardware_lock);
+    bool asleep = chip.low_power;
+    pthread_mutex_unlock(&hardware_lock);
+    return asleep;
 }
 void platform_finish_tx(unsigned count)
 {

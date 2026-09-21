@@ -110,6 +110,8 @@ esp_err_t gpio_intr_disable(gpio_num_t gpio);
 esp_err_t gpio_isr_handler_add(gpio_num_t gpio, void (*handler)(void *), void *arg);
 esp_err_t gpio_isr_handler_remove(gpio_num_t gpio);
 esp_err_t gpio_set_intr_type(gpio_num_t gpio, int type);
+esp_err_t gpio_hold_en(gpio_num_t gpio);
+esp_err_t gpio_hold_dis(gpio_num_t gpio);
 int gpio_get_level(gpio_num_t gpio);
 
 // Test controls; they serialize simulated hardware changes against SPI.
@@ -122,3 +124,4 @@ void platform_fail_isr_install(void);
 void platform_enter_isr(bool is_isr);
 void platform_check_clean(void);
 void platform_pause_ms(unsigned ms);
+bool platform_is_low_power(void);

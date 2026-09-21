@@ -34,6 +34,9 @@ typedef struct {
 // Disable completes outstanding frames with is_tx_success=false. No callbacks
 // run after disable returns. Delete joins the worker before freeing resources;
 // callers must serialize deletion against other API calls (WiCAN's node_lock).
+// Delete also attempts controller LPM, logging any failure without blocking
+// resource cleanup, and holds CS high until the next creation. Recreating the
+// node wakes the controller at 1 MHz and restores all configuration/RAM.
 // Bus-off and controller faults stop the node; recreate it to recover.
 esp_err_t twai_new_node_mcp251xfd(spi_host_device_t bus,
                                 const twai_mcp251xfd_node_config_t *config,

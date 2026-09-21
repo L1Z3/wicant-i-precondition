@@ -17,6 +17,8 @@ typedef struct {
     bool freeze_mode;
     bool no_oscillator;
     bool pretend_mcp2517;
+    bool low_power;
+    unsigned wake_reads_remaining;
     uint32_t wire_ids[256];
     unsigned wire_count;
 } fake_mcp2518fd_t;

@@ -41,6 +41,7 @@ typedef struct {
     bool isr_installed;
     bool enabled;
     bool stopping;
+    bool controller_initialized;
 } mcp251xfd_node_t;
 
 static mcp251xfd_node_t *node_context(twai_node_handle_t node)
@@ -84,6 +85,9 @@ static eERRORRESULT spi_init(void *arg, uint8_t chip_select, uint32_t hz)
     };
     if (spi_bus_add_device(ctx->spi_host, &config, &ctx->spi) != ESP_OK) return ERR__SPI_CONFIG_ERROR;
     ctx->spi_hz = hz;
+    // Deletion holds CS high across SPI-device removal and ESP32 light sleep.
+    // Configure the peripheral's idle level before releasing that hold.
+    if (gpio_hold_dis(ctx->cs_gpio) != ESP_OK) return ERR__SPI_CONFIG_ERROR;
     return ERR_NONE;
 }
 
@@ -287,7 +291,19 @@ static void destroy_context(mcp251xfd_node_t *ctx)
         // Cooperative exit: never kill a task in SPI, a callback, or a mutex.
         xSemaphoreTake(ctx->worker_exited, portMAX_DELAY);
     }
-    if (ctx->spi) spi_bus_remove_device(ctx->spi);
+    // No worker or ISR can access SPI now. LPM entry must be the final transfer
+    // before deletion, since any subsequent CS assertion wakes the controller.
+    if (ctx->controller_initialized) {
+        eERRORRESULT error = mcp251xfd_core_sleep(&ctx->core);
+        if (error != ERR_NONE) ESP_LOGE(TAG, "controller low-power request failed: %d", (int)error);
+    }
+    if (ctx->spi) {
+        // Keep nCS deasserted when IDF resets its pin on device removal.
+        // The hold is released by spi_init() on the next node creation.
+        esp_err_t error = gpio_hold_en(ctx->cs_gpio);
+        if (error != ESP_OK) ESP_LOGE(TAG, "CS hold failed: %d", (int)error);
+        spi_bus_remove_device(ctx->spi);
+    }
     if (ctx->events) vEventGroupDelete(ctx->events);
     if (ctx->worker_exited) vSemaphoreDelete(ctx->worker_exited);
     if (ctx->tx_space) vSemaphoreDelete(ctx->tx_space);
@@ -459,6 +475,7 @@ esp_err_t twai_new_node_mcp251xfd(spi_host_device_t bus, const twai_mcp251xfd_no
         ESP_LOGE(TAG, "MCP2518FD initialization failed: %d", (int)init_error);
         goto fail;
     }
+    ctx->controller_initialized = true;
     gpio_config_t gpio = {.pin_bit_mask = BIT64(ctx->int_gpio), .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE, .pull_down_en = GPIO_PULLDOWN_DISABLE, .intr_type = GPIO_INTR_DISABLE};
     error = gpio_config(&gpio);
