@@ -69,7 +69,8 @@
      }
      else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
      {
-         ESP_LOGI(WIFI_TAG, "WIFI_EVENT_STA_DISCONNECTED");
+         wifi_event_sta_disconnected_t* event = (wifi_event_sta_disconnected_t*) event_data;
+         ESP_LOGI(WIFI_TAG, "WIFI_EVENT_STA_DISCONNECTED: reason=%u", (unsigned)event->reason);
 
          // Keep global device status in sync
          dev_status_clear_wifi_connected();
@@ -135,7 +136,7 @@
          dev_status_set_wifi_connected();
      }
  
-     if (event_id == WIFI_EVENT_AP_STACONNECTED)
+     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED)
      {
          ESP_LOGI(WIFI_TAG, "WIFI_EVENT_AP_STACONNECTED");
          wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*) event_data;
@@ -147,19 +148,19 @@
              ESP_LOGW(WIFI_TAG, "disable ble");
          }
      }
-     else if (event_id == WIFI_EVENT_AP_STADISCONNECTED)
+     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STADISCONNECTED)
      {
          ESP_LOGI(WIFI_TAG, "WIFI_EVENT_AP_STADISCONNECTED");
          wifi_event_ap_stadisconnected_t* event = (wifi_event_ap_stadisconnected_t*) event_data;
-         ESP_LOGI(WIFI_TAG, "station "MACSTR" leave, AID=%d",
-                  MAC2STR(event->mac), event->aid);
+         ESP_LOGI(WIFI_TAG, "station "MACSTR" leave, AID=%d, reason=%u",
+                  MAC2STR(event->mac), event->aid, (unsigned)event->reason);
          if(config_server_get_ble_config())
          {
              ble_enable();
              ESP_LOGW(WIFI_TAG, "enable ble");
          }
      }
-     else if(event_id == WIFI_EVENT_AP_START)
+     else if(event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_START)
      {
          ESP_LOGI(WIFI_TAG, "WIFI_EVENT_AP_START");
      }
@@ -404,4 +405,3 @@
      ESP_LOGI(WIFI_TAG, "wifi_init finished.");
  
  }
- 

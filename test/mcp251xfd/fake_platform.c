@@ -12,6 +12,7 @@ struct fake_task { pthread_t thread; SemaphoreHandle_t notifications; void (*ent
 struct fake_spi { unsigned hz; bool acquired; };
 static _Thread_local TaskHandle_t current_task;
 static _Thread_local bool isr_context;
+static _Thread_local unsigned held_mutexes;
 static atomic_int semaphore_count, event_count, task_count, spi_count;
 static pthread_mutex_t hardware_lock = PTHREAD_MUTEX_INITIALIZER;
 static fake_mcp2518fd_t chip;
@@ -22,6 +23,8 @@ static bool interrupt_enabled, fail_install;
 static bool cs_held;
 static unsigned spi_acquire_attempts, spi_fail_acquire;
 static atomic_uint spi_reservations;
+static atomic_uint worker_delays;
+static atomic_bool force_int_low;
 
 static struct timespec deadline(unsigned ms)
 {
@@ -63,7 +66,7 @@ SemaphoreHandle_t xSemaphoreCreateBinary(void) { return xSemaphoreCreateCounting
 int xSemaphoreTake(SemaphoreHandle_t sem, TickType_t timeout)
 {
     assert(!isr_context);
-    if (sem->mutex) { pthread_mutex_lock(&sem->lock); return pdTRUE; }
+    if (sem->mutex) { pthread_mutex_lock(&sem->lock); held_mutexes++; return pdTRUE; }
     pthread_mutex_lock(&sem->lock);
     struct timespec until = deadline(timeout);
     while (!sem->count) {
@@ -80,7 +83,7 @@ int xSemaphoreTake(SemaphoreHandle_t sem, TickType_t timeout)
 
 int xSemaphoreGive(SemaphoreHandle_t sem)
 {
-    if (sem->mutex) { pthread_mutex_unlock(&sem->lock); return pdTRUE; }
+    if (sem->mutex) { assert(held_mutexes); held_mutexes--; pthread_mutex_unlock(&sem->lock); return pdTRUE; }
     pthread_mutex_lock(&sem->lock);
     bool room = sem->count < sem->capacity;
     if (room) sem->count++;
@@ -180,6 +183,14 @@ void vTaskDelete(TaskHandle_t handle)
     current_task = NULL;
     atomic_fetch_sub(&task_count, 1);
     pthread_exit(NULL);
+}
+
+void vTaskDelay(TickType_t ticks)
+{
+    // A fairness pause must actually block, outside both driver mutexes.
+    assert(current_task && !isr_context && !held_mutexes && ticks > 0);
+    platform_pause_ms(ticks);
+    atomic_fetch_add(&worker_delays, 1);
 }
 
 void xTaskNotifyGive(TaskHandle_t handle) { assert(!isr_context); xSemaphoreGive(handle->notifications); }
@@ -291,7 +302,7 @@ int gpio_get_level(gpio_num_t gpio)
     pthread_mutex_lock(&hardware_lock);
     bool active = chip.tef_count || chip.rx_count || (chip.memory[0x060] & 16);
     pthread_mutex_unlock(&hardware_lock);
-    return !active;
+    return !(active || atomic_load(&force_int_low));
 }
 
 void platform_check_clean(void)
@@ -310,6 +321,8 @@ void platform_reset(void)
     fail_install = interrupt_enabled = false;
     cs_held = false;
     spi_acquire_attempts = spi_fail_acquire = 0;
+    atomic_store(&worker_delays, 0);
+    atomic_store(&force_int_low, false);
 }
 bool platform_is_low_power(void)
 {
@@ -353,3 +366,5 @@ void platform_disconnect(void) { pthread_mutex_lock(&hardware_lock); chip.discon
 void platform_fail_isr_install(void) { fail_install = true; }
 void platform_fail_spi_acquire(unsigned attempt) { spi_fail_acquire = attempt; }
 bool platform_spi_acquired(void) { return atomic_load(&spi_reservations) != 0; }
+void platform_force_int_low(bool low) { atomic_store(&force_int_low, low); }
+unsigned platform_worker_delays(void) { return atomic_load(&worker_delays); }

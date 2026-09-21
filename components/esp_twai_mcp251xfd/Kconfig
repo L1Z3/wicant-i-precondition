@@ -1,0 +1,12 @@
+menu "MCP2518FD driver"
+
+    config MCP251XFD_PERF_DIAGNOSTICS
+        bool "Enable CAN throughput diagnostics"
+        default n
+        help
+            Log MCP service windows and delayed consumption of WiCAN's shared
+            RX queue. Includes per-frame counters and queue timestamps.
+            Leave disabled for normal use to compile out this instrumentation.
+            Queue-drop and controller-fault warnings remain available.
+
+endmenu

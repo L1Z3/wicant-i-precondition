@@ -107,6 +107,9 @@ static void test_worker_and_ownership(void)
     invalid = frames[0];
     invalid.buffer = NULL;
     assert(node->transmit(node, &invalid, 0) == ESP_ERR_INVALID_ARG);
+    invalid = frames[0];
+    invalid.header.id = 0x800;
+    assert(node->transmit(node, &invalid, 0) == ESP_ERR_INVALID_ARG);
     for (unsigned i = 0; i < 32; i++) assert(node->transmit(node, &frames[i], 0) == ESP_OK);
     assert(node->transmit(node, &frames[32], 0) == ESP_ERR_TIMEOUT);
     assert(node->transmit_wait_done(node, 0) == ESP_ERR_TIMEOUT);
@@ -144,6 +147,87 @@ static void *transmit_thread(void *arg)
     op->result = op->node->transmit(op->node, &frames[32], -1);
     atomic_store(&op->returned, true);
     return NULL;
+}
+
+static void *submit_burst_thread(void *arg)
+{
+    operation_t *op = arg;
+    atomic_store(&op->started, true);
+    op->result = ESP_OK;
+    for (unsigned i = 1; i < 33 && op->result == ESP_OK; i++) {
+        op->result = op->node->transmit(op->node, &frames[i], 0);
+    }
+    atomic_store(&op->returned, true);
+    return NULL;
+}
+
+static void test_submission_during_worker_callback(unsigned stop)
+{
+    twai_node_handle_t node = create_node();
+    assert(node->transmit(node, &frames[0], 0) == ESP_OK);
+    wait_pending(1);
+    atomic_store(&pause_callback, true);
+    platform_finish_tx(1);
+    for (unsigned i = 0; i < 1000 && !atomic_load(&callback_entered); i++) platform_pause_ms(1);
+    assert(atomic_load(&callback_entered));
+
+    // The worker holds its core/SPI lock in this callback. A zero-timeout
+    // sender must still be able to submit up to the total outstanding limit.
+    operation_t op = {.node = node};
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, submit_burst_thread, &op) == 0);
+    for (unsigned i = 0; i < 1000 && !atomic_load(&op.returned); i++) platform_pause_ms(1);
+    bool returned_while_worker_paused = atomic_load(&op.returned);
+    // Release the simulated stall before reporting a regression failure.
+    if (!returned_while_worker_paused) atomic_store(&pause_callback, false);
+    pthread_join(thread, NULL);
+    assert(returned_while_worker_paused && op.result == ESP_OK);
+    assert(node->transmit_wait_done(node, 0) == ESP_ERR_TIMEOUT);
+    assert(node->transmit(node, &frames[0], 0) == ESP_ERR_TIMEOUT);
+
+    operation_t disable = {.node = node};
+    if (stop == 1) {
+        assert(pthread_create(&thread, NULL, disable_thread, &disable) == 0);
+        while (!atomic_load(&disable.started)) platform_pause_ms(1);
+        platform_pause_ms(20);
+        assert(!atomic_load(&disable.returned));
+    } else if (stop == 2) {
+        platform_disconnect();
+    }
+    atomic_store(&pause_callback, false);
+    if (stop) {
+        if (stop == 1) {
+            pthread_join(thread, NULL);
+            assert(disable.result == ESP_OK);
+        }
+        wait_completions(33);
+        assert(completed[0] == &frames[0] && successful[0]);
+        for (unsigned i = 1; i < 33; i++) assert(completed[i] == &frames[i] && !successful[i]);
+        assert(node->transmit(node, &frames[0], 0) == ESP_ERR_INVALID_STATE);
+        assert(node->transmit_wait_done(node, 0) == ESP_ERR_INVALID_STATE);
+        if (stop == 2) {
+            for (unsigned i = 0; i < 1000 && !atomic_load(&bus_off_count); i++) platform_pause_ms(1);
+            assert(atomic_load(&bus_off_count) == 1);
+            assert(node->disable(node) != ESP_OK);
+        }
+        assert(node->del(node) == ESP_OK);
+        platform_check_clean();
+        return;
+    }
+
+    wait_completions(1);
+    assert(node->transmit_wait_done(node, 0) == ESP_ERR_TIMEOUT);
+    assert(node->transmit(node, &frames[0], 0) == ESP_ERR_TIMEOUT);
+    for (unsigned batch = 0; batch < 4; batch++) {
+        wait_pending(8);
+        platform_finish_tx(8);
+        wait_completions(1 + (batch + 1) * 8);
+    }
+    for (unsigned i = 0; i < 33; i++) assert(completed[i] == &frames[i] && successful[i]);
+    assert(node->transmit_wait_done(node, 0) == ESP_OK);
+    assert(node->disable(node) == ESP_OK);
+    assert(node->del(node) == ESP_OK);
+    platform_check_clean();
 }
 
 static void test_disable_waits_for_callback(void)
@@ -266,14 +350,47 @@ static void test_spi_reservation(void)
     platform_check_clean();
 }
 
+static void test_continuously_asserted_interrupt(void)
+{
+    twai_node_handle_t node = create_node();
+    // Keep work immediately available even after the hardware FIFOs drain.
+    // Notifications alone must not let the worker avoid every blocking wait.
+    platform_force_int_low(true);
+    for (unsigned i = 0; i < 1000 && platform_worker_delays() < 2; i++) platform_pause_ms(1);
+    assert(platform_worker_delays() >= 2);
+
+    // Repeated fairness pauses must preserve pending work and normal APIs.
+    unsigned delays = platform_worker_delays();
+    assert(node->transmit(node, &frames[0], 0) == ESP_OK);
+    wait_pending(1);
+    platform_finish_tx(1);
+    platform_receive(0x1234567, false);
+    wait_completions(1);
+    assert(completed[0] == &frames[0] && successful[0]);
+    for (unsigned i = 0; i < 1000 && !atomic_load(&receive_count); i++) platform_pause_ms(1);
+    assert(atomic_load(&receive_count) == 1);
+    assert(node->transmit_wait_done(node, 100) == ESP_OK);
+    twai_node_status_t status;
+    assert(node->get_info(node, &status, NULL) == ESP_OK);
+    assert(status.tx_queue_remaining == 32);
+    for (unsigned i = 0; i < 1000 && platform_worker_delays() == delays; i++) platform_pause_ms(1);
+    assert(platform_worker_delays() > delays);
+    // Leave INT asserted through shutdown to exercise cooperative deletion.
+    assert(node->disable(node) == ESP_OK);
+    assert(node->del(node) == ESP_OK);
+    platform_check_clean();
+}
+
 int main(void)
 {
     test_worker_and_ownership();
+    for (unsigned stop = 0; stop < 3; stop++) test_submission_during_worker_callback(stop);
     test_disable_waits_for_callback();
     test_disable_wakes_full_queue_sender();
     test_fault_and_failed_creation();
     test_low_power_recreation();
     test_spi_reservation();
+    test_continuously_asserted_interrupt();
     for (unsigned i = 0; i < 16; i++) {
         twai_node_handle_t node = create_node();
         assert(node->disable(node) == ESP_OK);

@@ -43,6 +43,12 @@ validates its inputs; upstream's optional `CHECK_NULL_PARAM` is not enabled.
 
 - The GPIO ISR only notifies a worker. SPI transfers, event callbacks, and
   complete multi-transfer controller operations run under one task mutex.
+- Transmit callers put copied frames and original completion tokens into a
+  submission ring under a separate short mutex, without waiting for the SPI
+  service mutex. The worker admits those frames into the portable core. One
+  credit limit covers the submission ring, core queue, and hardware together;
+  idle status and cancellation include all accepted frames. A disable/enable
+  generation check rejects senders that waited across that transition.
 - Startup uses 1 MHz SPI for reset/configuration, then the board's 10 MHz
   setting. SYSCLK is the supplied oscillator frequency with no PLL/divider.
   Configuration rejects SPI speeds above `0.85 * SYSCLK / 2`.
@@ -66,10 +72,32 @@ validates its inputs; upstream's optional `CHECK_NULL_PARAM` is not enabled.
   TEF sequence numbers identify successful completions. Credits are released
   only after consuming TEF, so the number of outstanding events cannot exceed
   TEF capacity. Queue capacity includes hardware and software frames.
+- On EB-FD, WiCAN's shared RX/forward task runs unpinned at priority 21, above
+  the MCP worker (20) and the pinned IDF version's WPA3 AP authentication task
+  (19). It can run on either CPU as work becomes available. TX submission uses
+  the separate short mutex, so forwarding need not wait for a SPI service pass.
+  When draining a persistent backlog, it checks elapsed time between complete
+  frames and blocks for one tick after 8 ms. It holds neither the state-machine
+  nor TX locks during that pause. This budget includes time spent blocked or
+  preempted, and does not bound individual frame handling. Proto/v300 retain
+  unpinned priority 7 without this extra pause.
+- The SPI worker runs on core 1 at priority 20 on dual-core targets. The worker
+  checks elapsed busy time between service passes and blocks for one tick
+  after 8 ms without reaching its notification wait. Both mutexes are released
+  before that pause, and pending notifications are preserved. One tick is
+  1 ms in the current firmware. This gives lower-priority work an opportunity
+  to run under continuous notifications; it does not bound an individual SPI
+  transfer or callback. The watchdog remains enabled. The initial 8 ms budget
+  needs throughput validation on hardware.
 - The service loop uses interrupt flags to skip inactive RX/TEF FIFOs. It
   combines adjacent FIFO status/address reads and error-counter/diagnostic
   reads into bursts, while retaining the per-pass bus-off checks. It refills
   TX before draining an RX burst so reception cannot delay restarting TX.
+  The first TX refill reuses the status/address snapshot from that pass's
+  error checks; subsequent UINC operations and one-shot resets require fresh
+  snapshots. After all loaded frames complete, TEF draining stops without an
+  extra empty check. Any unexpected remaining event asserts INT for the next
+  pass, where ownership and sequence validation still apply.
   Events arriving after the interrupt snapshot leave INT asserted and are
   serviced on the next pass.
 - One-shot mode permits one hardware frame at a time. Exhausted attempts
@@ -103,6 +131,39 @@ are accumulated until the next enable, so recovery does not hide an earlier
 ACK or bit error. Validity flags distinguish failed reads from zero values.
 These diagnostics do not measure the physical oscillator frequency.
 
+Throughput instrumentation is **compiled out by default**. To restore it,
+enable `CONFIG_MCP251XFD_PERF_DIAGNOSTICS` under `MCP2518FD driver` in
+`menuconfig`. This includes both the driver's service statistics and WiCAN's
+software RX queue timestamps; disabling it also removes their counters,
+timestamp calls and 2 KiB of extra queue storage. The scheduling budgets and
+ordinary queue-drop/controller-fault warnings remain active.
+
+With diagnostics enabled, a WARN-level `service window` line appears at most
+once per second when busy intervals reach the budget or long gaps/passes
+occur. It accumulates worst times over the whole reporting window instead of
+sampling one busy slice:
+
+- `TX` counts successful TEF completions; `RX` counts frames handed to the
+  application callback, which may subsequently reject them if its queue is full.
+- `passes` and `pauses` count service passes and scheduled one-tick pauses.
+- `max gap/pass/busy` gives microseconds between service starts, within a
+  service pass, and within a busy interval. Gap includes normal idle polling
+  (up to approximately 10 ms), scheduling, mutex waits and diagnostic logging;
+  pass/busy times also include preemption. These are not pure SPI timings.
+- `INT` is the final pass's `CiINT` snapshot. `0010` is TEF activity; `0012`
+  adds RX activity. These flags alone do not indicate a controller error.
+- `HW RX overruns` counts cumulative observed FIFO overflow flags, not exact
+  lost frames. It is separate from `can_receive: rx queue full` counters.
+
+With that option enabled, EB-FD also timestamps entries in the shared
+application RX queue. An `RX scheduling` warning reports the window's worst
+queue residence time and gap between dequeues when residence exceeds 20 ms,
+at most once per second.
+The reported gap can include idle time, processing, scheduling, mutex/TX-slot
+waits and logging; queue age indicates an actual waiting frame. `queued` is a
+current queue-depth snapshot, not its high-water mark. The timestamp adds
+eight bytes per queue entry (2 KiB for 256 entries); frame capacity is unchanged.
+
 Deletion requires a disabled node and must be serialized against application
 API calls. It disables the interrupt source, waits for in-flight GPIO ISRs on
 both cores, unregisters the handler, and asks the worker to exit. The worker is
@@ -126,9 +187,10 @@ re-enabling the same node; LPM is requested only when disposing of that node.
 
 ## Validation
 
-The host SPI model counts 3 transactions for an idle service pass, 6 for one
-TX submission, and 14 for one TX submission plus RX and completion. The same
-workloads before the first throughput pass used 6, 10, and 18 respectively.
+The host SPI model counts 3 transactions for an idle service pass, 5 for one
+TX submission, and 12 for one TX submission plus RX and completion. The same
+workloads after the first throughput pass used 3, 6 and 14, and before it used
+6, 10 and 18 respectively. TX completion plus refill uses 8, previously 10.
 These counts are regression checks, not measured board throughput; they also
 exclude the CPU savings from avoiding DMA and repeated SPI bus arbitration.
 
@@ -143,3 +205,8 @@ These tests do not verify physical SPI timing, transceiver wiring, electrical
 CAN behavior, ESP32 scheduling latency, or silicon errata. Follow the
 [bench checklist](../../test/mcp251xfd/README.md) before relying on the
 prototype on a vehicle network.
+
+The latest hardware retest reports no drops while joining Wi-Fi or using the
+HTTP interface, with a small remaining burst when connecting SavvyCAN (76
+bus-1 TX-pool drops in the supplied log). See the
+[findings](../../test/mcp251xfd/bringup-findings.md) for test history and limits.

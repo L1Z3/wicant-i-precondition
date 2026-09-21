@@ -17,6 +17,12 @@
 
 #define TAG "mcp251xfd"
 #define IDLE_BIT BIT0
+#define WORKER_BUSY_SLICE_US 8000
+
+typedef struct {
+    mcp251xfd_frame_t frame;
+    const void *token;
+} tx_submission_t;
 
 typedef struct {
     struct twai_node_base base;
@@ -27,6 +33,7 @@ typedef struct {
     gpio_num_t cs_gpio;
     gpio_num_t int_gpio;
     SemaphoreHandle_t lock;
+    SemaphoreHandle_t tx_lock;
     SemaphoreHandle_t tx_space;
     SemaphoreHandle_t worker_exited;
     EventGroupHandle_t events;
@@ -36,6 +43,16 @@ typedef struct {
     uint32_t timestamp_resolution_hz;
     twai_frame_t rx_cache;
     uint8_t rx_data[8];
+    tx_submission_t submissions[MCP251XFD_TX_CAPACITY];
+    unsigned submission_head;
+    unsigned submission_count;
+    unsigned outstanding;
+    uint32_t tx_generation;
+#if CONFIG_MCP251XFD_PERF_DIAGNOSTICS
+    uint32_t tx_successes;
+    uint32_t rx_deliveries;
+#endif
+    bool accepting_tx;
     bool rx_pending;
     bool in_rx_callback;
     bool isr_installed;
@@ -119,14 +136,69 @@ static uint32_t current_ms(void)
     return (uint32_t)(esp_timer_get_time() / 1000);
 }
 
+// Lock order is core lock, then TX lock. The submission path only takes the
+// TX lock; no SPI or user callback may run while that short lock is held.
+static void close_tx(mcp251xfd_node_t *ctx)
+{
+    xSemaphoreTake(ctx->tx_lock, portMAX_DELAY);
+    if (ctx->accepting_tx) {
+        ctx->accepting_tx = false;
+        ctx->tx_generation++;
+    }
+    xSemaphoreGive(ctx->tx_lock);
+}
+
 static void tx_done(void *arg, const void *token, bool success)
 {
     mcp251xfd_node_t *ctx = arg;
+#if CONFIG_MCP251XFD_PERF_DIAGNOSTICS
+    if (success) ctx->tx_successes++;
+#endif
+    // A core fault cancels frames before publishing BUS_OFF. Close admission
+    // before returning any credits to blocked senders in that case.
+    if (!ctx->core.running) close_tx(ctx);
+    xSemaphoreTake(ctx->tx_lock, portMAX_DELAY);
+    ctx->outstanding--;
     xSemaphoreGive(ctx->tx_space);
-    if (!ctx->core.count) xEventGroupSetBits(ctx->events, IDLE_BIT);
+    if (!ctx->outstanding) xEventGroupSetBits(ctx->events, IDLE_BIT);
+    xSemaphoreGive(ctx->tx_lock);
     if (ctx->callbacks.on_tx_done) {
         twai_tx_done_event_data_t event = {.done_tx_frame = token, .is_tx_success = success};
         ctx->callbacks.on_tx_done(&ctx->base, &event, ctx->user_data);
+    }
+}
+
+static bool pop_submission(mcp251xfd_node_t *ctx, tx_submission_t *submission)
+{
+    xSemaphoreTake(ctx->tx_lock, portMAX_DELAY);
+    bool pending = ctx->submission_count != 0;
+    if (pending) {
+        *submission = ctx->submissions[ctx->submission_head];
+        ctx->submission_head = (ctx->submission_head + 1) % MCP251XFD_TX_CAPACITY;
+        ctx->submission_count--;
+    }
+    xSemaphoreGive(ctx->tx_lock);
+    return pending;
+}
+
+static void cancel_submissions(mcp251xfd_node_t *ctx)
+{
+    // Admission is already closed and the caller owns the core lock.
+    tx_submission_t submission;
+    while (pop_submission(ctx, &submission)) tx_done(ctx, submission.token, false);
+}
+
+static void admit_submissions(mcp251xfd_node_t *ctx)
+{
+    tx_submission_t submission;
+    for (unsigned i = 0; i < MCP251XFD_TX_CAPACITY && pop_submission(ctx, &submission); i++) {
+        eERRORRESULT error = mcp251xfd_core_enqueue(&ctx->core, &submission.frame, submission.token);
+        // Inputs were validated before acceptance, and the shared credit limit
+        // reserves space across both queues. Still return ownership on error.
+        if (error != ERR_NONE) {
+            ESP_LOGE(TAG, "TX admission failed: %d", (int)error);
+            tx_done(ctx, submission.token, false);
+        }
     }
 }
 
@@ -134,6 +206,9 @@ static void rx_done(void *arg, const mcp251xfd_frame_t *frame)
 {
     mcp251xfd_node_t *ctx = arg;
     if (!ctx->callbacks.on_rx_done) return;
+#if CONFIG_MCP251XFD_PERF_DIAGNOSTICS
+    ctx->rx_deliveries++;
+#endif
     uint32_t resolution = ctx->timestamp_resolution_hz;
     uint64_t us = resolution ? esp_timer_get_time() : 0;
     ctx->rx_cache = (twai_frame_t){
@@ -161,7 +236,11 @@ static twai_error_state_t twai_state(mcp251xfd_state_t state)
 static void state_changed(void *arg, mcp251xfd_state_t old, mcp251xfd_state_t state)
 {
     mcp251xfd_node_t *ctx = arg;
-    if (state == MCP251XFD_STATE_BUS_OFF) gpio_intr_disable(ctx->int_gpio);
+    if (state == MCP251XFD_STATE_BUS_OFF) {
+        gpio_intr_disable(ctx->int_gpio);
+        close_tx(ctx);
+        cancel_submissions(ctx);
+    }
     if (ctx->callbacks.on_state_change) {
         twai_state_change_event_data_t event = {.old_sta = twai_state(old), .new_sta = twai_state(state)};
         ctx->callbacks.on_state_change(&ctx->base, &event, ctx->user_data);
@@ -206,9 +285,24 @@ static void log_fault(mcp251xfd_node_t *ctx, eERRORRESULT error)
 static void worker_task(void *arg)
 {
     mcp251xfd_node_t *ctx = arg;
+    int64_t busy_since = esp_timer_get_time();
+#if CONFIG_MCP251XFD_PERF_DIAGNOSTICS
+    int64_t window_start = busy_since;
+    int64_t last_pass_start = 0;
+    uint32_t previous_tx = 0, previous_rx = 0;
+    struct {
+        uint32_t passes, pauses, max_gap_us, max_pass_us, max_busy_us;
+    } window = {0};
+#endif
     for (;;) {
-        // Polling also covers an already-low INT line or a missed falling edge.
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
+        // An available notification does not block. Under sustained RX/TX (or
+        // an asserted INT) this high-priority task can otherwise run forever.
+        // Start a fresh busy interval only after reaching a wait for new work.
+        if (!ulTaskNotifyTake(pdTRUE, 0)) {
+            // Polling also covers an already-low INT or a missed falling edge.
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
+            busy_since = esp_timer_get_time();
+        }
         xSemaphoreTake(ctx->lock, portMAX_DELAY);
         if (ctx->stopping) {
             SemaphoreHandle_t exited = ctx->worker_exited;
@@ -218,12 +312,60 @@ static void worker_task(void *arg)
             vTaskDelete(NULL);
             return;
         }
+#if CONFIG_MCP251XFD_PERF_DIAGNOSTICS
+        int64_t pass_start = esp_timer_get_time();
+        // Preserve the worst interval across the whole reporting window. This
+        // includes scheduler/mutex delays and the normal 10 ms idle poll wait.
+        uint32_t gap_us = last_pass_start ? pass_start - last_pass_start : 0;
+        if (gap_us > window.max_gap_us) window.max_gap_us = gap_us;
+        last_pass_start = pass_start;
+#endif
         if (ctx->enabled) {
+            if (ctx->core.running) admit_submissions(ctx);
             eERRORRESULT error = mcp251xfd_core_service(&ctx->core);
             if (error != ERR_NONE) log_fault(ctx, error);
             if (ctx->core.running && gpio_get_level(ctx->int_gpio) == 0) xTaskNotifyGive(ctx->worker);
         }
+#if CONFIG_MCP251XFD_PERF_DIAGNOSTICS
+        uint16_t interrupts = ctx->core.diagnostics.interrupts;
+        uint32_t rx_overruns = ctx->core.rx_overruns;
+        uint32_t tx_successes = ctx->tx_successes;
+        uint32_t rx_deliveries = ctx->rx_deliveries;
+#endif
         xSemaphoreGive(ctx->lock);
+        int64_t now = esp_timer_get_time();
+        bool pause = now - busy_since >= WORKER_BUSY_SLICE_US;
+#if CONFIG_MCP251XFD_PERF_DIAGNOSTICS
+        uint32_t pass_us = now - pass_start;
+        uint32_t busy_us = now - busy_since;
+        if (pass_us > window.max_pass_us) window.max_pass_us = pass_us;
+        if (busy_us > window.max_busy_us) window.max_busy_us = busy_us;
+        window.passes++;
+        if (pause) window.pauses++;
+        if (now - window_start >= 1000000) {
+            // Log window maxima instead of sampling one arbitrary busy slice:
+            // a short Wi-Fi stall must not disappear behind rate limiting.
+            if (window.pauses || window.max_gap_us > 20000 || window.max_pass_us >= WORKER_BUSY_SLICE_US) {
+                ESP_LOGW(TAG, "service window: %" PRIi64 " ms TX=%" PRIu32 " RX=%" PRIu32
+                         " passes=%" PRIu32 " pauses=%" PRIu32 " max gap/pass/busy=%" PRIu32
+                         "/%" PRIu32 "/%" PRIu32 " us INT=%04x HW RX overruns=%" PRIu32,
+                         (now - window_start) / 1000, tx_successes - previous_tx, rx_deliveries - previous_rx,
+                         window.passes, window.pauses, window.max_gap_us, window.max_pass_us,
+                         window.max_busy_us, interrupts, rx_overruns);
+            }
+            window_start = now;
+            previous_tx = tx_successes;
+            previous_rx = rx_deliveries;
+            memset(&window, 0, sizeof(window));
+        }
+#endif
+        if (pause) {
+            // Release BOTH mutexes before blocking. taskYIELD() alone cannot
+            // admit lower-priority tasks. Notifications remain pending, and
+            // the hardware FIFOs continue transmitting/buffering meanwhile.
+            vTaskDelay(1);
+            busy_since = esp_timer_get_time();
+        }
     }
 }
 
@@ -254,6 +396,9 @@ static esp_err_t node_enable(twai_node_handle_t node)
         error = gpio_intr_enable(ctx->int_gpio);
         if (error == ESP_OK) {
             ctx->enabled = true;
+            xSemaphoreTake(ctx->tx_lock, portMAX_DELAY);
+            ctx->accepting_tx = true;
+            xSemaphoreGive(ctx->tx_lock);
             xTaskNotifyGive(ctx->worker);
         } else {
             mcp251xfd_core_disable(&ctx->core);
@@ -267,9 +412,11 @@ static esp_err_t node_disable(twai_node_handle_t node)
 {
     mcp251xfd_node_t *ctx = node_context(node);
     xSemaphoreTake(ctx->lock, portMAX_DELAY);
+    close_tx(ctx);
     gpio_intr_disable(ctx->int_gpio);
     ctx->enabled = false;
     esp_err_t error = to_esp_error(mcp251xfd_core_disable(&ctx->core));
+    cancel_submissions(ctx);
     xEventGroupSetBits(ctx->events, IDLE_BIT);
     xSemaphoreGive(ctx->lock);
     return error;
@@ -321,6 +468,7 @@ static void destroy_context(mcp251xfd_node_t *ctx)
     if (ctx->events) vEventGroupDelete(ctx->events);
     if (ctx->worker_exited) vSemaphoreDelete(ctx->worker_exited);
     if (ctx->tx_space) vSemaphoreDelete(ctx->tx_space);
+    if (ctx->tx_lock) vSemaphoreDelete(ctx->tx_lock);
     if (ctx->lock) vSemaphoreDelete(ctx->lock);
     free(ctx);
 }
@@ -382,15 +530,17 @@ static esp_err_t transmit(twai_node_handle_t node, const twai_frame_t *frame, in
 {
     if (xPortInIsrContext()) return ESP_ERR_NOT_SUPPORTED;
     if (timeout < -1 || frame->header.dlc > 8 || frame->buffer_len > 8 ||
+        frame->header.id > (frame->header.ide ? 0x1fffffffu : 0x7ffu) ||
         (!frame->header.rtr && frame->buffer_len < frame->header.dlc) ||
         (frame->buffer_len && !frame->buffer)) return ESP_ERR_INVALID_ARG;
     if (frame->header.fdf || frame->header.brs || frame->header.esi || frame->header.trigger_time) return ESP_ERR_NOT_SUPPORTED;
     mcp251xfd_node_t *ctx = node_context(node);
     // Fail fast while disabled/listening, even when the caller requested a wait.
-    xSemaphoreTake(ctx->lock, portMAX_DELAY);
-    bool running = ctx->core.running;
+    xSemaphoreTake(ctx->tx_lock, portMAX_DELAY);
+    bool running = ctx->accepting_tx;
+    uint32_t generation = ctx->tx_generation;
     bool listening = ctx->core.config.listen_only;
-    xSemaphoreGive(ctx->lock);
+    xSemaphoreGive(ctx->tx_lock);
     if (!running) return ESP_ERR_INVALID_STATE;
     if (listening) return ESP_ERR_NOT_SUPPORTED;
     TickType_t ticks = timeout == -1 ? portMAX_DELAY : pdMS_TO_TICKS(timeout);
@@ -398,15 +548,20 @@ static esp_err_t transmit(twai_node_handle_t node, const twai_frame_t *frame, in
     mcp251xfd_frame_t message = {.id = frame->header.id, .dlc = frame->header.dlc,
                                .extended = frame->header.ide, .rtr = frame->header.rtr};
     if (!message.rtr && message.dlc) memcpy(message.data, frame->buffer, message.dlc);
-    xSemaphoreTake(ctx->lock, portMAX_DELAY);
-    esp_err_t error = to_esp_error(mcp251xfd_core_enqueue(&ctx->core, &message, frame));
-    if (error == ESP_OK) {
-        xEventGroupClearBits(ctx->events, IDLE_BIT);
+    xSemaphoreTake(ctx->tx_lock, portMAX_DELAY);
+    esp_err_t error = ESP_ERR_INVALID_STATE;
+    if (ctx->accepting_tx && generation == ctx->tx_generation) {
+        unsigned tail = (ctx->submission_head + ctx->submission_count) % MCP251XFD_TX_CAPACITY;
+        ctx->submissions[tail] = (tx_submission_t){.frame = message, .token = frame};
+        ctx->submission_count++;
+        if (!ctx->outstanding) xEventGroupClearBits(ctx->events, IDLE_BIT);
+        ctx->outstanding++;
         xTaskNotifyGive(ctx->worker);
+        error = ESP_OK;
     } else {
         xSemaphoreGive(ctx->tx_space);
     }
-    xSemaphoreGive(ctx->lock);
+    xSemaphoreGive(ctx->tx_lock);
     return error;
 }
 
@@ -416,9 +571,10 @@ static esp_err_t wait_tx_done(twai_node_handle_t node, int timeout)
     mcp251xfd_node_t *ctx = node_context(node);
     TickType_t ticks = timeout == -1 ? portMAX_DELAY : pdMS_TO_TICKS(timeout);
     EventBits_t bits = xEventGroupWaitBits(ctx->events, IDLE_BIT, pdFALSE, pdTRUE, ticks);
-    xSemaphoreTake(ctx->lock, portMAX_DELAY);
-    esp_err_t error = !ctx->core.running ? ESP_ERR_INVALID_STATE : (bits & IDLE_BIT) ? ESP_OK : ESP_ERR_TIMEOUT;
-    xSemaphoreGive(ctx->lock);
+    xSemaphoreTake(ctx->tx_lock, portMAX_DELAY);
+    esp_err_t error = !ctx->accepting_tx ? ESP_ERR_INVALID_STATE :
+        ((bits & IDLE_BIT) && !ctx->outstanding) ? ESP_OK : ESP_ERR_TIMEOUT;
+    xSemaphoreGive(ctx->tx_lock);
     return error;
 }
 
@@ -442,9 +598,11 @@ static esp_err_t get_info(twai_node_handle_t node, twai_node_status_t *status, t
 {
     mcp251xfd_node_t *ctx = node_context(node);
     xSemaphoreTake(ctx->lock, portMAX_DELAY);
+    xSemaphoreTake(ctx->tx_lock, portMAX_DELAY);
     if (status) *status = (twai_node_status_t){.state = twai_state(ctx->core.state),
         .tx_error_count = ctx->core.tx_errors, .rx_error_count = ctx->core.rx_errors,
-        .tx_queue_remaining = ctx->core.config.tx_queue_depth - ctx->core.count};
+        .tx_queue_remaining = ctx->core.config.tx_queue_depth - ctx->outstanding};
+    xSemaphoreGive(ctx->tx_lock);
     if (record) *record = (twai_node_record_t){.bus_err_num = ctx->core.bus_errors};
     xSemaphoreGive(ctx->lock);
     return ESP_OK;
@@ -471,10 +629,11 @@ esp_err_t twai_new_node_mcp251xfd(spi_host_device_t bus, const twai_mcp251xfd_no
     ctx->timestamp_resolution_hz = config->timestamp_resolution_hz;
     ctx->exclusive_spi = config->flags.exclusive_spi;
     ctx->lock = xSemaphoreCreateMutex();
+    ctx->tx_lock = xSemaphoreCreateMutex();
     ctx->tx_space = xSemaphoreCreateCounting(config->tx_queue_depth, config->tx_queue_depth);
     ctx->worker_exited = xSemaphoreCreateBinary();
     ctx->events = xEventGroupCreate();
-    if (!ctx->lock || !ctx->tx_space || !ctx->worker_exited || !ctx->events) goto fail;
+    if (!ctx->lock || !ctx->tx_lock || !ctx->tx_space || !ctx->worker_exited || !ctx->events) goto fail;
     xEventGroupSetBits(ctx->events, IDLE_BIT);
     ctx->core.device = (MCP251XFD){.InterfaceDevice = ctx, .SPIClockSpeed = config->spi_clock_hz,
         .fnSPI_Init = spi_init, .fnSPI_Transfer = spi_transfer, .fnGetCurrentms = current_ms};

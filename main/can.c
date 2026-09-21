@@ -59,6 +59,9 @@ typedef struct {
 typedef struct {
 	twai_message_t msg;
 	can_bus_t bus;
+#if HW_HAS_MCP2518FD && CONFIG_MCP251XFD_PERF_DIAGNOSTICS
+	int64_t queued_at_us;
+#endif
 } can_rx_item_t;
 
 // Indexed by the CAN_5K..CAN_1000K rate codes in can.h
@@ -163,6 +166,11 @@ static bool can_on_rx_done(twai_node_handle_t handle, const twai_rx_done_event_d
 
 	// Queue full = frame dropped. SPI workers use task APIs; on-chip TWAI
 	// requests a context switch on ISR exit if the receive task was unblocked.
+#if HW_HAS_MCP2518FD && CONFIG_MCP251XFD_PERF_DIAGNOSTICS
+	// Bring-up diagnostic: measure time in the shared software queue, separately
+	// from controller servicing. esp_timer_get_time() is safe in ISR context.
+	item.queued_at_us = esp_timer_get_time();
+#endif
 	BaseType_t task_woken = pdFALSE;
 	BaseType_t sent = xPortInIsrContext() ? xQueueSendFromISR(can_rx_queue, &item, &task_woken) :
 										  xQueueSend(can_rx_queue, &item, 0);
@@ -808,6 +816,30 @@ esp_err_t can_receive(twai_message_t *message, can_bus_t *bus, TickType_t ticks_
 	{
 		return ESP_ERR_TIMEOUT;
 	}
+
+#if HW_HAS_MCP2518FD && CONFIG_MCP251XFD_PERF_DIAGNOSTICS
+	// Retain worst consumer delays across the reporting interval. Queue age
+	// distinguishes an undrained backlog from a harmless idle gap between RX.
+	static int64_t last_pop_us, last_report_us;
+	static uint32_t max_age_us, max_pop_gap_us;
+	int64_t now = esp_timer_get_time();
+	uint32_t age_us = now - item.queued_at_us;
+	uint32_t gap_us = last_pop_us ? now - last_pop_us : 0;
+	last_pop_us = now;
+	if (age_us > max_age_us) max_age_us = age_us;
+	if (gap_us > max_pop_gap_us) max_pop_gap_us = gap_us;
+	if (now - last_report_us >= 1000000)
+	{
+		if (max_age_us >= 20000)
+		{
+			ESP_LOGW(TAG, "RX scheduling: max queue age=%lu us, max pop gap=%lu us, queued=%u",
+					 (unsigned long)max_age_us, (unsigned long)max_pop_gap_us,
+					 (unsigned)uxQueueMessagesWaiting(can_rx_queue));
+		}
+		last_report_us = now;
+		max_age_us = max_pop_gap_us = 0;
+	}
+#endif
 
 	*message = item.msg;
 	if (bus != NULL)	// bus tag is optional

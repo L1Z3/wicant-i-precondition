@@ -350,18 +350,24 @@ static eERRORRESULT drain_tef(mcp251xfd_core_t *core)
             return ERR__SPI_INVALID_DATA;
         }
         complete_head(core, true);
+        // Every loaded frame has now completed. Avoid reading an empty TEF
+        // again; an unexpected extra entry still asserts INT for the next pass,
+        // where it fails the ownership/sequence check above.
+        if (!core->loaded) break;
     }
     return ERR_NONE;
 }
 
-static eERRORRESULT fill_tx(mcp251xfd_core_t *core)
+static eERRORRESULT fill_tx(mcp251xfd_core_t *core, uint8_t status, uint16_t address)
 {
     unsigned max_loaded = core->config.one_shot ? 1 : MCP251XFD_HW_TX_DEPTH;
+    bool first = true;
     while (core->loaded < core->count && core->loaded < max_loaded) {
-        uint8_t status;
-        uint16_t address;
-        TRY(read_fifo_head(core, TX_FIFO, &status, &address));
-        // A one-shot attempt can fail between the service status read and here.
+        // Reuse the first STA/UA snapshot taken for the service error checks.
+        // Later UINC writes advance UA, so subsequent frames need a fresh read.
+        if (!first) TRY(read_fifo_head(core, TX_FIFO, &status, &address));
+        first = false;
+        // Do not add to a FIFO whose retry limit is already exhausted.
         if (status & MCP251XFD_TX_FIFO_ATTEMPTS_EXHAUSTED) break;
         if (!(status & MCP251XFD_TX_FIFO_NOT_FULL)) break;
         const mcp251xfd_pending_tx_t *tx = &core->tx[(core->head + core->loaded) % MCP251XFD_TX_CAPACITY];
@@ -418,8 +424,16 @@ static eERRORRESULT service(mcp251xfd_core_t *core)
     }
     change_state(core, (status & (MCP251XFD_TX_BUS_PASSIVE_STATE | MCP251XFD_RX_BUS_PASSIVE_STATE)) ? MCP251XFD_STATE_PASSIVE :
                        (status & (MCP251XFD_TX_WARNING_STATE | MCP251XFD_RX_WARNING_STATE)) ? MCP251XFD_STATE_WARNING : MCP251XFD_STATE_ACTIVE);
-    setMCP251XFD_FIFOstatus tx_status = 0;
-    TRY(MCP251XFD_GetFIFOStatus(&core->device, TX_FIFO, &tx_status));
+    uint8_t tx_status;
+    uint16_t tx_address = 0;
+    unsigned max_loaded = core->config.one_shot ? 1 : MCP251XFD_HW_TX_DEPTH;
+    if (core->loaded < core->count && core->loaded < max_loaded) {
+        // Read UA with status when a refill can use it. Status is still checked
+        // on every pass, including when the TX FIFO is full or software idle.
+        TRY(read_fifo_head(core, TX_FIFO, &tx_status, &tx_address));
+    } else {
+        TRY(MCP251XFD_ReadSFR8(&core->device, RegMCP251XFD_CiFIFOSTAm, &tx_status));
+    }
     if (events & (MCP251XFD_INT_BUS_ERROR_EVENT | MCP251XFD_INT_RX_INVALID_MESSAGE_EVENT | MCP251XFD_INT_TX_ATTEMPTS_EVENT)) {
         core->bus_errors++;
         if (core->callbacks.error) {
@@ -438,10 +452,13 @@ static eERRORRESULT service(mcp251xfd_core_t *core)
         }
         TRY(MCP251XFD_ResetFIFO(&core->device, TX_FIFO));
         complete_head(core, false);
+        // Reset changes UA. Never reuse the pre-reset address or status when
+        // replacing a failed one-shot frame.
+        if (core->count) TRY(read_fifo_head(core, TX_FIFO, &tx_status, &tx_address));
     }
     // Refill before draining RX so a receive burst cannot leave the TX FIFO
     // idle. The depth still bounds pending TEF events and preserves wire order.
-    TRY(fill_tx(core));
+    TRY(fill_tx(core, tx_status, tx_address));
     if (!(events & (MCP251XFD_INT_RX_EVENT | MCP251XFD_INT_RX_OVERFLOW_EVENT))) return ERR_NONE;
     for (unsigned i = 0; i < 32; i++) {
         uint8_t rx_status;

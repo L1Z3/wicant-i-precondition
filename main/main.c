@@ -60,6 +60,16 @@
 
 #define TAG 		__func__
 
+#if HW_HAS_MCP2518FD
+// Keep forwarding above the MCP worker (20) and WPA3 authentication (19),
+// with either CPU available. Continuous RX is bounded below so other tasks
+// can still run. TX submission must not hold the MCP SPI/service mutex.
+#define CAN_RX_TASK_PRIORITY 21
+#define CAN_RX_BUSY_SLICE_US 8000
+#else
+#define CAN_RX_TASK_PRIORITY 7
+#endif
+
 #define GPIO_OUTPUT_PIN_SEL  ((1ULL<<CONNECTED_LED_GPIO_NUM) | (1ULL<<ACTIVE_LED_GPIO_NUM) | (1ULL<<PWR_LED_GPIO_NUM))
 
 static QueueHandle_t xMsg_Tx_Queue, xMsg_Rx_Queue, xmsg_ws_tx_queue, xmsg_ble_tx_queue, xmsg_obd_rx_queue, xmsg_mqtt_rx_queue;
@@ -334,12 +344,14 @@ static void can_rx_task(void *pvParameters)
 
 		// Block up to 10 ms for the first frame (keeps LED housekeeping above
 		// running when idle), then drain the backlog without waiting. This
-		// blocking is what makes prio 7 safe: the task only outranks the TCP
-		// tasks while there is frame work to do.
+		// blocking lets lower-priority tasks run while CAN is idle.
         if (can_receive(&rx_msg, &rx_bus, pdMS_TO_TICKS(10)) != ESP_OK)
         {
             continue;
         }
+#if HW_HAS_MCP2518FD
+        int64_t burst_start_us = esp_timer_get_time();
+#endif
         do
         {
             // Only GVRET/SavvyCAN and the precondition code are bus-aware;
@@ -487,6 +499,17 @@ static void can_rx_task(void *pvParameters)
 					xQueueSend( xmsg_mqtt_rx_queue, ( void * ) &mqtt_rx_msg, pdMS_TO_TICKS(0) );
 				}
 			}
+#if HW_HAS_MCP2518FD
+            // A permanently nonempty queue must not keep this priority-21
+            // task ready forever. Block only between complete frames, after
+            // releasing the state-machine and TX locks. The MCP worker and
+            // lower-priority tasks can run during this one-tick pause.
+            if (esp_timer_get_time() - burst_start_us >= CAN_RX_BUSY_SLICE_US)
+            {
+                vTaskDelay(1);
+                burst_start_us = esp_timer_get_time();
+            }
+#endif
         } while (can_receive(&rx_msg, &rx_bus, 0) == ESP_OK);
 	}
 }
@@ -719,10 +742,11 @@ void app_main(void)
     }
 	wc_mdns_init((char*)uid, hardware_version, firmware_version);
 	precondition_task_start();
-    // Prio 7: the CAN datapath must preempt the TCP streaming tasks (prio 5)
-    // instead of timeslicing with them. Safe only because can_rx_task blocks
-    // in can_receive() when idle (see the receive loop).
-    xTaskCreate(can_rx_task, "can_rx_task", 1024*3, (void*)AF_INET, 7, NULL);
+    // Leave forwarding unpinned so it can run alongside SPI on the other CPU.
+    // EB-FD also outranks authentication; its receive loop bounds busy bursts.
+    // Proto/v300 retain priority 7, above TCP streaming tasks at priority 5.
+    ESP_ERROR_CHECK(xTaskCreate(can_rx_task, "can_rx_task", 1024*3, (void*)AF_INET,
+                               CAN_RX_TASK_PRIORITY, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
     xTaskCreate(can_tx_task, "can_tx_task", 1024*3, (void*)AF_INET, 5, NULL);
 
 	if(config_server_get_sleep_config())

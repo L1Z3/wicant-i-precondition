@@ -41,6 +41,7 @@ static inline void fake_log(const char *tag, const char *format, ...) __attribut
 static inline void fake_log(const char *tag, const char *format, ...) { (void)tag; (void)format; }
 #define ESP_LOGE(...) fake_log(__VA_ARGS__)
 #define ESP_LOGI(...) fake_log(__VA_ARGS__)
+#define ESP_LOGW(...) fake_log(__VA_ARGS__)
 #define portYIELD_FROM_ISR() ((void)0)
 static inline void *heap_caps_calloc(size_t n, size_t size, unsigned caps) { (void)caps; return calloc(n, size); }
 
@@ -95,6 +96,7 @@ void vEventGroupDelete(EventGroupHandle_t group);
 BaseType_t xTaskCreatePinnedToCore(void (*entry)(void *), const char *name, unsigned stack_size,
                                   void *arg, unsigned priority, TaskHandle_t *handle, int core);
 void vTaskDelete(TaskHandle_t handle);
+void vTaskDelay(TickType_t ticks);
 void xTaskNotifyGive(TaskHandle_t handle);
 void vTaskNotifyGiveFromISR(TaskHandle_t handle, BaseType_t *woken);
 unsigned ulTaskNotifyTake(int clear, TickType_t timeout);
@@ -129,3 +131,5 @@ void platform_enter_isr(bool is_isr);
 void platform_check_clean(void);
 void platform_pause_ms(unsigned ms);
 bool platform_is_low_power(void);
+void platform_force_int_low(bool low);
+unsigned platform_worker_delays(void);

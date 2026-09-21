@@ -1,7 +1,9 @@
 # MCP2518FD validation
 
 See [bring-up findings](bringup-findings.md) for hardware test results and the
-remaining AP connection regression after the first throughput optimization.
+remaining small TX-drop burst when SavvyCAN connects. The latest retest reports
+no drops during Wi-Fi association or HTTP use. The earlier AP connection
+failure was identified as a password mismatch.
 
 Run from the repository root:
 
@@ -25,6 +27,9 @@ Mixed TX/RX bursts verify TX is refilled while draining RX, FIFO wrap preserves
 payloads and completion ownership, and RX arriving after the interrupt snapshot
 is serviced on the next pass. SPI transaction budgets protect the reduction in
 per-frame overhead, and the model rejects transfers above the non-DMA limit.
+TX snapshot reuse is covered by FIFO wrap, repeated one-shot reset/refill and
+transfer-failure tests. An extra TEF event after the last valid completion must
+remain pending and fault on the next pass without returning a token twice.
 
 The adapter test compiles the actual ESP-IDF adapter against pthread-backed
 platform stubs. It checks worker/ISR separation, queue backpressure, original
@@ -35,6 +40,14 @@ devices are released. Deletion/recreation also checks LPM entry, no subsequent
 worker SPI access, and CS hold/release across device removal and creation.
 It also checks exclusive SPI reservation/release, cleanup after reservation
 failure at either clock speed, and the optional shared-bus configuration.
+Submission tests pause the worker inside its core lock while another thread
+queues frames. They check submission remains independent of SPI servicing,
+the unchanged total credit limit, idle accounting for staged work, and ordered
+completion or exactly-once cancellation after disable/fault.
+An asserted-INT test keeps the worker continuously notified after the hardware
+FIFOs drain. It checks repeated blocking pauses outside both mutexes, continued
+TX/RX and status access, and cooperative shutdown with INT still low. The
+previous worker fails this test. The stubs do not simulate ESP32 priorities.
 These are host tests, not measurements on real hardware.
 
 ## Bring-up diagnostics
@@ -50,6 +63,25 @@ In the service path, error 10 (`ERR__NOT_READY`) means the driver observed
 The log now includes TEC/REC and ACK, BIT0, BIT1, FORM, STUFF, and CRC flags,
 including flags from earlier polls. The captured mode matters: configuration
 mode itself sets TXBO, so registers must be captured before fault cleanup.
+
+Throughput instrumentation defaults off and is compiled out, including its
+counters and extra queue timestamps. Enable `CONFIG_MCP251XFD_PERF_DIAGNOSTICS`
+in `menuconfig` under `MCP2518FD driver` for future investigations. Worker and
+consumer pauses, ordinary queue-drop warnings and controller-fault diagnostics
+remain active with this option off.
+
+With that option enabled, capture `service window` lines around Wi-Fi activity
+alongside all software queue-drop counters. `max gap/pass/busy` retains each
+window's worst intervals in microseconds; it does not merely sample the first
+busy interval that satisfies the log rate limit. Gap includes idle polling and
+logging as well as scheduling/mutex waits. `TX` counts successful MCP TEF
+completions and `RX` counts callback deliveries before the shared queue accepts
+or drops them. `INT=0010` means TEF activity; `0012` adds RX. Neither is itself
+an error. `HW RX overruns` counts observed hardware overflow flags, not frames.
+The EB-FD consumer then also logs `RX scheduling` when the worst software queue age
+exceeds 20 ms in a reporting interval. Capture those lines to compare delayed
+queue consumption with the MCP worker's service gaps. The dequeue gap includes
+idle/processing/wait time; queue age measures how long an actual frame waited.
 
 The supplied EB-FD firmware identifies ESP32 GPIO 11 -> SN65HVD233/U2 RS and
 GPIO 12 -> TCAN3413/U4 STB, each with a 10 kOhm pull-up. Both must be low during

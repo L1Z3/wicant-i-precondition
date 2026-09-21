@@ -455,9 +455,36 @@ static void test_service_spi_cost(void)
     assert(mcp251xfd_core_service(&f.core) == ERR_NONE);
     unsigned mixed = f.chip.transfers - before;
     assert(f.completed_count == 1 && f.received_count == 1 && f.chip.tx_count == 1);
-    // Regression budgets from the same workload: previously 6 / 10 / 18.
-    assert(idle <= 3 && tx <= 6 && mixed <= 14);
-    printf("SPI transfers per service: idle=%u TX=%u TX+RX+completion=%u\n", idle, tx, mixed);
+    fake_transmit(&f.chip, true);
+    enqueue(&f, 2);
+    before = f.chip.transfers;
+    assert(mcp251xfd_core_service(&f.core) == ERR_NONE);
+    unsigned tx_complete_refill = f.chip.transfers - before;
+    assert(f.completed_count == 2 && f.chip.tx_count == 1);
+    // Same workloads before TX snapshot reuse: 3 / 6 / 14 / 10.
+    assert(idle <= 3 && tx <= 5 && mixed <= 12 && tx_complete_refill <= 8);
+    printf("SPI transfers per service: idle=%u TX=%u TX+RX+completion=%u TX+completion=%u\n",
+           idle, tx, mixed, tx_complete_refill);
+}
+
+static void test_unexpected_tef_after_last_completion(void)
+{
+    fixture_t f;
+    prepare(&f);
+    start(&f);
+    enqueue(&f, 0);
+    assert(mcp251xfd_core_service(&f.core) == ERR_NONE);
+    fake_transmit(&f.chip, true);
+    // Corrupt hardware state with an extra copy of the only valid completion.
+    memcpy(f.chip.memory + 0x408, f.chip.memory + 0x400, 8);
+    f.chip.tef_count++;
+    f.chip.tef_head++;
+    assert(mcp251xfd_core_service(&f.core) == ERR_NONE);
+    assert(f.completed_count == 1 && f.success[0] && !f.core.loaded);
+    assert(f.chip.tef_count == 1); // INT remains asserted for the next pass.
+    assert(mcp251xfd_core_service(&f.core) == ERR__SPI_INVALID_DATA);
+    assert(f.core.faulted && f.bus_off_count == 1);
+    assert(f.completed_count == 1); // Never return ownership twice.
 }
 
 static void test_mixed_bursts_and_late_interrupt(void)
@@ -509,6 +536,7 @@ int main(void)
     test_fault_diagnostics();
     test_low_power_recreation();
     test_service_spi_cost();
+    test_unexpected_tef_after_last_completion();
     test_mixed_bursts_and_late_interrupt();
     puts("MCP2518FD core: timing, SPI initialization, FIFO order, TEF ownership, one-shot, RX/RTR, filters, and lifecycle tests passed");
     return 0;
