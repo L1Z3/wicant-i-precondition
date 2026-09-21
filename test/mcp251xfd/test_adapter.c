@@ -58,7 +58,8 @@ static twai_mcp251xfd_node_config_t config(void)
 {
     return (twai_mcp251xfd_node_config_t){.io_cfg = {.int_gpio = 7, .cs_gpio = 18},
         .spi_clock_hz = 10000000, .oscillator_hz = 40000000,
-        .bit_timing = {.bitrate = 500000, .sp_permill = 875}, .fail_retry_cnt = -1, .tx_queue_depth = 32};
+        .bit_timing = {.bitrate = 500000, .sp_permill = 875}, .fail_retry_cnt = -1, .tx_queue_depth = 32,
+        .flags = {.exclusive_spi = true}};
 }
 
 static twai_node_handle_t create_node(void)
@@ -75,6 +76,7 @@ static twai_node_handle_t create_node(void)
     twai_mcp251xfd_node_config_t cfg = config();
     twai_node_handle_t node;
     assert(twai_new_node_mcp251xfd(1, &cfg, &node) == ESP_OK);
+    assert(platform_spi_acquired());
     twai_event_callbacks_t callbacks = {.on_tx_done = on_tx_done, .on_state_change = on_state_change, .on_rx_done = on_rx_done};
     assert(node->register_cbs(node, &callbacks, NULL) == ESP_OK);
     assert(node->enable(node) == ESP_OK);
@@ -240,6 +242,30 @@ static void test_low_power_recreation(void)
     assert(platform_is_low_power());
 }
 
+static void test_spi_reservation(void)
+{
+    // Both the initial safe-speed device and the final operating-speed device
+    // must unwind cleanly if reservation fails during creation.
+    for (unsigned attempt = 1; attempt <= 2; attempt++) {
+        platform_reset();
+        platform_fail_spi_acquire(attempt);
+        twai_mcp251xfd_node_config_t cfg = config();
+        twai_node_handle_t node = (void *)1;
+        assert(twai_new_node_mcp251xfd(1, &cfg, &node) != ESP_OK && node == NULL);
+        platform_check_clean();
+    }
+    platform_reset();
+    twai_mcp251xfd_node_config_t cfg = config();
+    cfg.flags.exclusive_spi = false;
+    twai_node_handle_t node;
+    assert(twai_new_node_mcp251xfd(1, &cfg, &node) == ESP_OK);
+    assert(!platform_spi_acquired());
+    assert(node->enable(node) == ESP_OK);
+    assert(node->disable(node) == ESP_OK);
+    assert(node->del(node) == ESP_OK);
+    platform_check_clean();
+}
+
 int main(void)
 {
     test_worker_and_ownership();
@@ -247,6 +273,7 @@ int main(void)
     test_disable_wakes_full_queue_sender();
     test_fault_and_failed_creation();
     test_low_power_recreation();
+    test_spi_reservation();
     for (unsigned i = 0; i < 16; i++) {
         twai_node_handle_t node = create_node();
         assert(node->disable(node) == ESP_OK);

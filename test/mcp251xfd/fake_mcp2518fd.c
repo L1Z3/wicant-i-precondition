@@ -56,7 +56,8 @@ static void refresh(fake_mcp2518fd_t *chip)
     chip->memory[TXSTA] = (chip->memory[TXSTA] & 0xf0) | (chip->tx_count < 8 ? 1 : 0) | (!chip->tx_count ? 4 : 0);
     chip->memory[RXSTA] = (chip->memory[RXSTA] & 8) | (chip->rx_count ? 1 : 0) | (chip->rx_count == 32 ? 4 : 0);
     chip->memory[TEFSTA] = (chip->memory[TEFSTA] & 8) | (chip->tef_count ? 1 : 0) | (chip->tef_count == 8 ? 4 : 0);
-    chip->memory[INT] = (chip->rx_count ? 2 : 0) | (chip->tef_count ? 16 : 0);
+    chip->memory[INT] = (chip->rx_count ? 2 : 0) |
+                       ((chip->tef_count || (chip->memory[TEFSTA] & 8)) ? 16 : 0);
     chip->memory[INT + 1] = (chip->memory[INT + 1] & ~((1u << 2) | (1u << 3))) |
                            ((chip->memory[TXSTA] & 16) ? 4 : 0) | ((chip->memory[RXSTA] & 8) ? 8 : 0);
     fake_write32(chip, TEFUA, TEF_RAM - 0x400 + chip->tef_tail * 8);
@@ -87,6 +88,7 @@ static eERRORRESULT transfer(void *arg, uint8_t select, uint8_t *tx, uint8_t *rx
     chip->transfers++;
     if (chip->disconnected || chip->transfers == chip->fail_on_transfer) return ERR__SPI_COMM_ERROR;
     assert(size >= 2);
+    assert(size <= 64); // ESP32 non-DMA SPI FIFO capacity.
     unsigned command = tx[0] >> 4;
     unsigned address = (tx[0] & 15) * 256 + tx[1];
     assert(address + size - 2 <= sizeof(chip->memory));
@@ -117,6 +119,11 @@ static eERRORRESULT transfer(void *arg, uint8_t select, uint8_t *tx, uint8_t *rx
         // The upstream driver uses the same TX/RX buffer.
         memset(rx, 0, 2);
         memcpy(rx + 2, chip->memory + address, size - 2);
+        if (address == INT && chip->rx_after_interrupt_read) {
+            chip->rx_after_interrupt_read = false;
+            mcp251xfd_frame_t frame = {.id = 0x321, .dlc = 1, .data = {0x5a}};
+            fake_receive(chip, &frame, false);
+        }
         return ERR_NONE;
     }
     assert(command == 2 && !rx);

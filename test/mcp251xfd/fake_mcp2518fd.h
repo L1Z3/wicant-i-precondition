@@ -19,6 +19,7 @@ typedef struct {
     bool pretend_mcp2517;
     bool low_power;
     unsigned wake_reads_remaining;
+    bool rx_after_interrupt_read;
     uint32_t wire_ids[256];
     unsigned wire_count;
 } fake_mcp2518fd_t;

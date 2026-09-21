@@ -46,6 +46,15 @@ validates its inputs; upstream's optional `CHECK_NULL_PARAM` is not enabled.
 - Startup uses 1 MHz SPI for reset/configuration, then the board's 10 MHz
   setting. SYSCLK is the supplied oscillator frequency with no PLL/divider.
   Configuration rejects SPI speeds above `0.85 * SYSCLK / 2`.
+- EB-FD uses polling SPI without DMA. Transfers are at most 18 bytes, fitting
+  the peripheral's CPU FIFO and avoiding DMA temporary-buffer allocation and
+  copying for short register accesses. Vendor transfers larger than this are
+  split into 16-byte data chunks.
+- WiCAN sets `exclusive_spi` because MCP2518FD is the only device on SPI2.
+  This reserves the bus for the node's lifetime, avoiding per-transfer bus
+  arbitration. The reservation is released before speed changes or deletion,
+  including failed creation. Other callers can leave this flag clear when
+  sharing a bus; the driver mutex still serializes access to this device.
 - Nominal timing supports WiCAN's 5 kbit/s–1 Mbit/s rates and configurable
   sample point. Bitrate must be exactly representable. The closest sample
   point is chosen, preferring finer time quanta on ties. At 40 MHz, WiCAN's
@@ -57,6 +66,12 @@ validates its inputs; upstream's optional `CHECK_NULL_PARAM` is not enabled.
   TEF sequence numbers identify successful completions. Credits are released
   only after consuming TEF, so the number of outstanding events cannot exceed
   TEF capacity. Queue capacity includes hardware and software frames.
+- The service loop uses interrupt flags to skip inactive RX/TEF FIFOs. It
+  combines adjacent FIFO status/address reads and error-counter/diagnostic
+  reads into bursts, while retaining the per-pass bus-off checks. It refills
+  TX before draining an RX burst so reception cannot delay restarting TX.
+  Events arriving after the interrupt snapshot leave INT asserted and are
+  serviced on the next pass.
 - One-shot mode permits one hardware frame at a time. Exhausted attempts
   reset that TX FIFO and complete the frame with `is_tx_success=false`;
   software-queued frames remain in order. Unlimited-retry mode pipelines eight.
@@ -110,6 +125,12 @@ node. `twai_node_disable()` alone retains configuration mode and supports
 re-enabling the same node; LPM is requested only when disposing of that node.
 
 ## Validation
+
+The host SPI model counts 3 transactions for an idle service pass, 6 for one
+TX submission, and 14 for one TX submission plus RX and completion. The same
+workloads before the first throughput pass used 6, 10, and 18 respectively.
+These counts are regression checks, not measured board throughput; they also
+exclude the CPU savings from avoiding DMA and repeated SPI bus arbitration.
 
 Run `make -C test/mcp251xfd` from the repository root. This exercises the real
 core and vendor SPI protocol against a register/RAM simulator, plus the actual

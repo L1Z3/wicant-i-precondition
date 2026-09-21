@@ -1,5 +1,8 @@
 # MCP2518FD validation
 
+See [bring-up findings](bringup-findings.md) for hardware test results and the
+remaining AP connection regression after the first throughput optimization.
+
 Run from the repository root:
 
 ```sh
@@ -18,6 +21,10 @@ SPI failure, mode timeout, repeated enable/disable, and failed initialization.
 It also models LPM wake-up clearing registers/RAM, an unusable first SPI reply,
 and delayed oscillator readiness, then verifies configuration and TX after
 recreating the software context without resetting the simulated hardware.
+Mixed TX/RX bursts verify TX is refilled while draining RX, FIFO wrap preserves
+payloads and completion ownership, and RX arriving after the interrupt snapshot
+is serviced on the next pass. SPI transaction budgets protect the reduction in
+per-frame overhead, and the model rejects transfers above the non-DMA limit.
 
 The adapter test compiles the actual ESP-IDF adapter against pthread-backed
 platform stubs. It checks worker/ISR separation, queue backpressure, original
@@ -26,6 +33,8 @@ during disable, controller disconnection, and cleanup after partially completed
 creation. Resource counters check that tasks, semaphores, event groups, and SPI
 devices are released. Deletion/recreation also checks LPM entry, no subsequent
 worker SPI access, and CS hold/release across device removal and creation.
+It also checks exclusive SPI reservation/release, cleanup after reservation
+failure at either clock speed, and the optional shared-bus configuration.
 These are host tests, not measurements on real hardware.
 
 ## Bring-up diagnostics
@@ -91,6 +100,15 @@ pin mapping, nominal bitrate, test duration, observed loss, and errors.
     after the LPM request. Measure supply current; do not probe sleeping
     controller registers over SPI, since that wakes it. On wake, verify both
     transceivers return low, the controller is reconfigured, and RX/TX resume.
+
+For the first throughput comparison, repeat the same 500 kbit/s MITM workload
+and SavvyCAN connection state before and after flashing. Record elapsed time,
+the per-bus `can_receive: rx queue full` counter deltas, forwarding/TX drops,
+and any controller fault. RX queue-full counters measure loss in the shared
+software queue, not overflow of the MCP2518FD hardware FIFO. Queue depths,
+SPI clock, bit timing and task priorities are unchanged by this optimization;
+the changes reduce SPI work and refill TX earlier. A lower SPI transaction
+count alone does not establish a lower physical frame-loss rate.
 
 Full CAN FD traffic is outside this implementation. In Normal CAN 2.0 mode the
 controller can emit error frames on FD traffic; this checklist assumes a

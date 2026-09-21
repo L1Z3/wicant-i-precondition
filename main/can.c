@@ -433,7 +433,9 @@ static esp_err_t can_mcp251xfd_bus_init(void)
 			.quadwp_io_num = GPIO_NUM_NC,
 			.quadhd_io_num = GPIO_NUM_NC,
 		};
-		esp_err_t err = spi_bus_initialize(MCP2518FD_SPI_HOST, &config, SPI_DMA_CH_AUTO);
+		// All Classical CAN transfers fit the SPI peripheral's CPU FIFO. DMA
+		// adds allocation/copy overhead for the small, unaligned register reads.
+		esp_err_t err = spi_bus_initialize(MCP2518FD_SPI_HOST, &config, SPI_DMA_DISABLED);
 		if (err != ESP_OK) return err;
 		spi_ready = true;
 	}
@@ -458,7 +460,8 @@ static esp_err_t can_bus1_create_node(void)
 		.bit_timing = {.bitrate = can_bitrate_bps[can_cfg[CAN_BUS_1].rate], .sp_permill = CAN_SAMPLE_POINT_PERMILL},
 		.fail_retry_cnt = can_cfg[CAN_BUS_1].auto_tx ? -1 : 0,
 		.tx_queue_depth = CAN_TX_SLOT_COUNT,
-		.flags = {.enable_loopback = can_cfg[CAN_BUS_1].loopback, .enable_listen_only = can_cfg[CAN_BUS_1].silent},
+		.flags = {.enable_loopback = can_cfg[CAN_BUS_1].loopback,
+			.enable_listen_only = can_cfg[CAN_BUS_1].silent, .exclusive_spi = true},
 	};
 	return twai_new_node_mcp251xfd(MCP2518FD_SPI_HOST, &config, &can_node[CAN_BUS_1]);
 }

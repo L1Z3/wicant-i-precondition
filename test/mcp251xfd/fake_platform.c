@@ -9,7 +9,7 @@
 struct fake_semaphore { pthread_mutex_t lock; pthread_cond_t changed; unsigned count, capacity; bool mutex; };
 struct fake_events { pthread_mutex_t lock; pthread_cond_t changed; EventBits_t bits; };
 struct fake_task { pthread_t thread; SemaphoreHandle_t notifications; void (*entry)(void *); void *arg; };
-struct fake_spi { unsigned hz; };
+struct fake_spi { unsigned hz; bool acquired; };
 static _Thread_local TaskHandle_t current_task;
 static _Thread_local bool isr_context;
 static atomic_int semaphore_count, event_count, task_count, spi_count;
@@ -20,6 +20,8 @@ static void (*interrupt_handler)(void *);
 static void *interrupt_arg;
 static bool interrupt_enabled, fail_install;
 static bool cs_held;
+static unsigned spi_acquire_attempts, spi_fail_acquire;
+static atomic_uint spi_reservations;
 
 static struct timespec deadline(unsigned ms)
 {
@@ -214,12 +216,26 @@ esp_err_t spi_bus_add_device(spi_host_device_t bus, const spi_device_interface_c
 }
 esp_err_t spi_bus_remove_device(spi_device_handle_t device)
 {
+    assert(!device->acquired);
     // Device removal resets the CS pin. It must remain held if the chip is
     // asleep, otherwise a low glitch could undo the low-power request.
     assert(!chip.low_power || cs_held);
     free(device);
     atomic_fetch_sub(&spi_count, 1);
     return ESP_OK;
+}
+esp_err_t spi_device_acquire_bus(spi_device_handle_t device, TickType_t wait)
+{
+    assert(wait == portMAX_DELAY && !device->acquired);
+    if (++spi_acquire_attempts == spi_fail_acquire) return ESP_FAIL;
+    assert(atomic_fetch_add(&spi_reservations, 1) == 0);
+    device->acquired = true;
+    return ESP_OK;
+}
+void spi_device_release_bus(spi_device_handle_t device)
+{
+    assert(device->acquired && atomic_fetch_sub(&spi_reservations, 1) == 1);
+    device->acquired = false;
 }
 esp_err_t spi_device_polling_transmit(spi_device_handle_t device, spi_transaction_t *transaction)
 {
@@ -283,6 +299,7 @@ void platform_check_clean(void)
     for (unsigned i = 0; i < 100 && atomic_load(&task_count); i++) platform_pause_ms(1);
     assert(!atomic_load(&task_count) && !atomic_load(&semaphore_count) && !atomic_load(&event_count) && !atomic_load(&spi_count));
     assert(!interrupt_handler);
+    assert(!atomic_load(&spi_reservations));
 }
 void platform_reset(void)
 {
@@ -292,6 +309,7 @@ void platform_reset(void)
     hardware_transfer = core.device.fnSPI_Transfer;
     fail_install = interrupt_enabled = false;
     cs_held = false;
+    spi_acquire_attempts = spi_fail_acquire = 0;
 }
 bool platform_is_low_power(void)
 {
@@ -333,3 +351,5 @@ void platform_receive(uint32_t id, bool rtr)
 }
 void platform_disconnect(void) { pthread_mutex_lock(&hardware_lock); chip.disconnected = true; pthread_mutex_unlock(&hardware_lock); }
 void platform_fail_isr_install(void) { fail_install = true; }
+void platform_fail_spi_acquire(unsigned attempt) { spi_fail_acquire = attempt; }
+bool platform_spi_acquired(void) { return atomic_load(&spi_reservations) != 0; }

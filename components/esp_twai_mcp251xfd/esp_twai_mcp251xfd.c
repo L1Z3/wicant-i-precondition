@@ -42,6 +42,8 @@ typedef struct {
     bool enabled;
     bool stopping;
     bool controller_initialized;
+    bool exclusive_spi;
+    bool spi_acquired;
 } mcp251xfd_node_t;
 
 static mcp251xfd_node_t *node_context(twai_node_handle_t node)
@@ -76,6 +78,10 @@ static eERRORRESULT spi_init(void *arg, uint8_t chip_select, uint32_t hz)
     if (ctx->spi && ctx->spi_hz == hz) return ERR_NONE;
     // Only called during creation, before the worker or GPIO ISR is installed.
     if (ctx->spi) {
+        if (ctx->spi_acquired) {
+            spi_device_release_bus(ctx->spi);
+            ctx->spi_acquired = false;
+        }
         if (spi_bus_remove_device(ctx->spi) != ESP_OK) return ERR__SPI_CONFIG_ERROR;
         ctx->spi = NULL;
     }
@@ -88,6 +94,13 @@ static eERRORRESULT spi_init(void *arg, uint8_t chip_select, uint32_t hz)
     // Deletion holds CS high across SPI-device removal and ESP32 light sleep.
     // Configure the peripheral's idle level before releasing that hold.
     if (gpio_hold_dis(ctx->cs_gpio) != ESP_OK) return ERR__SPI_CONFIG_ERROR;
+    // WiCAN dedicates SPI2 to this controller, as it does for MCP2515. Holding
+    // the device's bus reservation avoids arbitration on every short transfer.
+    // The core mutex still serializes calls made by different tasks.
+    if (ctx->exclusive_spi) {
+        if (spi_device_acquire_bus(ctx->spi, portMAX_DELAY) != ESP_OK) return ERR__SPI_CONFIG_ERROR;
+        ctx->spi_acquired = true;
+    }
     return ERR_NONE;
 }
 
@@ -121,8 +134,8 @@ static void rx_done(void *arg, const mcp251xfd_frame_t *frame)
 {
     mcp251xfd_node_t *ctx = arg;
     if (!ctx->callbacks.on_rx_done) return;
-    uint64_t us = esp_timer_get_time();
     uint32_t resolution = ctx->timestamp_resolution_hz;
+    uint64_t us = resolution ? esp_timer_get_time() : 0;
     ctx->rx_cache = (twai_frame_t){
         .header = {.id = frame->id, .dlc = frame->dlc, .ide = frame->extended, .rtr = frame->rtr,
                    .timestamp = (us / 1000000) * resolution + (us % 1000000) * resolution / 1000000},
@@ -302,6 +315,7 @@ static void destroy_context(mcp251xfd_node_t *ctx)
         // The hold is released by spi_init() on the next node creation.
         esp_err_t error = gpio_hold_en(ctx->cs_gpio);
         if (error != ESP_OK) ESP_LOGE(TAG, "CS hold failed: %d", (int)error);
+        if (ctx->spi_acquired) spi_device_release_bus(ctx->spi);
         spi_bus_remove_device(ctx->spi);
     }
     if (ctx->events) vEventGroupDelete(ctx->events);
@@ -455,6 +469,7 @@ esp_err_t twai_new_node_mcp251xfd(spi_host_device_t bus, const twai_mcp251xfd_no
     ctx->cs_gpio = config->io_cfg.cs_gpio;
     ctx->int_gpio = config->io_cfg.int_gpio;
     ctx->timestamp_resolution_hz = config->timestamp_resolution_hz;
+    ctx->exclusive_spi = config->flags.exclusive_spi;
     ctx->lock = xSemaphoreCreateMutex();
     ctx->tx_space = xSemaphoreCreateCounting(config->tx_queue_depth, config->tx_queue_depth);
     ctx->worker_exited = xSemaphoreCreateBinary();

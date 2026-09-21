@@ -300,21 +300,52 @@ eERRORRESULT mcp251xfd_core_enqueue(mcp251xfd_core_t *core,
     return ERR_NONE;
 }
 
+static uint32_t read_le32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+static void write_le32(uint8_t *p, uint32_t value)
+{
+    for (unsigned i = 0; i < 4; i++) p[i] = value >> (i * 8);
+}
+
+static eERRORRESULT read_fifo_head(mcp251xfd_core_t *core, eMCP251XFD_FIFO fifo,
+                                  uint8_t *status, uint16_t *address)
+{
+    // STA and UA are adjacent. Read them together instead of issuing a second
+    // transaction for UA through the vendor's generic message helper. UA is
+    // owned by software UINC, so it remains valid until we advance this FIFO.
+    uint16_t reg = fifo == MCP251XFD_TEF ? RegMCP251XFD_CiTEFSTA :
+                   RegMCP251XFD_CiFIFOSTAm + MCP251XFD_FIFO_REG_SIZE * (fifo - 1);
+    uint8_t registers[8];
+    TRY(MCP251XFD_ReadData(&core->device, reg, registers, sizeof(registers)));
+    *status = registers[0];
+    uint32_t offset = read_le32(registers + 4);
+    unsigned size = fifo == MCP251XFD_TEF ? 8 : 16;
+    if ((offset & 3) || offset > MCP251XFD_RAM_SIZE - size) return ERR__SPI_INVALID_DATA;
+    *address = MCP251XFD_RAM_ADDR + offset;
+    return ERR_NONE;
+}
+
 static eERRORRESULT drain_tef(mcp251xfd_core_t *core)
 {
     // Never load more than eight frames without reading their TEF entries,
     // even if hardware TX FIFO space has already become available.
     for (unsigned i = 0; i < MCP251XFD_HW_TX_DEPTH; i++) {
-        setMCP251XFD_FIFOstatus status = 0;
-        TRY(MCP251XFD_GetFIFOStatus(&core->device, MCP251XFD_TEF, &status));
+        uint8_t status;
+        uint16_t address;
+        TRY(read_fifo_head(core, MCP251XFD_TEF, &status, &address));
         if (status & MCP251XFD_TEF_FIFO_OVERFLOW) {
             core->diagnostics.reason = "TEF overflow";
             return ERR__BUFFER_FULL;
         }
         if (!(status & MCP251XFD_TEF_FIFO_NOT_EMPTY)) return ERR_NONE;
-        MCP251XFD_CANMessage event = {0};
-        TRY(MCP251XFD_ReceiveMessageFromFIFO(&core->device, &event, MCP251XFD_PAYLOAD_8BYTE, NULL, MCP251XFD_TEF));
-        if (!core->loaded || !core->count || event.MessageSEQ != core->tx[core->head].sequence) {
+        uint8_t object[8];
+        TRY(MCP251XFD_ReadData(&core->device, address, object, sizeof(object)));
+        TRY(MCP251XFD_UpdateFIFO(&core->device, MCP251XFD_TEF, false));
+        MCP251XFD_CAN_TX_Message_Control control = {.T1 = read_le32(object + 4)};
+        if (!core->loaded || !core->count || control.SEQ != core->tx[core->head].sequence) {
             core->diagnostics.reason = "TEF sequence mismatch";
             return ERR__SPI_INVALID_DATA;
         }
@@ -323,27 +354,56 @@ static eERRORRESULT drain_tef(mcp251xfd_core_t *core)
     return ERR_NONE;
 }
 
+static eERRORRESULT fill_tx(mcp251xfd_core_t *core)
+{
+    unsigned max_loaded = core->config.one_shot ? 1 : MCP251XFD_HW_TX_DEPTH;
+    while (core->loaded < core->count && core->loaded < max_loaded) {
+        uint8_t status;
+        uint16_t address;
+        TRY(read_fifo_head(core, TX_FIFO, &status, &address));
+        // A one-shot attempt can fail between the service status read and here.
+        if (status & MCP251XFD_TX_FIFO_ATTEMPTS_EXHAUSTED) break;
+        if (!(status & MCP251XFD_TX_FIFO_NOT_FULL)) break;
+        const mcp251xfd_pending_tx_t *tx = &core->tx[(core->head + core->loaded) % MCP251XFD_TX_CAPACITY];
+        uint8_t object[16] = {0};
+        write_le32(object, MCP251XFD_MessageIDtoObjectMessageIdentifier(tx->frame.id, tx->frame.extended, false));
+        MCP251XFD_CAN_TX_Message_Control control = {
+            .SEQ = tx->sequence, .DLC = tx->frame.dlc, .IDE = tx->frame.extended, .RTR = tx->frame.rtr,
+        };
+        write_le32(object + 4, control.T1);
+        if (!tx->frame.rtr) memcpy(object + 8, tx->frame.data, tx->frame.dlc);
+        unsigned size = 8 + ((tx->frame.dlc + 3) & ~3u);
+        TRY(MCP251XFD_WriteData(&core->device, address, object, size));
+        // A failed transfer may already have committed UINC/TXREQ. Never retry
+        // ambiguously: fault() retires the tokens and requests recreation.
+        TRY(MCP251XFD_UpdateFIFO(&core->device, TX_FIFO, true));
+        core->loaded++;
+    }
+    return ERR_NONE;
+}
+
 static eERRORRESULT service(mcp251xfd_core_t *core)
 {
     core->diagnostics.reason = "controller I/O";
     core->diagnostics.trec_valid = core->diagnostics.bdiag1_valid = false;
-    TRY(drain_tef(core));
     setMCP251XFD_InterruptEvents events = 0;
     MCP251XFD_CiBDIAG1_Register diagnostic = {0};
     TRY(MCP251XFD_GetInterruptEvents(&core->device, &events));
     core->diagnostics.interrupts = events;
+    // New events after this snapshot leave INT asserted for the next pass.
+    // TX submissions should not poll empty receive/completion FIFOs each time.
+    if (events & MCP251XFD_INT_TEF_EVENT) TRY(drain_tef(core));
     // Read counters and status together, and keep the triggering values before
     // cleanup changes mode (configuration mode itself sets the TXBO bit).
-    uint32_t trec;
-    TRY(MCP251XFD_ReadSFR32(&core->device, RegMCP251XFD_CiTREC, &trec));
+    uint8_t counters[12]; // TREC, BDIAG0, BDIAG1 are contiguous.
+    TRY(MCP251XFD_ReadData(&core->device, RegMCP251XFD_CiTREC, counters, sizeof(counters)));
+    uint32_t trec = read_le32(counters);
     core->diagnostics.trec = trec;
     core->diagnostics.trec_valid = true;
     core->tx_errors = trec >> 8;
     core->rx_errors = trec;
     eMCP251XFD_TXRXErrorStatus status = (trec >> 16) & 0x3f;
-    uint32_t bdiag1;
-    TRY(MCP251XFD_ReadSFR32(&core->device, RegMCP251XFD_CiBDIAG1, &bdiag1));
-    diagnostic.CiBDIAG1 = bdiag1;
+    diagnostic.CiBDIAG1 = read_le32(counters + 8);
     core->diagnostics.bdiag1 = diagnostic.CiBDIAG1;
     core->diagnostics.bdiag1_valid = true;
     core->diagnostics.bdiag1_seen |= diagnostic.CiBDIAG1 & 0xffff0000u;
@@ -379,48 +439,34 @@ static eERRORRESULT service(mcp251xfd_core_t *core)
         TRY(MCP251XFD_ResetFIFO(&core->device, TX_FIFO));
         complete_head(core, false);
     }
+    // Refill before draining RX so a receive burst cannot leave the TX FIFO
+    // idle. The depth still bounds pending TEF events and preserves wire order.
+    TRY(fill_tx(core));
+    if (!(events & (MCP251XFD_INT_RX_EVENT | MCP251XFD_INT_RX_OVERFLOW_EVENT))) return ERR_NONE;
     for (unsigned i = 0; i < 32; i++) {
-        setMCP251XFD_FIFOstatus rx_status = 0;
-        TRY(MCP251XFD_GetFIFOStatus(&core->device, RX_FIFO, &rx_status));
+        uint8_t rx_status;
+        uint16_t address;
+        TRY(read_fifo_head(core, RX_FIFO, &rx_status, &address));
         if (rx_status & MCP251XFD_RX_FIFO_OVERFLOW) {
             core->rx_overruns++;
             TRY(MCP251XFD_ClearFIFOEvents(&core->device, RX_FIFO, MCP251XFD_RX_FIFO_OVERFLOW));
         }
         if (!(rx_status & MCP251XFD_RX_FIFO_NOT_EMPTY)) break;
         mcp251xfd_frame_t frame = {0};
-        MCP251XFD_CANMessage message = {.PayloadData = frame.data};
-        TRY(MCP251XFD_ReceiveMessageFromFIFO(&core->device, &message, MCP251XFD_PAYLOAD_8BYTE, NULL, RX_FIFO));
-        if (message.ControlFlags & MCP251XFD_CANFD_FRAME) {
+        uint8_t object[16];
+        TRY(MCP251XFD_ReadData(&core->device, address, object, sizeof(object)));
+        TRY(MCP251XFD_UpdateFIFO(&core->device, RX_FIFO, false));
+        MCP251XFD_CAN_RX_Message_Control control = {.R1 = read_le32(object + 4)};
+        if (control.FDF) {
             core->rx_fd_dropped++;
             continue;
         }
-        frame.id = message.MessageID;
-        frame.extended = (message.ControlFlags & MCP251XFD_EXTENDED_MESSAGE_ID) != 0;
-        frame.rtr = (message.ControlFlags & MCP251XFD_REMOTE_TRANSMISSION_REQUEST) != 0;
-        frame.dlc = message.DLC > 8 ? 8 : message.DLC;
-        if (frame.rtr) memset(frame.data, 0, sizeof(frame.data));
+        frame.extended = control.IDE;
+        frame.id = MCP251XFD_ObjectMessageIdentifierToMessageID(read_le32(object), frame.extended, false);
+        frame.rtr = control.RTR;
+        frame.dlc = control.DLC > 8 ? 8 : control.DLC;
+        if (!frame.rtr) memcpy(frame.data, object + 8, frame.dlc);
         if (core->callbacks.rx_done) core->callbacks.rx_done(core->callbacks.arg, &frame);
-    }
-    unsigned max_loaded = core->config.one_shot ? 1 : MCP251XFD_HW_TX_DEPTH;
-    while (core->loaded < core->count && core->loaded < max_loaded) {
-        TRY(MCP251XFD_GetFIFOStatus(&core->device, TX_FIFO, &tx_status));
-        // Do not set TXREQ again if a one-shot attempt just failed.
-        if (tx_status & MCP251XFD_TX_FIFO_ATTEMPTS_EXHAUSTED) break;
-        if (!(tx_status & MCP251XFD_TX_FIFO_NOT_FULL)) break;
-        mcp251xfd_pending_tx_t *tx = &core->tx[(core->head + core->loaded) % MCP251XFD_TX_CAPACITY];
-        uint8_t rtr_padding[8] = {0};
-        MCP251XFD_CANMessage message = {
-            .MessageID = tx->frame.id, .MessageSEQ = tx->sequence,
-            .DLC = (eMCP251XFD_DataLength)tx->frame.dlc,
-            .ControlFlags = (tx->frame.extended ? MCP251XFD_EXTENDED_MESSAGE_ID : 0) |
-                            (tx->frame.rtr ? MCP251XFD_REMOTE_TRANSMISSION_REQUEST : 0),
-            // Upstream copies DLC bytes even for RTR, which has no payload.
-            .PayloadData = tx->frame.rtr ? rtr_padding : tx->frame.data,
-        };
-        // A failed SPI transfer may already have committed UINC/TXREQ. Do not
-        // retry ambiguously: fault() retires all tokens and requests recovery.
-        TRY(MCP251XFD_TransmitMessageToFIFO(&core->device, &message, TX_FIFO, true));
-        core->loaded++;
     }
     return ERR_NONE;
 }

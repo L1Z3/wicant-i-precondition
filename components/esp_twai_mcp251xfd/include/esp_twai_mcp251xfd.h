@@ -22,6 +22,7 @@ typedef struct {
     struct {
         uint32_t enable_loopback: 1;
         uint32_t enable_listen_only: 1;
+        uint32_t exclusive_spi: 1;  // Reserve a dedicated SPI bus until deletion
     } flags;
 } twai_mcp251xfd_node_config_t;
 

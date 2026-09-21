@@ -15,6 +15,7 @@ typedef struct {
     unsigned bus_off_count;
     unsigned error_count;
     uint32_t diagnostic;
+    bool require_tx_during_rx;
 } fixture_t;
 
 static void tx_done(void *arg, const void *token, bool success)
@@ -30,6 +31,7 @@ static void rx_done(void *arg, const mcp251xfd_frame_t *frame)
 {
     fixture_t *f = arg;
     assert(f->received_count < 128);
+    if (f->require_tx_during_rx) assert(f->chip.tx_count > 0);
     f->received[f->received_count++] = *frame;
 }
 
@@ -433,6 +435,67 @@ static void test_low_power_recreation(void)
     assert(mcp251xfd_core_sleep(&f.core) == ERR__SPI_COMM_ERROR);
 }
 
+static void test_service_spi_cost(void)
+{
+    fixture_t f;
+    prepare(&f);
+    start(&f);
+    unsigned before = f.chip.transfers;
+    assert(mcp251xfd_core_service(&f.core) == ERR_NONE);
+    unsigned idle = f.chip.transfers - before;
+    enqueue(&f, 0);
+    before = f.chip.transfers;
+    assert(mcp251xfd_core_service(&f.core) == ERR_NONE);
+    unsigned tx = f.chip.transfers - before;
+    fake_transmit(&f.chip, true);
+    mcp251xfd_frame_t frame = make_frame(7);
+    fake_receive(&f.chip, &frame, false);
+    enqueue(&f, 1);
+    before = f.chip.transfers;
+    assert(mcp251xfd_core_service(&f.core) == ERR_NONE);
+    unsigned mixed = f.chip.transfers - before;
+    assert(f.completed_count == 1 && f.received_count == 1 && f.chip.tx_count == 1);
+    // Regression budgets from the same workload: previously 6 / 10 / 18.
+    assert(idle <= 3 && tx <= 6 && mixed <= 14);
+    printf("SPI transfers per service: idle=%u TX=%u TX+RX+completion=%u\n", idle, tx, mixed);
+}
+
+static void test_mixed_bursts_and_late_interrupt(void)
+{
+    fixture_t f;
+    prepare(&f);
+    start(&f);
+    for (unsigned i = 0; i < 16; i++) enqueue(&f, i);
+    assert(mcp251xfd_core_service(&f.core) == ERR_NONE);
+    for (unsigned i = 0; i < 8; i++) fake_transmit(&f.chip, true);
+    for (unsigned i = 0; i < 32; i++) {
+        mcp251xfd_frame_t frame = make_frame(i);
+        fake_receive(&f.chip, &frame, false);
+    }
+    f.require_tx_during_rx = true;
+    assert(mcp251xfd_core_service(&f.core) == ERR_NONE);
+    assert(f.completed_count == 8 && f.received_count == 32 && f.chip.tx_count == 8);
+    for (unsigned i = 0; i < 32; i++) {
+        mcp251xfd_frame_t frame = make_frame(i);
+        assert(f.received[i].id == frame.id && f.received[i].dlc == frame.dlc);
+        assert(memcmp(f.received[i].data, frame.data, frame.dlc) == 0);
+    }
+    for (unsigned i = 0; i < 8; i++) fake_transmit(&f.chip, true);
+    assert(mcp251xfd_core_service(&f.core) == ERR_NONE);
+    assert(f.completed_count == 16 && f.core.loaded == 0 && f.chip.tef_count == 0);
+    for (unsigned i = 0; i < 16; i++) assert(f.completed[i] == &f.tokens[i] && f.success[i]);
+
+    // An event arriving after the interrupt snapshot must remain pending for
+    // the next pass, including RX FIFO wrap from the burst above.
+    f.require_tx_during_rx = false;
+    f.chip.rx_after_interrupt_read = true;
+    assert(mcp251xfd_core_service(&f.core) == ERR_NONE);
+    assert(f.received_count == 32 && f.chip.rx_count == 1 && (f.chip.memory[0x01c] & 2));
+    assert(mcp251xfd_core_service(&f.core) == ERR_NONE);
+    assert(f.received_count == 33 && f.chip.rx_count == 0);
+    assert(f.received[32].id == 0x321 && f.received[32].data[0] == 0x5a);
+}
+
 int main(void)
 {
     test_timing();
@@ -445,6 +508,8 @@ int main(void)
     test_reenable_and_errors();
     test_fault_diagnostics();
     test_low_power_recreation();
+    test_service_spi_cost();
+    test_mixed_bursts_and_late_interrupt();
     puts("MCP2518FD core: timing, SPI initialization, FIFO order, TEF ownership, one-shot, RX/RTR, filters, and lifecycle tests passed");
     return 0;
 }
