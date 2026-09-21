@@ -1497,10 +1497,11 @@
             const showAll = document.getElementById("precon_button_show_all").checked;
             const selectedVehicle = document.getElementById("egmp_car_model").value;
             document.querySelectorAll("#precon_button option").forEach(option => {
-                const carClass = Array.from(option.classList).find(className =>
+                const carClasses = Array.from(option.classList).filter(className =>
                     className.startsWith("precon_button_car_"));
                 const carMatches = selectedVehicle === "unknown"
-                    || !carClass || carClass === `precon_button_car_${selectedVehicle}`;
+                    || carClasses.length === 0
+                    || carClasses.includes(`precon_button_car_${selectedVehicle}`);
                 const extraVisible = !option.classList.contains("precon_button_extra") || showAll;
                 option.hidden = !(carMatches && extraVisible);
             });
