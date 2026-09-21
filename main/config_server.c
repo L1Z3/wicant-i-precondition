@@ -2135,6 +2135,7 @@ static void config_server_load_cfg(char *cfg)
 	//*****
 	// key added after initial release; missing means a config saved by older
 	// firmware, so fall back to the default rather than rejecting the config
+    // could think about being more agressive if auto-detection works properly
 	key = cJSON_GetObjectItem(root,"egmp_car_model");
 	if(key == 0)
 	{
