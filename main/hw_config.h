@@ -41,7 +41,7 @@
 
 #define CAN_BUS_COUNT                2
 
-// -- Bus 0: TWAI controller on ESP -> SN65HVD233 #1 -- //
+// -- Bus 0: TWAI controller on ESP -> SN65HVD233 (EB-FD U2) -- //
 
 #define TX_GPIO_NUM                 2
 #define RX_GPIO_NUM                 1
@@ -51,6 +51,8 @@
 
 #if HARDWARE_VER == WICAN_PROTO
 
+// As per Ali, transceiver standby (RS, pin 8) is not working on proto.
+// CAN_STDBY_GPIO_NUM remains undefined for this board.
 // -- Bus 1: MCP2515 (SPI2) -> SN65HVD233 #2 -- //
 
 #define HW_HAS_MCP2515               1
@@ -70,7 +72,14 @@
 
 #else
 
-// -- Bus 1: MCP2518FD (SPI2) -> TCAN3413 -- //
+// STDBY_1 -> U2 RS and STDBY_2 -> U4 STB each have a 10 kOhm pull-up.
+// Drive low for normal operation, high for standby.
+#define CAN_STDBY_GPIO_NUM          11
+#define MCP2518FD_STDBY_GPIO_NUM    12
+
+// -- Bus 1: MCP2518FD U57 (SPI2) -> TCAN3413 U4 -- //
+// MCP2518FD resets over SPI; GPIO 8 is unused.
+// X2 is a 40 MHz crystal; PLL and SYSCLK division remain disabled.
 #define HW_HAS_MCP2515               0
 #define HW_HAS_MCP2518FD             1
 #define MCP2518FD_SPI_HOST           SPI2_HOST
@@ -84,15 +93,15 @@
 
 #endif
 
-#define CONNECTED_LED_GPIO_NUM       41
-#define ACTIVE_LED_GPIO_NUM          40
-#define PWR_LED_GPIO_NUM             42
+#define CONNECTED_LED_GPIO_NUM       41 // Green
+#define ACTIVE_LED_GPIO_NUM          40 // Yellow
+#define PWR_LED_GPIO_NUM             42 // Blue
 #define LED_ON                       0
 #define LED_OFF                      1
 #define PWR_LED_ON                   0
 #define PWR_LED_OFF                  1
 
-// VBAT sense: R1=62K, R2=6.2K divider (x11) to ADC1 ch3
+// VBAT sense: R1=62K, R2=6.2K divider (x11) to ADC1 ch3 / GPIO 4
 #define VBAT_ADC_CHANNEL             ADC_CHANNEL_3
 #define VBAT_ADC_ATTEN               ADC_ATTEN_DB_6
 #define VBAT_DIVIDER_R1_OHM          62000

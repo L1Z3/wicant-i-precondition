@@ -521,6 +521,11 @@ void app_main(void)
     gpio_set_direction(CAN_STDBY_GPIO_NUM, GPIO_MODE_OUTPUT);
     gpio_set_level(CAN_STDBY_GPIO_NUM, 1);
 #endif
+#ifdef MCP2518FD_STDBY_GPIO_NUM
+    gpio_reset_pin(MCP2518FD_STDBY_GPIO_NUM);
+    gpio_set_direction(MCP2518FD_STDBY_GPIO_NUM, GPIO_MODE_OUTPUT);
+    gpio_set_level(MCP2518FD_STDBY_GPIO_NUM, 1);
+#endif
 
     xMsg_Rx_Queue = xQueueCreate(16, sizeof( xdev_buffer) );
     // 128 slots (~10 KB): bigger than upstream 16 in order to ride out wifi/lwip hiccups
