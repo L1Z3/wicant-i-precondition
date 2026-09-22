@@ -1387,6 +1387,27 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
             platform.precon_status = PRECON_STATUS_IDLE;
             sm_send_event(sm, EV_STATUS_IDLE);
         }
+
+        // identify the car once so the config's egmp_car_model can be
+        // initialized (only while it is still at the default). the car model
+        // cannot change without a reboot, so cache the result instead of
+        // re-running this on every periodic status frame.
+        //   Ioniq 6: 0x0A82AA03
+        //   Ioniq 5: 0x2AD, idle status 0x01
+        //   EV6:     0x2AD, idle status 0x41
+        static bool egmp_car_model_detected = false;
+        if (!egmp_car_model_detected) {
+            if (to_push->identifier == 0x0A82AA03U) {
+                config_server_set_egmp_car_model("ioniq6");
+                egmp_car_model_detected = true;
+            } else if (status == 0x01U) {
+                config_server_set_egmp_car_model("ioniq5");
+                egmp_car_model_detected = true;
+            } else if (status == 0x41U) {
+                config_server_set_egmp_car_model("ev6");
+                egmp_car_model_detected = true;
+            }
+        }
     }
 
     if (IS_BATTERY_TEMPERATURE_FRAME(to_push->identifier)
