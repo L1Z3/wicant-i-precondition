@@ -770,26 +770,11 @@ static int mcp251xfd_handle_fifo_read(const struct device *dev, const struct mcp
 	fifo_tail_addr = ua;
 	fifo_tail_index = (fifo_tail_addr - fifo->ram_start_addr) / fifo->item_size;
 
-	if (fifo_type == MCP251XFD_FIFO_TYPE_RX) {
-		/*
-		 * fifo_head_index points where the next message will be written.
-		 * It points to one past the end of the fifo.
-		 */
-		fifo_head_index = FIELD_GET(MCP251XFD_REG_FIFOSTA_FIFOCI_MASK, fifosta);
-		if (fifo_head_index == 0) {
-			fifo_head_index = fifo->capacity - 1;
-		} else {
-			fifo_head_index -= 1;
-		}
-
-		if (fifo_tail_index > fifo_head_index) {
-			/* fetch to the end of the memory and then wrap to the start */
-			fetch_total = fifo->capacity - 1 - fifo_tail_index + 1;
-			fetch_total += fifo_head_index + 1;
-		} else {
-			fetch_total = fifo_head_index - fifo_tail_index + 1;
-		}
-	} else if (fifo_type == MCP251XFD_FIFO_TYPE_TEF) {
+	// LOCAL PATCH: MCP2518FD erratum DS80000789 #6 (FIFOSTA.FIFOCI reads can be
+	// corrupted with a valid CRC, so a batch could include stale objects).
+	// Read RX one message at a time from FIFOSTA/UA, like TEF; the interrupt
+	// loop calls back while RXIF remains set.
+	if (fifo_type == MCP251XFD_FIFO_TYPE_RX || fifo_type == MCP251XFD_FIFO_TYPE_TEF) {
 		/* FIFOCI doesn't exist for TEF queues, so fetch one message at a time */
 		fifo_head_index = fifo_tail_index;
 		fetch_total = 1;
