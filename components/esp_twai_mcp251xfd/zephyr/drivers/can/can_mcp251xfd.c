@@ -718,7 +718,9 @@ static int mcp251xfd_get_state(const struct device *dev, enum can_state *state,
 
 done:
 	k_mutex_unlock(&dev_data->mutex);
-	return 0;
+	// LOCAL PATCH: report a failed TREC read. Upstream returns 0, and
+	// handle_cerrif() then publishes an uninitialized state.
+	return ret;
 }
 
 static int mcp251xfd_get_core_clock(const struct device *dev, uint32_t *rate)
