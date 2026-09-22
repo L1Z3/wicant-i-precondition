@@ -465,6 +465,36 @@ static void run_inject_failure_ends_burst(void) {
     CHECK(sent_count == 1);
 }
 
+static void run_passive_inject_failure_ends_burst(void) {
+    start(100, 100);
+    sent_count = 0;
+
+    rx_cmd(0x96, 0x96, HEAD_UNIT_BUS);
+    int ticks = tick_until_sent(300);
+    CHECK(ticks > 0);
+    CHECK(sent_count == 1);
+
+    advance_ticks(2); // remaining active frames
+    CHECK(sent_count == 3);
+    CHECK(s_burst_phase == BURST_GAP);
+
+    advance_ticks(1); // idle tick: the passive tail is now armed
+    CHECK(sent_count == 3);
+    CHECK(s_burst_phase == BURST_PASSIVE);
+
+    // a failed passive frame drops the sequence too, rather than retrying (and
+    // logging a warning) every 40 ms while the bus is wedged
+    send_fail = true;
+    sent_count = 0;
+    tick1();
+    CHECK(sent_count == 1); // the attempt is recorded
+    CHECK(s_burst_phase == BURST_IDLE);
+
+    send_fail = false;
+    advance_ticks(50);
+    CHECK(sent_count == 1); // no retries, no remaining passive frames
+}
+
 // ---- suite table ----
 // each suite runs in its own forked process: the module's state is all
 // process statics
@@ -485,6 +515,7 @@ static const suite_t suites[] = {
     {"conflict burst and latch", run_conflict_burst_and_latch},
     {"probe burst and adoption", run_probe_burst_and_adoption},
     {"inject failure ends the active burst", run_inject_failure_ends_burst},
+    {"inject failure ends the passive burst", run_passive_inject_failure_ends_burst},
 };
 #define NUM_SUITES (sizeof(suites) / sizeof(suites[0]))
 

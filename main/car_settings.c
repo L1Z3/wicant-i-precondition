@@ -449,6 +449,13 @@ static void burst_arm(burst_phase_t phase) {
     s_burst_frames_left = CAR_SETTINGS_BURST_COUNT;
 }
 
+// can_send() failed (bus down/wedged): drop the rest of the sequence rather
+// than re-attempting every 40 ms and spamming the log. A later conflict/quiet
+// re-arm re-establishes the limits once the bus recovers.
+static void burst_abort(void) {
+    s_burst_phase = BURST_IDLE;
+}
+
 // One-shot startup probe: becomes a passive burst once the machine is idle.
 static void cs_arm_probe(const cs_tick_view_t *v) {
     if (!v->probe_pending || !burst_idle()) {
@@ -532,16 +539,10 @@ static void cs_arm_on_trigger(const cs_tick_view_t *v) {
 static void cs_step_burst(void) {
     switch (s_burst_phase) {
     case BURST_ACTIVE:
-        if (car_settings_inject(false)) {
-            if (--s_burst_frames_left == 0U) {
-                s_burst_phase = BURST_GAP;
-            }
-        } else {
-            // can_send() failed (bus down/wedged): drop the rest of the burst
-            // rather than re-attempting every 40 ms and spamming the log. A
-            // later conflict/quiet re-arm re-establishes the limits once the
-            // bus recovers.
-            s_burst_phase = BURST_IDLE;
+        if (!car_settings_inject(false)) {
+            burst_abort();
+        } else if (--s_burst_frames_left == 0U) {
+            s_burst_phase = BURST_GAP;
         }
         break;
     case BURST_GAP:
@@ -550,8 +551,9 @@ static void cs_step_burst(void) {
         s_burst_phase = BURST_PASSIVE;
         break;
     case BURST_PASSIVE:
-        // A failed passive frame is simply retried on the next tick.
-        if (car_settings_inject(true) && --s_burst_frames_left == 0U) {
+        if (!car_settings_inject(true)) {
+            burst_abort();
+        } else if (--s_burst_frames_left == 0U) {
             s_burst_phase = BURST_IDLE;
         }
         break;
