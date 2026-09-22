@@ -71,7 +71,9 @@ BUILD_ASSERT(MCP251XFD_TEF_FIFO_SIZE + MCP251XFD_TX_QUEUE_SIZE +
 #define MCP251XFD_PLLRDY_RETRIES      100
 
 #define MCP251XFD_MAX_INT_HANDLER_CALLS  10
-#define MCP251XFD_INT_HANDLER_SLEEP_USEC 10000
+// LOCAL PATCH: back off for 1 ms instead of 10 ms. Sustained forwarding keeps
+// INT asserted; a 10 ms pause stalls TEF servicing and exhausts TX mailboxes.
+#define MCP251XFD_INT_HANDLER_SLEEP_USEC 1000
 
 /* Delay time found experimentally to fix occasional init issue */
 #define MCP251XFD_RESET_DELAY_USEC 5000
