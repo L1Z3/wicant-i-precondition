@@ -49,7 +49,11 @@
 #define MCP251XFD_RX_FIFO_ITEMS CONFIG_CAN_MCP251XFD_RX_FIFO_ITEMS
 #define MCP251XFD_RX_FIFO_SIZE  (MCP251XFD_RX_FIFO_ITEMS * MCP251XFD_RX_FIFO_ITEM_SIZE)
 
-#define MCP251XFD_RX_FIFO_IDX 1
+// LOCAL PATCH: transmit through FIFO 1 instead of the TXQ, as Linux does. The
+// TXQ sends the lowest pending CAN ID first; a FIFO keeps submission order.
+// RAM stays TEF, TX, RX in that order, so the *_START_ADDR layout is unchanged.
+#define MCP251XFD_TX_FIFO_IDX 1
+#define MCP251XFD_RX_FIFO_IDX 2
 #define MCP251XFD_REG_SIZE    4
 
 #define MCP251XFD_CRC_POLY 0x8005

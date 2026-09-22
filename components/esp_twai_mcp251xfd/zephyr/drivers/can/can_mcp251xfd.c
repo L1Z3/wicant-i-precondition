@@ -167,14 +167,16 @@ static int mcp251xfd_fifo_write(const struct device *dev, int mailbox_idx,
 	int ret;
 
 	/* read fifosta and ua at the same time */
-	regs = mcp251xfd_read_crc(dev, MCP251XFD_REG_TXQSTA, MCP251XFD_REG_SIZE * 2);
+	// LOCAL PATCH: TX FIFO instead of TXQ (see MCP251XFD_TX_FIFO_IDX).
+	regs = mcp251xfd_read_crc(dev, MCP251XFD_REG_FIFOSTA(MCP251XFD_TX_FIFO_IDX),
+				  MCP251XFD_REG_SIZE * 2);
 	if (!regs) {
-		LOG_ERR("Failed to read 8 bytes from REG_TXQSTA");
+		LOG_ERR("Failed to read 8 bytes from TX FIFOSTA");
 		return -EINVAL;
 	}
 
 	/* check if fifo is full */
-	if (!(regs[0] & MCP251XFD_REG_TXQSTA_TXQNIF)) {
+	if (!(regs[0] & MCP251XFD_REG_FIFOSTA_TFNRFNIF)) {
 		return -ENOMEM;
 	}
 
@@ -194,10 +196,10 @@ static int mcp251xfd_fifo_write(const struct device *dev, int mailbox_idx,
 	}
 
 	reg_byte = mcp251xfd_get_spi_buf_ptr(dev);
-	*reg_byte = MCP251XFD_UINT32_FLAG_TO_BYTE_MASK(MCP251XFD_REG_TXQCON_UINC |
-						       MCP251XFD_REG_TXQCON_TXREQ);
+	*reg_byte = MCP251XFD_UINT32_FLAG_TO_BYTE_MASK(MCP251XFD_REG_FIFOCON_UINC |
+						       MCP251XFD_REG_FIFOCON_TXREQ);
 
-	return mcp251xfd_write(dev, MCP251XFD_REG_TXQCON + 1, 1);
+	return mcp251xfd_write(dev, MCP251XFD_REG_FIFOCON(MCP251XFD_TX_FIFO_IDX) + 1, 1);
 }
 
 static void mcp251xfd_rxobj_to_canframe(struct mcp251xfd_rxobj *src, struct can_frame *dst)
@@ -1338,8 +1340,8 @@ static inline int mcp251xfd_init_con_reg(const struct device *dev)
 	uint32_t tmp;
 
 	reg = mcp251xfd_get_spi_buf_ptr(dev);
-	tmp = MCP251XFD_REG_CON_ISOCRCEN | MCP251XFD_REG_CON_WAKFIL | MCP251XFD_REG_CON_TXQEN |
-	      MCP251XFD_REG_CON_STEF;
+	// LOCAL PATCH: TXQ disabled; TX uses MCP251XFD_TX_FIFO_IDX.
+	tmp = MCP251XFD_REG_CON_ISOCRCEN | MCP251XFD_REG_CON_WAKFIL | MCP251XFD_REG_CON_STEF;
 	tmp |= FIELD_PREP(MCP251XFD_REG_CON_WFT_MASK, MCP251XFD_REG_CON_WFT_T11FILTER) |
 		FIELD_PREP(MCP251XFD_REG_CON_REQOP_MASK, MCP251XFD_REG_CON_MODE_CONFIG);
 	*reg = tmp;
@@ -1439,15 +1441,17 @@ static inline int mcp251xfd_init_tx_queue(const struct device *dev)
 	uint32_t *reg = mcp251xfd_get_spi_buf_ptr(dev);
 	uint32_t tmp;
 
-	tmp = MCP251XFD_REG_TXQCON_TXEN | MCP251XFD_REG_TXQCON_FRESET;
-	tmp |= FIELD_PREP(MCP251XFD_REG_TXQCON_TXAT_MASK, MCP251XFD_REG_TXQCON_TXAT_UNLIMITED);
-	tmp |= FIELD_PREP(MCP251XFD_REG_TXQCON_FSIZE_MASK, MCP251XFD_TX_QUEUE_ITEMS - 1);
-	tmp |= FIELD_PREP(MCP251XFD_REG_TXQCON_PLSIZE_MASK,
+	// LOCAL PATCH: configure the TX FIFO rather than the TXQ.
+	tmp = MCP251XFD_REG_FIFOCON_TXEN | MCP251XFD_REG_FIFOCON_FRESET;
+	tmp |= FIELD_PREP(MCP251XFD_REG_FIFOCON_TXAT_MASK, MCP251XFD_REG_FIFOCON_TXAT_UNLIMITED);
+	tmp |= FIELD_PREP(MCP251XFD_REG_FIFOCON_FSIZE_MASK, MCP251XFD_TX_QUEUE_ITEMS - 1);
+	tmp |= FIELD_PREP(MCP251XFD_REG_FIFOCON_PLSIZE_MASK,
 			  can_bytes_to_dlc(MCP251XFD_PAYLOAD_SIZE) - 8);
 
 	*reg = sys_cpu_to_le32(tmp);
 
-	return mcp251xfd_write(dev, MCP251XFD_REG_TXQCON, MCP251XFD_REG_SIZE);
+	return mcp251xfd_write(dev, MCP251XFD_REG_FIFOCON(MCP251XFD_TX_FIFO_IDX),
+			       MCP251XFD_REG_SIZE);
 }
 
 static inline int mcp251xfd_init_rx_fifo(const struct device *dev)
