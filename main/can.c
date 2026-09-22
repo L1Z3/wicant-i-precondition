@@ -92,17 +92,18 @@ static EventGroupHandle_t s_can_event_group = NULL;
 static can_tx_slot_t tx_slot[CAN_BUS_COUNT][CAN_TX_SLOT_COUNT];
 // Counting semaphore whose count == number of free TX slots
 // can_send() takes it with the caller's timeout.
-// can_on_tx_done() gives it back from ISR context.
+// can_on_tx_done() gives it back from the driver callback.
 // Ordering rule: take BEFORE node_lock, never while holding it.
 static SemaphoreHandle_t tx_slot_sem[CAN_BUS_COUNT];
 // Bitmask that tracks which slots are free, guarded by tx_slot_num
 static uint32_t tx_slot_used[CAN_BUS_COUNT];
 // Spinlock for the slot bitmask above, which is the one piece of TX state
-// shared with ISR context (can_on_tx_done), so we can't use a mutex.
+// shared with driver callbacks (can_on_tx_done, possibly in ISR context), so
+// we can't use a mutex.
 static portMUX_TYPE tx_slot_mux = portMUX_INITIALIZER_UNLOCKED;
 
 // RX frames lost because the shared rx queue was full (rx task too slow).
-// Incremented from can_on_rx_done (ISR context), logged rate-limited from
+// Incremented from can_on_rx_done (driver callback), logged rate-limited from
 // can_receive() in task context.
 static volatile uint32_t rx_drop_count[CAN_BUS_COUNT];
 static uint32_t rx_drop_logged[CAN_BUS_COUNT];
@@ -114,16 +115,19 @@ static int64_t rx_drop_log_us[CAN_BUS_COUNT];
 static uint32_t tx_drop_count[CAN_BUS_COUNT];
 static int64_t tx_drop_log_us[CAN_BUS_COUNT];
 
-// Bus-off recovery: neither driver recovers on its own, so a state-change
-// callback (ISR) flags the bus and wakes a task that recreates the node.
-// Full recreate rather than twai_node_recover(): the frame in flight at
-// bus-off gets no on_tx_done, so bare recovery would leak one TX slot per
-// bus-off; teardown + can_tx_slots_reset starts clean.
+// Bus-off recovery: a state-change callback flags the bus and wakes a task
+// that recreates the node. Full recreate rather than twai_node_recover(): on
+// some drivers the frame in flight at bus-off gets no on_tx_done, so bare
+// recovery would leak one TX slot per bus-off; teardown + can_tx_slots_reset
+// starts clean.
 static TaskHandle_t can_recovery_task_handle = NULL;
-static volatile uint32_t can_busoff_pending;	// bitmask, set from ISR
+static volatile uint32_t can_busoff_pending;	// bitmask, set from driver callbacks
 static uint32_t can_busoff_count[CAN_BUS_COUNT];
 
-// Callback to receive frames from driver (ISR context): drain the frame out
+// Driver callbacks run in ISR context for the on-chip controller and in a
+// driver task for the SPI controllers, so they pick FreeRTOS APIs to match.
+
+// Callback to receive frames from driver: drain the frame out
 // of the hardware, tag it with its bus, and hand it to can_receive() via the
 // shared queue--all protocol work happens later in task context
 static bool can_on_rx_done(twai_node_handle_t handle, const twai_rx_done_event_data_t *edata, void *user_ctx)
@@ -159,14 +163,16 @@ static bool can_on_rx_done(twai_node_handle_t handle, const twai_rx_done_event_d
 	// task_woken -> tell the driver to context-switch on ISR exit if this
 	// send unblocked a higher-priority task (i.e. can_rx_task).
 	BaseType_t task_woken = pdFALSE;
-	if (xQueueSendFromISR(can_rx_queue, &item, &task_woken) != pdTRUE)
+	BaseType_t sent = xPortInIsrContext() ? xQueueSendFromISR(can_rx_queue, &item, &task_woken)
+										  : xQueueSend(can_rx_queue, &item, 0);
+	if (sent != pdTRUE)
 	{
 		rx_drop_count[item.bus]++;
 	}
 	return (task_woken == pdTRUE);
 }
 
-// Callback when the driver finishes transmitting a frame (ISR context):
+// Callback when the driver finishes (or abandons) a transmitted frame:
 // return its backing TX slot to the pool. This is the only thing that
 // replenishes the slots a can_send() may be blocked waiting on.
 static bool can_on_tx_done(twai_node_handle_t handle, const twai_tx_done_event_data_t *edata, void *user_ctx)
@@ -178,14 +184,21 @@ static bool can_on_tx_done(twai_node_handle_t handle, const twai_tx_done_event_d
 	// recover the slot containing it
 	can_tx_slot_t *slot = __containerof(edata->done_tx_frame, can_tx_slot_t, frame);
 
-	portENTER_CRITICAL_ISR(&tx_slot_mux);
+	portENTER_CRITICAL_SAFE(&tx_slot_mux);
 	tx_slot_used[bus] &= ~BIT(slot - &tx_slot[bus][0]);
-	portEXIT_CRITICAL_ISR(&tx_slot_mux);
+	portEXIT_CRITICAL_SAFE(&tx_slot_mux);
 
 	// Release the count so a blocked can_send() can claim the slot;
 	// task_woken as in can_on_rx_done
 	BaseType_t task_woken = pdFALSE;
-	xSemaphoreGiveFromISR(tx_slot_sem[bus], &task_woken);
+	if (xPortInIsrContext())
+	{
+		xSemaphoreGiveFromISR(tx_slot_sem[bus], &task_woken);
+	}
+	else
+	{
+		xSemaphoreGive(tx_slot_sem[bus]);
+	}
 	return (task_woken == pdTRUE);
 }
 
@@ -203,7 +216,14 @@ static bool can_on_state_change(twai_node_handle_t handle, const twai_state_chan
 	BaseType_t task_woken = pdFALSE;
 	if (can_recovery_task_handle != NULL)
 	{
-		vTaskNotifyGiveFromISR(can_recovery_task_handle, &task_woken);
+		if (xPortInIsrContext())
+		{
+			vTaskNotifyGiveFromISR(can_recovery_task_handle, &task_woken);
+		}
+		else
+		{
+			xTaskNotifyGive(can_recovery_task_handle);
+		}
 	}
 	return (task_woken == pdTRUE);
 }
@@ -220,7 +240,16 @@ static void can_recovery_task(void *arg)
 		uint32_t pending = __atomic_exchange_n(&can_busoff_pending, 0, __ATOMIC_SEQ_CST);
 		for (int bus = 0; bus < CAN_BUS_COUNT; bus++)
 		{
-			if (!(pending & BIT(bus)) || !can_is_enabled((can_bus_t)bus))
+			if (!(pending & BIT(bus)))
+			{
+				continue;
+			}
+			// A driver can report bus-off while can_enable() is still
+			// publishing the enabled state; wait for it to finish.
+			xSemaphoreTake(node_lock[bus], portMAX_DELAY);
+			bool enabled = can_is_enabled((can_bus_t)bus);
+			xSemaphoreGive(node_lock[bus]);
+			if (!enabled)
 			{
 				pending &= ~BIT(bus);
 				continue;
@@ -817,11 +846,10 @@ esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_w
 	// guaranteed), and staying non-blocking keeps the node_lock hold short
 	esp_err_t err = twai_node_transmit(can_node[bus], &slot->frame, 0);
 
-	xSemaphoreGive(node_lock[bus]);
-
 	if (err != ESP_OK)
 	{
-		// Frame never reached the driver: put the slot straight back
+		// Frame never reached the driver: put the slot straight back, before
+		// releasing node_lock so a bus recreate can't reuse it meanwhile
 		portENTER_CRITICAL(&tx_slot_mux);
 		tx_slot_used[bus] &= ~BIT(slot - &tx_slot[bus][0]);
 		portEXIT_CRITICAL(&tx_slot_mux);
@@ -832,6 +860,7 @@ esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_w
 			ESP_LOGE(TAG, "bus %d: transmit failed: %s", bus, esp_err_to_name(err));
 		}
 	}
+	xSemaphoreGive(node_lock[bus]);
 	return err;
 }
 
