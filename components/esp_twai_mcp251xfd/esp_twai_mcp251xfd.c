@@ -341,6 +341,11 @@ static esp_err_t create(spi_host_device_t host, const twai_mcp251xfd_node_config
 		ESP_LOGE(TAG, "controller initialization failed: %d", ret);
 		node->init_error = esp_err_from(ret);
 	} else {
+		// Initialization went through ESP-IDF's SPI driver, which has now
+		// configured the bus for this device; drive it directly from here on.
+		k_mutex_lock(&node->data.mutex, K_FOREVER);
+		node->config.bus.hw = SPI_LL_GET_HW(host);
+		k_mutex_unlock(&node->data.mutex);
 		can_set_state_change_callback(&node->dev, state_changed, node);
 	}
 	s_node = node;

@@ -57,4 +57,8 @@ release, reapply the patches, and check the driver for new API use.
   filters, `get_info`, `recover`, `reconfig_timing` and
   `transmit_wait_all_done`.
 - **SPI.** Every transfer is at most 18 bytes, so the bus runs without DMA. The
-  node reserves the bus.
+  node reserves the bus. Initialization uses ESP-IDF's SPI driver; after that,
+  transfers program the peripheral directly through ESP-IDF's low-level HAL
+  (`hal/spi_ll.h`), reusing the bus configuration the driver set up. This
+  roughly halves the cost of each transfer, but depends on ESP-IDF internals
+  and on the node being the only device on its SPI bus.
