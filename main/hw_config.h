@@ -88,7 +88,9 @@
 #define MCP2518FD_MISO_GPIO_NUM      15
 #define MCP2518FD_CS_GPIO_NUM        18
 #define MCP2518FD_INT_GPIO_NUM       7
-#define MCP2518FD_SPI_CLOCK_HZ       10000000
+// 80/5 MHz. MCP2518FD allows 17 MHz at a 40 MHz SYSCLK, but its 20 ns SDO
+// valid time leaves ~11 ns of MISO margin at 16 MHz through the GPIO matrix.
+#define MCP2518FD_SPI_CLOCK_HZ       16000000
 #define MCP2518FD_OSCILLATOR_HZ      40000000
 
 #endif
