@@ -26,6 +26,7 @@ typedef struct {
 	int filters[2];
 	bool listen_only;
 	bool in_use;
+	bool asleep;
 	esp_err_t init_error;
 } mcp251xfd_node_t;
 
@@ -151,8 +152,58 @@ static esp_err_t node_disable(twai_node_handle_t handle)
 	return esp_err_from(can_stop(&node_of(handle)->dev));
 }
 
-// Releases the node for the next twai_new_node_mcp251xfd(); the controller
-// stays initialized in configuration mode.
+// Sleep mode stops the controller's oscillator (15 uA typical instead of
+// ~15 mA) but keeps its registers and RAM, so it wakes up configured. Low
+// Power Mode draws less but loses both, and the driver initializes only once.
+// Without CiINT.WAKIE, bus activity does not wake it.
+static int controller_sleep(mcp251xfd_node_t *node)
+{
+	const struct device *dev = &node->dev;
+	int ret;
+
+	k_mutex_lock(&node->data.mutex, K_FOREVER);
+	// Release INT first: entering Sleep sets MODIF, and an asserted INT would
+	// otherwise stay low for as long as the controller sleeps.
+	uint32_t *reg = mcp251xfd_get_spi_buf_ptr(dev);
+	*reg = 0;
+	ret = mcp251xfd_write(dev, MCP251XFD_REG_INT, MCP251XFD_REG_SIZE);
+	reg = ret < 0 ? NULL : mcp251xfd_read_crc(dev, MCP251XFD_REG_CON, MCP251XFD_REG_SIZE);
+	ret = -EIO;
+	if (reg) {
+		uint32_t con = sys_le32_to_cpu(*reg) & ~MCP251XFD_REG_CON_REQOP_MASK;
+
+		*reg = sys_cpu_to_le32(con | FIELD_PREP(MCP251XFD_REG_CON_REQOP_MASK,
+							MCP251XFD_REG_CON_MODE_SLEEP));
+		ret = mcp251xfd_write(dev, MCP251XFD_REG_CON, MCP251XFD_REG_SIZE);
+	}
+	// OPMOD keeps reading as Configuration mode; OSCDIS is the handshake.
+	if (ret == 0) {
+		ret = mcp251xfd_reg_check_value_wtimeout(dev, MCP251XFD_REG_OSC,
+							 MCP251XFD_REG_OSC_OSCDIS,
+							 MCP251XFD_REG_OSC_OSCDIS,
+							 MCP251XFD_MODE_CHANGE_TIMEOUT_USEC,
+							 MCP251XFD_MODE_CHANGE_RETRIES, true);
+	}
+	k_mutex_unlock(&node->data.mutex);
+	return ret;
+}
+
+// Writing OSC with OSCDIS clear wakes the controller into Configuration mode;
+// the driver's initialization helper does that and waits for OSCRDY (at most
+// 3 ms). Then restore the interrupt enables that controller_sleep() cleared.
+static int controller_wake(mcp251xfd_node_t *node)
+{
+	k_mutex_lock(&node->data.mutex, K_FOREVER);
+	int ret = mcp251xfd_init_osc_reg(&node->dev);
+	if (ret == 0) {
+		ret = mcp251xfd_init_int_reg(&node->dev);
+	}
+	k_mutex_unlock(&node->data.mutex);
+	return ret;
+}
+
+// Releases the node for the next twai_new_node_mcp251xfd() and puts the
+// controller to sleep until then.
 static esp_err_t node_delete(twai_node_handle_t handle)
 {
 	mcp251xfd_node_t *node = node_of(handle);
@@ -162,6 +213,12 @@ static esp_err_t node_delete(twai_node_handle_t handle)
 	}
 	node->callbacks = (twai_event_callbacks_t){};
 	node->in_use = false;
+	int ret = controller_sleep(node);
+	if (ret < 0) {
+		// The node is still released; the next creation wakes it regardless.
+		ESP_LOGW(TAG, "controller sleep failed: %d", ret);
+	}
+	node->asleep = true;
 	return ESP_OK;
 }
 
@@ -334,6 +391,11 @@ static esp_err_t create(spi_host_device_t host, const twai_mcp251xfd_node_config
 	};
 	node->filters[0] = node->filters[1] = NO_FILTER;
 
+	// A software restart leaves the controller as it was, possibly asleep
+	// (see node_delete()). Wake it so initialization can reset it; failures
+	// surface from initialization itself.
+	mcp251xfd_init_osc_reg(&node->dev);
+
 	// Starts the driver's interrupt thread, which references the node, so the
 	// node is kept even if initialization fails.
 	int ret = mcp251xfd_init(&node->dev);
@@ -361,6 +423,11 @@ esp_err_t twai_new_node_mcp251xfd(spi_host_device_t host, const twai_mcp251xfd_n
 	}
 	ESP_RETURN_ON_FALSE(!s_node->in_use, ESP_ERR_INVALID_STATE, TAG, "node already in use");
 	ESP_RETURN_ON_ERROR(s_node->init_error, TAG, "controller unavailable until restart");
+	if (s_node->asleep) {
+		int ret = controller_wake(s_node);
+		ESP_RETURN_ON_FALSE(ret >= 0, esp_err_from(ret), TAG, "controller wake failed: %d", ret);
+		s_node->asleep = false;
+	}
 	ESP_RETURN_ON_ERROR(configure(s_node, config), TAG, "configure failed");
 	s_node->in_use = true;
 	*node_ret = &s_node->base;

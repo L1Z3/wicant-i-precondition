@@ -28,9 +28,10 @@ typedef struct {
 // service. The node reserves the SPI bus for itself.
 //
 // There is a single node, initialized on the first call and never freed:
-// twai_node_delete() releases it, and the next call reuses it with the new bit
-// timing and mode. SPI, pins and oscillator come from the first call. If
-// initialization fails, later calls fail too until restart.
+// twai_node_delete() releases it and puts the controller in Sleep mode, and
+// the next call wakes it and applies the new bit timing and mode. SPI, pins
+// and oscillator come from the first call. If initialization fails, later
+// calls fail too until restart.
 //
 // Callbacks run in the driver's thread rather than an ISR, including
 // on_tx_done for frames that twai_node_disable() aborts. Frames retry until

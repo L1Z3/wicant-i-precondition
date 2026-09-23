@@ -37,10 +37,17 @@ release, reapply the patches, and check the driver for new API use.
 
 - **One node.** The first `twai_new_node_mcp251xfd()` initializes the
   controller and starts the driver's thread. Zephyr drivers have no teardown,
-  so `twai_node_delete()` leaves the controller in configuration mode, and the
-  next call applies new bit timing, mode and filters. If initialization fails,
-  the node stays unavailable until restart. The controller is not put into
-  low-power mode.
+  so `twai_node_delete()` keeps the controller, and the next call applies new
+  bit timing, mode and filters. If initialization fails, the node stays
+  unavailable until restart.
+- **Sleep.** `twai_node_delete()` puts the controller in Sleep mode: the
+  oscillator stops (15 uA typical instead of ~15 mA) and registers and RAM are
+  kept, so the next creation wakes it, waits up to 3 ms for the oscillator and
+  carries on. Low Power Mode would draw 4 uA but loses the configuration,
+  which the driver cannot rebuild. Bus activity does not wake the controller.
+  Interrupt enables are cleared while asleep so INT is released. The
+  controller has its own power, so it can still be asleep after an
+  `esp_restart()`; the first creation wakes it before initializing.
 - **Threads.** A level-triggered INT interrupt wakes the driver's thread
   (priority 20, core 1), which services RX, TX completion and errors and runs
   all callbacks. `transmit()` writes the frame over SPI from the caller's task
