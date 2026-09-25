@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Fully clean firmware build dir(s): ./clean {v300|custom|all}
+# Fully clean firmware build dir(s): ./clean.sh {v300|proto|eb-fd|all}
 
 set -euo pipefail
 cd "$(dirname "$0")"
 
 usage() {
-    echo "usage: ${0##*/} {v300|custom|all}" >&2
+    echo "usage: ${0##*/} {v300|proto|eb-fd|all}" >&2
     exit 2
 }
 [ $# -eq 1 ] || usage
@@ -30,12 +30,13 @@ clean_one() {
 }
 
 case "$1" in
-    v300|custom)
+    v300|proto|eb-fd)
         clean_one "$1"
         ;;
     all)
         clean_one v300
-        clean_one custom
+        clean_one proto
+        clean_one eb-fd
         ;;
     *)
         usage

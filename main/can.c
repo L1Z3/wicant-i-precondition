@@ -451,6 +451,9 @@ void can_enable(can_bus_t bus)
 	{
 #if HW_HAS_MCP2515
 		err = can_bus1_create_node();
+#elif HW_HAS_MCP2518FD
+		ESP_LOGE(TAG, "bus %d: MCP2518FD driver not yet integrated", bus);
+		err = ESP_ERR_NOT_SUPPORTED;
 #else
 		err = ESP_ERR_NOT_SUPPORTED;
 #endif
