@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Build firmware variant(s): ./build {v300|custom|all}
+# Build firmware variant(s): ./build.sh {v300|proto|eb-fd|all}
 
 set -euo pipefail
 cd "$(dirname "$0")"
 
 usage() {
-    echo "usage: ${0##*/} {v300|custom|all}" >&2
+    echo "usage: ${0##*/} {v300|proto|eb-fd|all}" >&2
     exit 2
 }
 [ $# -eq 1 ] || usage
@@ -22,13 +22,14 @@ build_one() {
 }
 
 case "$1" in
-    v300|custom)
+    v300|proto|eb-fd)
         build_one "$1"
         ;;
     all)
         build_one v300
-        build_one custom
-        echo "=== both variants built OK ==="
+        build_one proto
+        build_one eb-fd
+        echo "=== all variants built OK ==="
         ;;
     *)
         usage

@@ -1,7 +1,7 @@
-# Shared intentional config deltas for both hardware variants.
+# Shared intentional config deltas for all hardware variants.
 # Generated with idf.py save-defconfig from the previously upstream C3
 # sdkconfig, then split: target-specific bits live in
-# sdkconfig.defaults.esp32c3 (V300) / sdkconfig.defaults.esp32s3 (custom).
+# sdkconfig.defaults.esp32c3 (V300) / sdkconfig.defaults.esp32s3 (proto/eb-fd).
 # The generated sdkconfig itself lives in the build dir and is not committed.
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 CONFIG_APP_RETRIEVE_LEN_ELF_SHA=16

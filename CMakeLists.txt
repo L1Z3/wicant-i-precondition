@@ -4,19 +4,25 @@ cmake_minimum_required(VERSION 3.5)
 
 # 1, 3, 4 are other WiCAN variants not supported by this branch
 set(WICAN_V300 2)
-set(WICAN_CUSTOM 5)
+set(WICAN_PROTO 5)
+set(WICAN_EB_FD 6)
 
-# Variant selection: override with idf.py -DHARDWARE_VER_NAME=custom.
-# The variant implies the chip target (V300 = ESP32-C3, custom = ESP32-S3),
+# Variant selection: override with idf.py -DHARDWARE_VER_NAME=proto.
+# The variant implies the chip target (V300 = ESP32-C3, proto/eb-fd = ESP32-S3),
 # so the right sdkconfig.defaults.<target> file is picked up automatically.
 if(NOT DEFINED HARDWARE_VER_NAME)
-    set(HARDWARE_VER_NAME "custom")
+    set(HARDWARE_VER_NAME "proto")
 endif()
 
-if(HARDWARE_VER_NAME STREQUAL "custom")
-    set(HARDWARE_VER ${WICAN_CUSTOM})
-    set(HW_VER "CUSTOM")
-    set(HW_PREF "custom")
+if(HARDWARE_VER_NAME STREQUAL "proto")
+    set(HARDWARE_VER ${WICAN_PROTO})
+    set(HW_VER "PROTO")
+    set(HW_PREF "proto")
+    set(HW_TARGET "esp32s3")
+elseif(HARDWARE_VER_NAME STREQUAL "eb-fd")
+    set(HARDWARE_VER ${WICAN_EB_FD})
+    set(HW_VER "EB-FD")
+    set(HW_PREF "eb-fd")
     set(HW_TARGET "esp32s3")
 elseif(HARDWARE_VER_NAME STREQUAL "v300")
     set(HARDWARE_VER ${WICAN_V300})
@@ -24,7 +30,7 @@ elseif(HARDWARE_VER_NAME STREQUAL "v300")
     set(HW_PREF "obd")
     set(HW_TARGET "esp32c3")
 else()
-    message(FATAL_ERROR "Unknown HARDWARE_VER_NAME '${HARDWARE_VER_NAME}' (expected 'v300' or 'custom')")
+    message(FATAL_ERROR "Unknown HARDWARE_VER_NAME '${HARDWARE_VER_NAME}' (expected 'v300', 'proto', or 'eb-fd')")
 endif()
 
 # Default the chip target from the variant (overridable with -DIDF_TARGET or
@@ -41,7 +47,7 @@ if(NOT EFFECTIVE_IDF_TARGET STREQUAL HW_TARGET)
     message(FATAL_ERROR "Variant '${HARDWARE_VER_NAME}' requires IDF_TARGET=${HW_TARGET}, got '${EFFECTIVE_IDF_TARGET}'")
 endif()
 
-# Keep the generated sdkconfig inside the build dir so the two hardware
+# Keep the generated sdkconfig inside the build dir so the hardware
 # variants (separate build dirs, different IDF targets) don't fight over
 # a single top-level sdkconfig file.
 if(NOT DEFINED SDKCONFIG)
@@ -51,7 +57,8 @@ endif()
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 add_definitions(-DWICAN_V300=${WICAN_V300})
-add_definitions(-DWICAN_CUSTOM=${WICAN_CUSTOM})
+add_definitions(-DWICAN_PROTO=${WICAN_PROTO})
+add_definitions(-DWICAN_EB_FD=${WICAN_EB_FD})
 add_definitions(-DHARDWARE_VER=${HARDWARE_VER})
 add_definitions(-DHARDWARE_VERSION="${HW_VER}")
 
