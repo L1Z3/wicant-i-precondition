@@ -51,12 +51,20 @@ In `zephyr/drivers/can/can_mcp251xfd.{c,h}`, each marked `LOCAL PATCH`:
 
 ## Behaviour
 
-- **One node.** The first `twai_new_node_mcp251xfd()` initializes the
-  controller and starts the driver's thread. Zephyr drivers have no teardown,
-  so `twai_node_delete()` leaves the controller in configuration mode, and the
-  next call applies new bit timing, mode and filters. If initialization fails,
-  the node stays unavailable until restart. The controller is not put into
-  low-power mode.
+- **One node.** The first `twai_new_node_mcp251xfd()` initializes the driver
+  and starts its thread. Zephyr drivers have no teardown, so
+  `twai_node_delete()` keeps the node, and every call, the first included,
+  resets the controller and redoes the driver's register setup
+  (`controller_reset()`, retried like Linux's soft reset) before applying bit
+  timing, mode and filters. Only a failure to set up the INT pin leaves the
+  node unavailable until restart. If `twai_node_disable()` fails to stop the
+  controller, `twai_node_delete()` resets it and still releases the node.
+- **Sleep.** `twai_node_delete()` puts the controller in Low Power Mode:
+  4 uA typical instead of ~15 mA, losing registers and RAM, which the next
+  reset rebuilds. Any SPI access wakes it, so it waits for the driver's
+  thread to finish first; bus activity does not wake it. Unlike Sleep mode,
+  which keeps the registers, waking doesn't clear `OSCDIS`, so [erratum
+  DS80000789 #7][errata] (a wake that doesn't last) doesn't apply.
 - **RX filters.** By default all standard and extended frames are accepted.
   Mask filter 0 replaces that. Upstream's filter removal also clears the next
   three filters' enable bits, so the adapter always removes every filter before

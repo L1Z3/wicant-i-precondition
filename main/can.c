@@ -448,6 +448,14 @@ static esp_err_t can_mcp2518fd_bus_init(void)
 	{
 		return err;
 	}
+	// SDO is high-impedance between transfers, and floating raises the
+	// controller's Sleep current (MCP2518FD datasheet, SPI section)
+	gpio_pullup_en(MCP2518FD_MISO_GPIO_NUM);
+	// esp_restart() resets only the CPUs: INT's level-triggered interrupt
+	// stays enabled while the controller, powered separately, may hold INT
+	// low. Clear it before the ISR service exists, or it fires without a
+	// handler until the interrupt watchdog resets the chip, repeatedly.
+	gpio_reset_pin(MCP2518FD_INT_GPIO_NUM);
 
 	err = gpio_install_isr_service(0);
 	if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)	// INVALID_STATE = already installed
