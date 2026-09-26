@@ -1272,13 +1272,16 @@ static int mcp251xfd_stop(const struct device *dev)
 	}
 
 	/* wait for all the messages to be aborted */
-	while (1) {
-		reg_byte = mcp251xfd_read_crc(dev, MCP251XFD_REG_CON_B3, 1);
-
-		if (!reg_byte ||
-		    (*reg_byte & MCP251XFD_UINT32_FLAG_TO_BYTE_MASK(MCP251XFD_REG_CON_ABAT)) == 0) {
-			break;
-		}
+	// LOCAL PATCH: bound the wait. Upstream polls without a limit or a pause
+	// until ABAT clears, so a controller that never clears it (no clock)
+	// hangs this task with the driver's mutex held. Upstream also carries on
+	// after a failed read; now either failure fails the stop.
+	ret = mcp251xfd_reg_check_value_wtimeout(dev, MCP251XFD_REG_CON, 0, MCP251XFD_REG_CON_ABAT,
+						 MCP251XFD_MODE_CHANGE_TIMEOUT_USEC,
+						 MCP251XFD_MODE_CHANGE_RETRIES, true);
+	if (ret < 0) {
+		k_mutex_unlock(&dev_data->mutex);
+		return ret;
 	}
 
 	mcp251xfd_reset_tx_fifos(dev, -ENETDOWN);
