@@ -1031,12 +1031,17 @@ static void mcp251xfd_handle_interrupts(const struct device *dev)
 	uint8_t consecutive_calls = 0;
 
 	while (1) {
+		bool progress = false;
+
 		k_mutex_lock(&dev_data->mutex, K_FOREVER);
 		reg_int_hw = mcp251xfd_read_crc(dev, MCP251XFD_REG_INT, sizeof(*reg_int_hw));
 
 		if (!reg_int_hw) {
 			k_mutex_unlock(&dev_data->mutex);
-			continue;
+			// LOCAL PATCH: treat a failed read as a pass without progress,
+			// subject to the INT pin check and back-off. Upstream retries at
+			// once, spinning this thread for as long as reads keep failing.
+			goto check_int_pin;
 		}
 
 		*reg_int_hw = sys_le16_to_cpu(*reg_int_hw);
@@ -1063,6 +1068,8 @@ static void mcp251xfd_handle_interrupts(const struct device *dev)
 							 MCP251XFD_FIFO_TYPE_RX);
 			if (ret < 0) {
 				LOG_ERR("Error handling RXIF [%d]", ret);
+			} else {
+				progress = true;
 			}
 		}
 
@@ -1071,6 +1078,8 @@ static void mcp251xfd_handle_interrupts(const struct device *dev)
 							 MCP251XFD_FIFO_TYPE_TEF);
 			if (ret < 0) {
 				LOG_ERR("Error handling TEFIF [%d]", ret);
+			} else {
+				progress = true;
 			}
 		}
 
@@ -1110,15 +1119,20 @@ static void mcp251xfd_handle_interrupts(const struct device *dev)
 		}
 #endif
 
+check_int_pin:
 		/* Break from loop if INT pin is inactive */
-		consecutive_calls++;
+		// LOCAL PATCH: count only passes that moved no RX or TEF object.
+		// Upstream counts every pass, and with one object per pass (erratum
+		// #6 above) any burst of ten frames paused servicing.
+		consecutive_calls = progress ? 0 : consecutive_calls + 1;
 		ret = gpio_pin_get_dt(&dev_cfg->int_gpio_dt);
 		if (ret < 0) {
 			LOG_ERR("Couldn't read INT pin [%d]", ret);
 		} else if (ret == 0) {
 			/* All interrupt flags handled */
 			break;
-		} else if (consecutive_calls % MCP251XFD_MAX_INT_HANDLER_CALLS == 0) {
+		} else if (consecutive_calls >= MCP251XFD_MAX_INT_HANDLER_CALLS) {
+			consecutive_calls = 0;
 			/* If there are clock problems, then MODIF cannot be cleared. */
 			/* This is detected if there are too many consecutive calls. */
 			/* Sleep this thread if this happens. */
