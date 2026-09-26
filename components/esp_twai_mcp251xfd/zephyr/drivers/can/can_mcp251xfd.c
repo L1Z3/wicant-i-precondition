@@ -718,7 +718,9 @@ static int mcp251xfd_get_state(const struct device *dev, enum can_state *state,
 
 done:
 	k_mutex_unlock(&dev_data->mutex);
-	return 0;
+	// LOCAL PATCH: report a failed TREC read. Upstream returns 0, and
+	// handle_cerrif() then publishes an uninitialized state.
+	return ret;
 }
 
 static int mcp251xfd_get_core_clock(const struct device *dev, uint32_t *rate)
@@ -1029,6 +1031,8 @@ static void mcp251xfd_handle_interrupts(const struct device *dev)
 	uint32_t reg_int;
 	int ret;
 	uint8_t consecutive_calls = 0;
+	// LOCAL PATCH: a state read failed after CERRIF was cleared (see below).
+	bool state_pending = false;
 
 	while (1) {
 		bool progress = false;
@@ -1103,11 +1107,17 @@ static void mcp251xfd_handle_interrupts(const struct device *dev)
 		 * TX ERROR_WARNING -> TX ERROR_ACTIVE.
 		 */
 		if ((reg_int & MCP251XFD_REG_INT_CERRIF) ||
-		    dev_data->state > CAN_STATE_ERROR_ACTIVE) {
+		    dev_data->state > CAN_STATE_ERROR_ACTIVE || state_pending) {
 			ret = mcp251xfd_handle_cerrif(dev);
 			if (ret < 0) {
 				LOG_ERR("Error handling CERRIF [%d]", ret);
 			}
+			// LOCAL PATCH: CERRIF is already cleared and won't be set again
+			// until the next threshold crossing, so a failed read would lose
+			// this state change (error-passive on a silent bus, say) for good.
+			// Keep retrying, with the back-off below, even once INT is
+			// released, while the controller is started (see below).
+			state_pending = ret < 0;
 		}
 
 #if defined(CONFIG_CAN_STATS)
@@ -1128,7 +1138,11 @@ check_int_pin:
 		ret = gpio_pin_get_dt(&dev_cfg->int_gpio_dt);
 		if (ret < 0) {
 			LOG_ERR("Couldn't read INT pin [%d]", ret);
-		} else if (ret == 0) {
+		} else if (ret == 0 && !(state_pending && dev_data->common.started)) {
+			// LOCAL PATCH: a pending state read holds the loop only while the
+			// controller is started: a stopped one only reports STOPPED, and
+			// retries would keep accessing it indefinitely. Checked here, as
+			// a failed CiINT read skips handle_cerrif().
 			/* All interrupt flags handled */
 			break;
 		} else if (consecutive_calls >= MCP251XFD_MAX_INT_HANDLER_CALLS) {
