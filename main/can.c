@@ -54,6 +54,7 @@ enum bus_state
 typedef struct {
 	twai_frame_t frame;
 	uint8_t data[TWAI_FRAME_MAX_LEN];
+	int64_t queued_us;	// when can_send() claimed the slot, for stall detection
 } can_tx_slot_t;
 
 typedef struct {
@@ -120,13 +121,39 @@ static int64_t rx_drop_log_us[CAN_BUS_COUNT];
 static uint32_t tx_drop_count[CAN_BUS_COUNT];
 static int64_t tx_drop_log_us[CAN_BUS_COUNT];
 
-// Bus-off recovery: a state-change callback flags the bus and wakes a task
-// that recreates the node. Full recreate rather than twai_node_recover(): on
-// some drivers the frame in flight at bus-off gets no on_tx_done, so bare
-// recovery would leak one TX slot per bus-off; teardown + can_tx_slots_reset
-// starts clean.
+// TX stall detection. A bus whose peers have all stopped acknowledging never
+// reaches bus-off: an error-passive transmitter's error count stops rising on
+// ACK errors (ISO 11898-1), so the controller retries one frame forever. Seen
+// on bus 1 with a head unit that went silent after a traffic flood and only
+// came back once the bus went quiet. Every CAN_TX_STALL_CHECK_MS the recovery
+// task checks each error-passive bus, and recovers it if its oldest
+// outstanding frame has waited over CAN_TX_STALL_US. Frames complete in
+// submission order, so that frame is the one being retried. Losing
+// arbitration on a busy bus never makes a controller error-passive, so that
+// alone doesn't trigger it.
+#define CAN_TX_STALL_US 1000000
+#define CAN_TX_STALL_CHECK_MS 250
+// Error-passive per the last state change, set in can_on_state_change()
+static volatile bool bus_err_passive[CAN_BUS_COUNT];
+// Recovery only helps a bus whose peers are there but starved. With no peer
+// at all (a head unit asleep while forwarding continues), every recovery
+// stalls again, and each one costs 250 ms of downtime and a flush of the
+// shared RX queue. So each stall recovery that no acknowledged frame follows
+// doubles the bus's threshold, up to 64 s; an acknowledged frame resets it.
+#define CAN_TX_STALL_BACKOFF_MAX 6
+static uint8_t tx_stall_backoff[CAN_BUS_COUNT];
+// A frame was acknowledged since the last stall check; set in can_on_tx_done()
+static bool tx_acked[CAN_BUS_COUNT];
+
+// Bus recovery: a bus-off state change flags the bus and wakes a task that
+// recreates the node; the task also finds TX stalls itself (see
+// CAN_TX_STALL_US). Full recreate rather than twai_node_recover(): on some
+// drivers the frame in flight at bus-off gets no on_tx_done, so bare recovery
+// would leak one TX slot per bus-off; teardown + can_tx_slots_reset starts
+// clean. The recreate also aborts whatever the controller was retrying and
+// leaves the bus quiet.
 static TaskHandle_t can_recovery_task_handle = NULL;
-static volatile uint32_t can_busoff_pending;	// bitmask, set from driver callbacks
+static volatile uint32_t can_busoff_pending;	// bitmask, set from driver callbacks and the stall check
 static uint32_t can_busoff_count[CAN_BUS_COUNT];
 
 // Driver callbacks run in ISR context for the on-chip controller and in a
@@ -192,6 +219,10 @@ static bool can_on_tx_done(twai_node_handle_t handle, const twai_tx_done_event_d
 	portENTER_CRITICAL_SAFE(&tx_slot_mux);
 	tx_slot_used[bus] &= ~BIT(slot - &tx_slot[bus][0]);
 	portEXIT_CRITICAL_SAFE(&tx_slot_mux);
+	if (edata->is_tx_success)
+	{
+		__atomic_store_n(&tx_acked[bus], true, __ATOMIC_RELAXED);
+	}
 
 	// Release the count so a blocked can_send() can claim the slot;
 	// task_woken as in can_on_rx_done
@@ -207,15 +238,10 @@ static bool can_on_tx_done(twai_node_handle_t handle, const twai_tx_done_event_d
 	return (task_woken == pdTRUE);
 }
 
-static bool can_on_state_change(twai_node_handle_t handle, const twai_state_change_event_data_t *edata, void *user_ctx)
+// Flag a bus for can_recovery_task(). Returns whether a higher-priority task
+// was woken (ISR context only).
+static bool can_request_recovery(can_bus_t bus)
 {
-	(void)handle;
-	if (edata->new_sta != TWAI_ERROR_BUS_OFF)
-	{
-		return false;
-	}
-
-	can_bus_t bus = (can_bus_t)(uintptr_t)user_ctx;
 	__atomic_fetch_or(&can_busoff_pending, BIT(bus), __ATOMIC_SEQ_CST);
 
 	BaseType_t task_woken = pdFALSE;
@@ -233,12 +259,67 @@ static bool can_on_state_change(twai_node_handle_t handle, const twai_state_chan
 	return (task_woken == pdTRUE);
 }
 
+static bool can_on_state_change(twai_node_handle_t handle, const twai_state_change_event_data_t *edata, void *user_ctx)
+{
+	(void)handle;
+	can_bus_t bus = (can_bus_t)(uintptr_t)user_ctx;
+	bus_err_passive[bus] = (edata->new_sta == TWAI_ERROR_PASSIVE);
+	if (edata->new_sta != TWAI_ERROR_BUS_OFF)
+	{
+		return false;
+	}
+	return can_request_recovery(bus);
+}
+
+// Flags every error-passive bus whose oldest outstanding frame has waited
+// over its stall threshold (see CAN_TX_STALL_BACKOFF_MAX).
+static void can_check_tx_stalls(void)
+{
+	int64_t now = esp_timer_get_time();
+
+	for (int bus = 0; bus < CAN_BUS_COUNT; bus++)
+	{
+		if (__atomic_exchange_n(&tx_acked[bus], false, __ATOMIC_RELAXED))
+		{
+			tx_stall_backoff[bus] = 0;
+		}
+		if (!bus_err_passive[bus] || !can_is_enabled((can_bus_t)bus))
+		{
+			continue;
+		}
+		int64_t oldest_us = now;
+		portENTER_CRITICAL(&tx_slot_mux);
+		for (int i = 0; i < CAN_TX_SLOT_COUNT; i++)
+		{
+			if ((tx_slot_used[bus] & BIT(i)) && tx_slot[bus][i].queued_us < oldest_us)
+			{
+				oldest_us = tx_slot[bus][i].queued_us;
+			}
+		}
+		portEXIT_CRITICAL(&tx_slot_mux);
+		if (now - oldest_us > ((int64_t)CAN_TX_STALL_US << tx_stall_backoff[bus]))
+		{
+			if (tx_stall_backoff[bus] < CAN_TX_STALL_BACKOFF_MAX)
+			{
+				tx_stall_backoff[bus]++;
+			}
+			ESP_LOGW(TAG, "bus %d: error-passive, oldest TX frame waiting %lld ms "
+					 "(next stall limit %d s unless a frame is acknowledged)",
+					 bus, (now - oldest_us) / 1000,
+					 (CAN_TX_STALL_US << tx_stall_backoff[bus]) / 1000000);
+			__atomic_fetch_or(&can_busoff_pending, BIT(bus), __ATOMIC_SEQ_CST);
+		}
+	}
+}
+
 static void can_recovery_task(void *arg)
 {
 	(void)arg;
 	while (1)
 	{
-		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+		// Woken for bus-off, and periodically to look for TX stalls
+		ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(CAN_TX_STALL_CHECK_MS));
+		can_check_tx_stalls();
 
 		// Tear down first so can_send() fails fast (bus enable bit cleared)
 		// instead of burning its full timeout per frame against a dead node.
@@ -260,7 +341,7 @@ static void can_recovery_task(void *arg)
 				continue;
 			}
 			can_busoff_count[bus]++;
-			ESP_LOGW(TAG, "bus %d: bus-off #%lu, recreating node (%lu TX dropped so far)",
+			ESP_LOGW(TAG, "bus %d: failure #%lu, recreating node (%lu TX dropped so far)",
 					 bus, can_busoff_count[bus], tx_drop_count[bus]);
 			can_disable((can_bus_t)bus);
 		}
@@ -291,6 +372,7 @@ static void can_tx_slots_reset(can_bus_t bus)
 	portENTER_CRITICAL(&tx_slot_mux);
 	tx_slot_used[bus] = 0;
 	portEXIT_CRITICAL(&tx_slot_mux);
+	bus_err_passive[bus] = false;
 	// Frames still queued in the driver at disable time are dropped without 
 	// an on_tx_done callback, so the semaphore must be refilled by hand.
 	while (xSemaphoreGive(tx_slot_sem[bus]) == pdTRUE)
@@ -899,6 +981,7 @@ esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_w
 	// if can_tx_slots_reset() refilled the semaphore while we held a permit
 	// waiting on node_lock (bus recreated under us) -- drop, don't assert.
 	can_tx_slot_t *slot = NULL;
+	int64_t now = esp_timer_get_time();
 	portENTER_CRITICAL(&tx_slot_mux);
 	for (int i = 0; i < CAN_TX_SLOT_COUNT; i++)
 	{
@@ -906,6 +989,9 @@ esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_w
 		{
 			tx_slot_used[bus] |= BIT(i);
 			slot = &tx_slot[bus][i];
+			// Stamped with the claim, so the stall check never sees a used
+			// slot with a stale time
+			slot->queued_us = now;
 			break;
 		}
 	}
