@@ -151,17 +151,155 @@ static esp_err_t node_disable(twai_node_handle_t handle)
 	return esp_err_from(can_stop(&node_of(handle)->dev));
 }
 
-// Releases the node for the next twai_new_node_mcp251xfd(); the controller
-// stays initialized in configuration mode.
+// The oscillator is stable within 3 ms of a power-on or wake (datasheet
+// TOSCSTAB, TOSCSLEEP). Linux's mcp251xfd driver waits as long, and retries its
+// reset three times.
+#define OSC_STAB_USEC  3000
+#define RESET_ATTEMPTS 3
+// Bounds the wait for the driver's thread in controller_sleep(), in 1-2 ms
+// sleeps. It only runs out if a controller fault keeps the thread retrying.
+#define IDLE_POLLS     100
+
+// Writing OSC wakes the controller: asserting nCS ends Low Power Mode (see
+// controller_sleep()), and clearing OSCDIS ends Sleep mode. The caller holds
+// the driver's mutex, or the driver isn't initialized yet.
+static void controller_wake(mcp251xfd_node_t *node)
+{
+	uint32_t *reg = mcp251xfd_get_spi_buf_ptr(&node->dev);
+
+	*reg = sys_cpu_to_le32(FIELD_PREP(MCP251XFD_REG_OSC_CLKODIV_MASK, node->config.clko_div));
+	(void)mcp251xfd_write(&node->dev, MCP251XFD_REG_OSC, MCP251XFD_REG_SIZE);
+	k_sleep(K_USEC(OSC_STAB_USEC));
+}
+
+// Brings the controller from any state (running, asleep, or partly set up) to
+// Configuration mode with mcp251xfd_init()'s register setup; configure() then
+// applies bit timing, mode and filters. Like
+// Linux's driver: wake the controller, reset it, and check that it's awake.
+static int controller_reset(mcp251xfd_node_t *node)
+{
+	const struct device *dev = &node->dev;
+	int ret = -EIO;
+
+	k_mutex_lock(&node->data.mutex, K_FOREVER);
+	for (int attempt = 0; attempt < RESET_ATTEMPTS && ret < 0; attempt++) {
+		controller_wake(node);
+		// Requests Configuration mode, then sends RESET.
+		ret = mcp251xfd_reset(dev);
+		// A controller still in Sleep mode reads as in Configuration mode
+		// and ignores RESET, so check that it's awake. That also catches
+		// erratum DS80000789 #7, a wake from Sleep mode that doesn't last.
+		// This firmware only sleeps in Low Power Mode, where it doesn't
+		// apply, but a controller keeps its power across restarts.
+		if (ret == 0) {
+			ret = mcp251xfd_reg_check_value_wtimeout(
+				dev, MCP251XFD_REG_OSC, MCP251XFD_REG_OSC_OSCRDY,
+				MCP251XFD_REG_OSC_OSCRDY | MCP251XFD_REG_OSC_OSCDIS, OSC_STAB_USEC, 1,
+				true);
+		}
+	}
+	if (ret == 0) {
+		node->data.current_mcp251xfd_mode = MCP251XFD_REG_CON_MODE_CONFIG;
+		ret = mcp251xfd_init_con_reg(dev);
+	}
+	if (ret == 0) {
+		ret = mcp251xfd_init_osc_reg(dev);
+	}
+	if (ret == 0) {
+		ret = mcp251xfd_init_iocon_reg(dev);
+	}
+	if (ret == 0) {
+		ret = mcp251xfd_init_int_reg(dev);
+	}
+	if (ret == 0) {
+		ret = mcp251xfd_set_tdc(dev, false);
+	}
+	if (ret == 0) {
+		ret = mcp251xfd_init_tef_fifo(dev);
+	}
+	if (ret == 0) {
+		ret = mcp251xfd_init_tx_queue(dev);
+	}
+	if (ret == 0) {
+		ret = mcp251xfd_init_rx_fifo(dev);
+	}
+	k_mutex_unlock(&node->data.mutex);
+	return ret;
+}
+
+// Low Power Mode stops the controller's clock and powers most of it down (4 uA
+// typical instead of ~15 mA), losing its registers and RAM, which
+// controller_reset() rebuilds. Asserting nCS wakes it, so there is no
+// confirmation that it went to sleep. Without CiINT.WAKIE, bus activity does
+// not wake it.
+static int controller_sleep(mcp251xfd_node_t *node)
+{
+	const struct device *dev = &node->dev;
+	uint32_t *reg;
+	uint8_t *reg_byte;
+
+	// Release INT first: entering Sleep sets MODIF, and an asserted INT would
+	// otherwise stay low for as long as the controller sleeps.
+	k_mutex_lock(&node->data.mutex, K_FOREVER);
+	reg = mcp251xfd_get_spi_buf_ptr(dev);
+	*reg = 0;
+	int ret = mcp251xfd_write(dev, MCP251XFD_REG_INT, MCP251XFD_REG_SIZE);
+	k_mutex_unlock(&node->data.mutex);
+	// Any later SPI access would wake the controller again, and the driver's
+	// thread can still be servicing the mode change of can_stop(). Wait until
+	// it has re-enabled INT's interrupt: it has then finished, and with INT
+	// released it won't be woken again. If it doesn't, leave the controller
+	// awake rather than have the thread wake it.
+	for (int i = 0; i < IDLE_POLLS && !gpio_pin_interrupt_enabled_dt(&node->config.int_gpio_dt);
+	     i++) {
+		k_sleep(K_MSEC(1));
+	}
+	if (ret == 0 && !gpio_pin_interrupt_enabled_dt(&node->config.int_gpio_dt)) {
+		ret = -EBUSY;
+	}
+
+	k_mutex_lock(&node->data.mutex, K_FOREVER);
+	// LPMEN makes the Sleep mode request below enter Low Power Mode.
+	if (ret == 0) {
+		reg_byte = mcp251xfd_get_spi_buf_ptr(dev);
+		*reg_byte = FIELD_PREP(MCP251XFD_REG_OSC_CLKODIV_MASK, node->config.clko_div) |
+			    MCP251XFD_REG_OSC_LPMEN;
+		ret = mcp251xfd_write(dev, MCP251XFD_REG_OSC, 1);
+	}
+	if (ret == 0) {
+		reg_byte = mcp251xfd_get_spi_buf_ptr(dev);
+		*reg_byte = FIELD_PREP(MCP251XFD_REG_CON_REQOP_MASK, MCP251XFD_REG_CON_MODE_SLEEP) >> 24;
+		ret = mcp251xfd_write(dev, MCP251XFD_REG_CON_B3, 1);
+	}
+	k_mutex_unlock(&node->data.mutex);
+	return ret;
+}
+
+// Releases the node for the next twai_new_node_mcp251xfd(), which resets the
+// controller, and puts the controller to sleep until then.
 static esp_err_t node_delete(twai_node_handle_t handle)
 {
 	mcp251xfd_node_t *node = node_of(handle);
 
+	// can_stop() failed partway (an SPI failure or a mode-change timeout) and
+	// left the driver started, possibly with the controller still on the bus.
+	// Reset it so it can go to sleep, and release the node anyway.
 	if (node->data.common.started) {
-		return ESP_ERR_INVALID_STATE;
+		ESP_LOGW(TAG, "controller did not stop, resetting it");
+		int ret = controller_reset(node);
+		if (ret < 0) {
+			ESP_LOGW(TAG, "controller reset failed: %d", ret);
+		}
+		mcp251xfd_reset_tx_fifos(&node->dev, -ENETDOWN);
+		node->data.common.started = false;
 	}
 	node->callbacks = (twai_event_callbacks_t){};
 	node->in_use = false;
+	int ret = controller_sleep(node);
+	if (ret < 0) {
+		// The node is still released; the next creation resets the controller.
+		ESP_LOGW(TAG, "controller sleep failed: %d", ret);
+	}
 	return ESP_OK;
 }
 
@@ -293,8 +431,8 @@ static esp_err_t create(spi_host_device_t host, const twai_mcp251xfd_node_config
 	}
 
 	// Mirrors the driver's devicetree instantiation (MCP251XFD_INIT). The
-	// bitrate here is only for initialization, which cannot be retried;
-	// configure() applies the requested one.
+	// bitrate here is only for mcp251xfd_init(); configure() applies the
+	// requested one.
 	const struct mcp251xfd_config driver_config = {
 		.common = {.max_bitrate = 1000000, .bitrate = 500000},
 		.bus = {.bus = &node->dev, .device = node->spi},
@@ -335,19 +473,29 @@ static esp_err_t create(spi_host_device_t host, const twai_mcp251xfd_node_config
 	};
 	node->filters[0] = node->filters[1] = NO_FILTER;
 
+	// A restart leaves the controller as it was, and WiCAN's sleep ends in
+	// one: wake it from Low Power Mode for initialization.
+	controller_wake(node);
+
 	// Starts the driver's interrupt thread, which references the node, so the
 	// node is kept even if initialization fails.
 	int ret = mcp251xfd_init(&node->dev);
-	if (ret < 0) {
-		ESP_LOGE(TAG, "controller initialization failed: %d", ret);
+	if (!node->data.int_thread.handle) {
+		// Failed setting up the INT pin, before any controller access.
+		ESP_LOGE(TAG, "driver initialization failed: %d", ret);
 		node->init_error = esp_err_from(ret);
 	} else {
-		// Initialization went through ESP-IDF's SPI driver, which has now
+		// Transfers so far went through ESP-IDF's SPI driver, which has
 		// configured the bus for this device; drive it directly from here on.
 		k_mutex_lock(&node->data.mutex, K_FOREVER);
 		node->config.bus.hw = SPI_LL_GET_HW(host);
 		k_mutex_unlock(&node->data.mutex);
 		can_set_state_change_callback(&node->dev, state_changed, node);
+		// The rest of initialization only sets up the controller, which every
+		// creation repeats with controller_reset().
+		if (ret < 0) {
+			ESP_LOGW(TAG, "controller initialization failed: %d; resetting it", ret);
+		}
 	}
 	s_node = node;
 	return ESP_OK;
@@ -362,6 +510,13 @@ esp_err_t twai_new_node_mcp251xfd(spi_host_device_t host, const twai_mcp251xfd_n
 	}
 	ESP_RETURN_ON_FALSE(!s_node->in_use, ESP_ERR_INVALID_STATE, TAG, "node already in use");
 	ESP_RETURN_ON_ERROR(s_node->init_error, TAG, "controller unavailable until restart");
+	// Enabled only here, not by controller_reset(): controller_sleep() takes an
+	// enabled interrupt to mean that the driver's thread is idle.
+	int ret = controller_reset(s_node);
+	if (ret == 0) {
+		ret = gpio_pin_interrupt_configure_dt(&s_node->config.int_gpio_dt, GPIO_INT_LEVEL_ACTIVE);
+	}
+	ESP_RETURN_ON_FALSE(ret >= 0, esp_err_from(ret), TAG, "controller reset failed: %d", ret);
 	ESP_RETURN_ON_ERROR(configure(s_node, config), TAG, "configure failed");
 	s_node->in_use = true;
 	*node_ret = &s_node->base;
