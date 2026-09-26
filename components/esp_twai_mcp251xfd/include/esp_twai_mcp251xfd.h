@@ -28,13 +28,14 @@ typedef struct {
 // service. The node reserves the SPI bus for itself.
 //
 // There is a single node, initialized on the first call and never freed:
-// twai_node_delete() releases it, and the next call reuses it with the new bit
-// timing and mode. SPI, pins and oscillator come from the first call. If
-// initialization fails, later calls fail too until restart.
+// twai_node_delete() releases it and puts the controller in Low Power Mode,
+// and every call resets the controller and applies the new bit timing and
+// mode. SPI, pins and oscillator come from the first call.
 //
 // Callbacks run in the driver's thread rather than an ISR, except on_tx_done
-// for frames that twai_node_disable() aborts, which runs in the caller's task.
-// Frames retry until sent (no one-shot mode). Filter 0 is the only mask filter.
+// for frames that twai_node_disable() (or a node_delete() that has to reset
+// the controller) aborts, which runs in the caller's task. Frames retry until
+// sent (no one-shot mode). Filter 0 is the only mask filter.
 esp_err_t twai_new_node_mcp251xfd(spi_host_device_t host, const twai_mcp251xfd_node_config_t *config,
                                   twai_node_handle_t *node_ret);
 

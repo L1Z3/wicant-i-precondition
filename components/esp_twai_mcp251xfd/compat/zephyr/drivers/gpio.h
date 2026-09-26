@@ -71,6 +71,9 @@ static inline int gpio_add_callback_dt(const struct gpio_dt_spec *spec, struct g
 	return gpio_isr_handler_add(spec->pin, z_gpio_isr, cb) == ESP_OK ? 0 : -EIO;
 }
 
+// Whether the INT pin's interrupt is enabled; see gpio_pin_interrupt_enabled_dt().
+static volatile bool z_gpio_int_enabled;
+
 // Called from the ISR (disable), and from the driver thread and controller
 // setup (enable).
 static inline int gpio_pin_interrupt_configure_dt(const struct gpio_dt_spec *spec,
@@ -82,9 +85,22 @@ static inline int gpio_pin_interrupt_configure_dt(const struct gpio_dt_spec *spe
 		if (gpio_set_intr_type(spec->pin, type) != ESP_OK) {
 			return -EIO;
 		}
+		// Set first: once enabled, the ISR can fire and clear it at once.
+		z_gpio_int_enabled = true;
 		return gpio_intr_enable(spec->pin) == ESP_OK ? 0 : -EIO;
 	}
+	z_gpio_int_enabled = false;
 	return gpio_intr_disable(spec->pin) == ESP_OK ? 0 : -EIO;
+}
+
+// Shim extension, not Zephyr API: whether the interrupt was last enabled. The
+// shim serves one pin, INT. The driver's ISR disables it and its thread
+// enables it again once it has handled the interrupt, so while INT is
+// released and nothing else enables it, enabled means the thread is idle.
+static inline bool gpio_pin_interrupt_enabled_dt(const struct gpio_dt_spec *spec)
+{
+	(void)spec;
+	return z_gpio_int_enabled;
 }
 
 // Logical level: 1 when the pin is active.
