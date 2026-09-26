@@ -1587,10 +1587,6 @@ static int mcp251xfd_init(const struct device *dev)
 		return -EINVAL;
 	}
 
-	if (gpio_pin_interrupt_configure_dt(&dev_cfg->int_gpio_dt, GPIO_INT_LEVEL_ACTIVE) < 0) {
-		return -EINVAL;
-	}
-
 	k_thread_create(&dev_data->int_thread, dev_data->int_thread_stack,
 			CONFIG_CAN_MCP251XFD_INT_THREAD_STACK_SIZE,
 			(k_thread_entry_t)mcp251xfd_int_thread, (void *)dev, NULL, NULL,
@@ -1706,6 +1702,16 @@ static int mcp251xfd_init(const struct device *dev)
 #if defined(CONFIG_CAN_FD_MODE)
 	ret = can_set_timing_data(dev, &timing_data);
 #endif
+
+	// LOCAL PATCH: enable INT's interrupt only once the controller is set up.
+	// Upstream enables it before the reset above, and a controller that kept
+	// running across an MCU restart can still be asserting INT: the interrupt
+	// thread then accesses it alongside this function, which doesn't take the
+	// driver's mutex.
+	if (ret == 0 &&
+	    gpio_pin_interrupt_configure_dt(&dev_cfg->int_gpio_dt, GPIO_INT_LEVEL_ACTIVE) < 0) {
+		ret = -EINVAL;
+	}
 
 	return ret;
 }
