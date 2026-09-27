@@ -1350,7 +1350,7 @@
                 <tr>
                     <td>Select Vehicle:</td>
                     <td>
-                        <select id="egmp_car_model" name="egmp_car_model" onchange="syncPreconButtonToggle(); submit_enable();">
+                        <select id="egmp_car_model" name="egmp_car_model" onchange="updatePreconButtonVisibility(); submit_enable();">
                             <option id="egmp_car_model_auto" value="auto">Auto (not detected yet)</option>
                             <option value="ioniq5">Ioniq 5</option>
                             <option value="ev6">EV6</option>
@@ -1393,6 +1393,7 @@
                             <option class="precon_button_extra precon_button_car_ioniq5 precon_button_car_ioniq6" value="avn_tuner_up">Tuner Up (Ioniq 5/6 Climate Bar)</option>
                             <option class="precon_button_extra precon_button_car_ioniq5 precon_button_car_ioniq6" value="avn_tuner_down">Tuner Down (Ioniq 5/6 Climate Bar)</option>
                         </select>
+                        <div id="precon_button_car_warning" style="display: none; color: #92400e; font-size: 0.85rem; margin-top: 4px;"></div>
                         <br />
                         <label style="font-weight: normal;">
                             <input type="checkbox" id="precon_button_show_all" onchange="updatePreconButtonVisibility();" />
@@ -1451,7 +1452,7 @@
         document.addEventListener('DOMContentLoaded', (event) => {
             document.getElementById("submit_button").disabled = true;
 
-            syncPreconButtonToggle();
+            updatePreconButtonVisibility();
             toggleSleepVoltageEnabled();
         });
 
@@ -1491,38 +1492,41 @@
                 || carClasses.includes(`precon_button_car_${carModel}`);
         }
 
-        // If the currently selected button is one that a filter would hide
-        // (an extra option, or a button not on the current car), tick the
-        // matching "show all" box. Called on load, after the device config
-        // populates the dropdowns, when the vehicle changes and when a car is
-        // detected.
-        function syncPreconButtonToggle() {
-            const preconSelect = document.getElementById("precon_button");
-            const selectedOption = preconSelect.options[preconSelect.selectedIndex];
-            if (selectedOption && selectedOption.classList.contains("precon_button_extra")) {
-                document.getElementById("precon_button_show_all").checked = true;
-            }
-            if (selectedOption && !preconButtonFitsCar(selectedOption, effectivePreconCarModel())) {
-                document.getElementById("precon_button_show_all_cars").checked = true;
-            }
-            updatePreconButtonVisibility();
-        }
-
         // Client-side only: recompute which preconditioning button options
         // are visible. An option is shown when it exists on the current car
         // (or "Show buttons for all vehicles" is checked) and, for the "extra"
         // options, when "Show all button options" is checked. The current
-        // selection is always shown. Does not affect the value submitted to
-        // the device.
+        // selection is always shown, with a warning if it is not on the
+        // current car. Does not affect the value submitted to the device.
+        // Called on load, after the device config populates the dropdowns,
+        // when the vehicle or button changes and when a car is detected.
         function updatePreconButtonVisibility() {
             const showAll = document.getElementById("precon_button_show_all").checked;
+            const effectiveCarModel = effectivePreconCarModel();
             const carModel = document.getElementById("precon_button_show_all_cars").checked
-                ? null : effectivePreconCarModel();
+                ? null : effectiveCarModel;
             document.querySelectorAll("#precon_button option").forEach(option => {
                 const extraVisible = !option.classList.contains("precon_button_extra") || showAll;
                 option.hidden = !option.selected
                     && !(preconButtonFitsCar(option, carModel) && extraVisible);
             });
+
+            // the firmware does not check the button against the car, so a
+            // mismatched button would silently never trigger
+            const preconSelect = document.getElementById("precon_button");
+            const selectedOption = preconSelect.options[preconSelect.selectedIndex];
+            const warning = document.getElementById("precon_button_car_warning");
+            if (selectedOption && !preconButtonFitsCar(selectedOption, effectiveCarModel)) {
+                const carOption = Array.from(document.getElementById("egmp_car_model").options)
+                    .find(option => option.value === effectiveCarModel);
+                // U+FE0E asks for the text form of the sign, so it takes the
+                // warning colour instead of rendering as a colour emoji
+                warning.textContent =
+                    `⚠︎ ${selectedOption.textContent} is not on the ${carOption.textContent}`;
+                warning.style.display = "";
+            } else {
+                warning.style.display = "none";
+            }
         }
 		let latest_car_models = null;
 		// does this board have the car-on sense pin? read from /check_status;
@@ -2723,7 +2727,7 @@ function loadAutoTable(jsonData) {
 				detectedCarModel = detected;
 				document.getElementById("egmp_car_model_auto").textContent = detectedOption
 					? `Auto (detected: ${detectedOption.textContent})` : "Auto (not detected yet)";
-				syncPreconButtonToggle();
+				updatePreconButtonVisibility();
 			}
 			document.getElementById("port_status").innerHTML = obj.port;
 			document.getElementById("fw_version").innerHTML = obj.fw_version;
@@ -3419,7 +3423,7 @@ function loadAutoTable(jsonData) {
             if (carSelect.selectedIndex < 0) {
                 carSelect.value = "auto";
             }
-            syncPreconButtonToggle();
+            updatePreconButtonVisibility();
 			if(obj.batt_alert_time == "1") {
 				document.getElementById("batt_alert_time").selectedIndex = "0";
 			} else if(obj.batt_alert_time == "6") {
