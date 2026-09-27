@@ -1348,6 +1348,17 @@
             <div class="section-title">Buttons</div>
             <table class="form-table">
                 <tr>
+                    <td>Select Vehicle:</td>
+                    <td>
+                        <select id="egmp_car_model" name="egmp_car_model" onchange="updatePreconButtonVisibility(); submit_enable();">
+                            <option id="egmp_car_model_auto" value="auto">Auto (not detected yet)</option>
+                            <option value="ioniq5">Ioniq 5</option>
+                            <option value="ev6">EV6</option>
+                            <option value="ioniq6">Ioniq 6</option>
+                        </select>
+                    </td>
+                </tr>
+                <tr>
                     <td>Preconditioning Mode:</td>
                     <td>
                         <select id="precon_mode" name="precon_mode" onchange="submit_enable();">
@@ -1360,13 +1371,13 @@
                 <tr>
                     <td>Preconditioning Activation Button:</td>
                     <td>
-                        <select id="precon_button" name="precon_button" onchange="submit_enable();">
+                        <select id="precon_button" name="precon_button" onchange="updatePreconButtonVisibility(); submit_enable();">
                             <option value="disabled">Disabled</option>
                             <option value="sw_star">Star Button (Steering Wheel)</option>
-                            <option value="avn_star">Star Button (Climate Bar)</option>
-                            <option value="avn_tuner_in">Tuner Press (Climate Bar)</option>
-                            <option value="avn_vol_in">Volume Press (Climate Bar)</option>
-                            <option value="ev6_avn_setup">Setup (EV6 Climate Bar)</option>
+                            <option class="precon_button_car_ioniq5 precon_button_car_ioniq6" value="avn_star">Star Button (Ioniq 5/6 Climate Bar)</option>
+                            <option class="precon_button_car_ioniq5 precon_button_car_ioniq6" value="avn_tuner_in">Tuner Press (Ioniq 5/6 Climate Bar)</option>
+                            <option class="precon_button_car_ioniq5 precon_button_car_ioniq6" value="avn_vol_in">Volume Press (Ioniq 5/6 Climate Bar)</option>
+                            <option class="precon_button_car_ev6" value="ev6_avn_setup">Setup (EV6 Climate Bar)</option>
                             <option class="precon_button_extra" value="sw_mode">Mode (Steering Wheel)</option>
                             <option class="precon_button_extra" value="sw_speak">Speak (Steering Wheel)</option>
                             <option class="precon_button_extra" value="sw_call">Call (Steering Wheel)</option>
@@ -1375,17 +1386,23 @@
                             <option class="precon_button_extra" value="sw_vol_down">Volume Down (Steering Wheel)</option>
                             <option class="precon_button_extra" value="sw_skip_up">Skip Up (Steering Wheel)</option>
                             <option class="precon_button_extra" value="sw_skip_down">Skip Down (Steering Wheel)</option>
-                            <option class="precon_button_extra" value="sw_ok">OK (Steering Wheel)</option>
-                            <option class="precon_button_extra" value="avn_map">Map (Climate Bar)</option>
-                            <option class="precon_button_extra" value="avn_nav">Nav (Climate Bar)</option>
-                            <option class="precon_button_extra" value="avn_media">Media (Climate Bar)</option>
-                            <option class="precon_button_extra" value="avn_tuner_up">Tuner Up (Climate Bar)</option>
-                            <option class="precon_button_extra" value="avn_tuner_down">Tuner Down (Climate Bar)</option>
+                            <option class="precon_button_extra precon_button_car_ioniq5 precon_button_car_ev6" value="sw_ok">OK (Ioniq 5/EV6 Steering Wheel)</option>
+                            <option class="precon_button_extra precon_button_car_ioniq5 precon_button_car_ioniq6" value="avn_map">Map (Ioniq 5/6 Climate Bar)</option>
+                            <option class="precon_button_extra precon_button_car_ioniq5 precon_button_car_ioniq6" value="avn_nav">Nav (Ioniq 5/6 Climate Bar)</option>
+                            <option class="precon_button_extra precon_button_car_ioniq5 precon_button_car_ioniq6" value="avn_media">Media (Ioniq 5/6 Climate Bar)</option>
+                            <option class="precon_button_extra precon_button_car_ioniq5 precon_button_car_ioniq6" value="avn_tuner_up">Tuner Up (Ioniq 5/6 Climate Bar)</option>
+                            <option class="precon_button_extra precon_button_car_ioniq5 precon_button_car_ioniq6" value="avn_tuner_down">Tuner Down (Ioniq 5/6 Climate Bar)</option>
                         </select>
+                        <div id="precon_button_car_warning" style="display: none; color: #92400e; font-size: 0.85rem; margin-top: 4px;"></div>
                         <br />
                         <label style="font-weight: normal;">
-                            <input type="checkbox" id="precon_button_show_all" onchange="togglePreconButtonOptions();" />
-                            Show all button options
+                            <input type="checkbox" id="precon_button_show_all" onchange="updatePreconButtonVisibility();" />
+                            Show extra button options
+                        </label>
+                        <br />
+                        <label style="font-weight: normal;">
+                            <input type="checkbox" id="precon_button_show_all_cars" onchange="updatePreconButtonVisibility();" />
+                            Show buttons for all vehicles
                         </label>
                     </td>
                 </tr>
@@ -1435,7 +1452,7 @@
         document.addEventListener('DOMContentLoaded', (event) => {
             document.getElementById("submit_button").disabled = true;
 
-            syncPreconButtonToggle();
+            updatePreconButtonVisibility();
             toggleSleepVoltageEnabled();
         });
 
@@ -1453,25 +1470,63 @@
             document.getElementById("sleep_volt_value").textContent = sleepVolt.value;
         }
 
-        // If the currently selected button is one of the extra options, show
-        // the full list so the selection stays visible. Called on load and
-        // again after the device config populates the dropdown value.
-        function syncPreconButtonToggle() {
-            const preconSelect = document.getElementById("precon_button");
-            const selectedOption = preconSelect.options[preconSelect.selectedIndex];
-            if (selectedOption && selectedOption.classList.contains("precon_button_extra")) {
-                document.getElementById("precon_button_show_all").checked = true;
-            }
-            togglePreconButtonOptions();
+        // car identified from CAN this session (from /check_status), or null
+        // until the car has been seen
+        let detectedCarModel = null;
+
+        // The car the button list is filtered by: the user's vehicle choice,
+        // or the detected car when that is "auto". null means no car is known
+        // yet, so nothing is filtered by car.
+        function effectivePreconCarModel() {
+            const selectedVehicle = document.getElementById("egmp_car_model").value;
+            return selectedVehicle === "auto" ? detectedCarModel : selectedVehicle;
         }
 
-        // Client-side only: show or hide the extra preconditioning button
-        // options. Does not affect the value submitted to the device.
-        function togglePreconButtonOptions() {
+        // Does this button exist on the given car? Buttons without a
+        // precon_button_car_* class exist on every car.
+        function preconButtonFitsCar(option, carModel) {
+            const carClasses = Array.from(option.classList).filter(className =>
+                className.startsWith("precon_button_car_"));
+            return carModel === null
+                || carClasses.length === 0
+                || carClasses.includes(`precon_button_car_${carModel}`);
+        }
+
+        // Client-side only: recompute which preconditioning button options
+        // are visible. An option is shown when it exists on the current car
+        // (or "Show buttons for all vehicles" is checked) and, for the "extra"
+        // options, when "Show all button options" is checked. The current
+        // selection is always shown, with a warning if it is not on the
+        // current car. Does not affect the value submitted to the device.
+        // Called on load, after the device config populates the dropdowns,
+        // when the vehicle or button changes and when a car is detected.
+        function updatePreconButtonVisibility() {
             const showAll = document.getElementById("precon_button_show_all").checked;
-            document.querySelectorAll(".precon_button_extra").forEach(option => {
-                option.hidden = !showAll;
+            const effectiveCarModel = effectivePreconCarModel();
+            const carModel = document.getElementById("precon_button_show_all_cars").checked
+                ? null : effectiveCarModel;
+            document.querySelectorAll("#precon_button option").forEach(option => {
+                const extraVisible = !option.classList.contains("precon_button_extra") || showAll;
+                option.hidden = !option.selected
+                    && !(preconButtonFitsCar(option, carModel) && extraVisible);
             });
+
+            // the firmware does not check the button against the car, so a
+            // mismatched button would silently never trigger
+            const preconSelect = document.getElementById("precon_button");
+            const selectedOption = preconSelect.options[preconSelect.selectedIndex];
+            const warning = document.getElementById("precon_button_car_warning");
+            if (selectedOption && !preconButtonFitsCar(selectedOption, effectiveCarModel)) {
+                const carOption = Array.from(document.getElementById("egmp_car_model").options)
+                    .find(option => option.value === effectiveCarModel);
+                // U+FE0E asks for the text form of the sign, so it takes the
+                // warning colour instead of rendering as a colour emoji
+                warning.textContent =
+                    `⚠︎ ${selectedOption.textContent} is not on the ${carOption.textContent}`;
+                warning.style.display = "";
+            } else {
+                warning.style.display = "none";
+            }
         }
 		let latest_car_models = null;
 		// does this board have the car-on sense pin? read from /check_status;
@@ -2662,6 +2717,18 @@ function loadAutoTable(jsonData) {
 			document.getElementById("precondition_active_status").textContent = obj.precondition_starting ? "Starting" : (obj.precondition_active ? "Yes" : "No");
 			// the button toggles, so label it with the action it will take
 			document.getElementById("precon_activate_button").value = obj.precondition_requested ? "Stop Preconditioning" : "Activate";
+			// car identified from CAN; the button filter uses it when the
+			// vehicle setting is "auto"
+			const carSelect = document.getElementById("egmp_car_model");
+			const detectedOption = Array.from(carSelect.options).find(option =>
+				option.value !== "auto" && option.value === obj.egmp_car_model_detected);
+			const detected = detectedOption ? detectedOption.value : null;
+			if (detected !== detectedCarModel) {
+				detectedCarModel = detected;
+				document.getElementById("egmp_car_model_auto").textContent = detectedOption
+					? `Auto (detected: ${detectedOption.textContent})` : "Auto (not detected yet)";
+				updatePreconButtonVisibility();
+			}
 			document.getElementById("port_status").innerHTML = obj.port;
 			document.getElementById("fw_version").innerHTML = obj.fw_version;
 			document.getElementById("hw_version").innerHTML = obj.hw_version;
@@ -2976,6 +3043,7 @@ function loadAutoTable(jsonData) {
 		obj["mqtt_status_topic"] = document.getElementById("mqtt_status_topic").value;
 		obj["mqtt_elm327_log"] = document.getElementById("mqtt_elm327_log").value;
         obj["battery_temp_unit"] = document.getElementById("battery_temp_unit").value;
+        obj["egmp_car_model"] = document.getElementById("egmp_car_model").value;
         obj["precon_mode"] = document.getElementById("precon_mode").value;
         obj["precon_button"] = document.getElementById("precon_button").value;
         obj["precon_press"] = document.getElementById("precon_press").value;
@@ -3348,7 +3416,14 @@ function loadAutoTable(jsonData) {
             document.getElementById("precon_button").value = obj.precon_button;
             // config saved by older firmware has no precon_press key
             document.getElementById("precon_press").value = obj.precon_press || "short";
-            syncPreconButtonToggle();
+            // config saved by older firmware has no egmp_car_model key; the
+            // firmware treats that, or any unrecognised model, as auto
+            const carSelect = document.getElementById("egmp_car_model");
+            carSelect.value = obj.egmp_car_model;
+            if (carSelect.selectedIndex < 0) {
+                carSelect.value = "auto";
+            }
+            updatePreconButtonVisibility();
 			if(obj.batt_alert_time == "1") {
 				document.getElementById("batt_alert_time").selectedIndex = "0";
 			} else if(obj.batt_alert_time == "6") {

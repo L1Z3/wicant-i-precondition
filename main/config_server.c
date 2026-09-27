@@ -157,6 +157,7 @@ const char device_config_default[] = R"json({
 "mqtt_rx_topic":"wican/%s/can/rx",
 "mqtt_status_topic":"wican/%s/can/status",
 "battery_temp_unit":"c",
+"egmp_car_model":"auto",
 "precon_mode":"once",
 "precon_button":"sw_star",
 "precon_press":"short"
@@ -1058,6 +1059,15 @@ char *config_server_get_status_json(bool remove_sensitive_info)
         cJSON_AddBoolToObject(root, "precondition_requested", pstate.requested);
         cJSON_AddBoolToObject(root, "precondition_active", pstate.active);
         cJSON_AddBoolToObject(root, "precondition_starting", pstate.starting);
+	}
+
+	// car identified from CAN this session; the web UI filters the buttons
+	// by it when the vehicle setting is "auto"
+	egmp_car_model_t car_model;
+	if (precondition_get_car_model(&car_model)) {
+		cJSON_AddStringToObject(root, "egmp_car_model_detected",
+				car_model == EGMP_CAR_IONIQ6 ? "ioniq6"
+				: car_model == EGMP_CAR_EV6 ? "ev6" : "ioniq5");
 	}
 
 	precondition_soc_t soc;
@@ -2127,6 +2137,25 @@ static void config_server_load_cfg(char *cfg)
     key = cJSON_GetObjectItem(root, "battery_temp_unit");
     strcpy(device_config.battery_temp_unit,
            cJSON_IsString(key) && strcmp(key->valuestring, "f") == 0 ? "f" : "c");
+
+	//*****
+	// key added after initial release; missing means a config saved by older
+	// firmware, so fall back to the default rather than rejecting the config
+	// could think about being more agressive if auto-detection works properly
+	key = cJSON_GetObjectItem(root,"egmp_car_model");
+	if(cJSON_IsString(key)
+			&& (strcmp(key->valuestring, "ioniq5") == 0
+				|| strcmp(key->valuestring, "ioniq6") == 0
+				|| strcmp(key->valuestring, "ev6") == 0))
+	{
+		strcpy(device_config.egmp_car_model, key->valuestring);
+	}
+	else
+	{
+		strcpy(device_config.egmp_car_model, "auto");
+	}
+	ESP_LOGE(TAG, "device_config.egmp_car_model: %s", device_config.egmp_car_model);
+	//*****
 
 	key = cJSON_GetObjectItem(root,"precon_mode");
 	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.precon_mode)))
