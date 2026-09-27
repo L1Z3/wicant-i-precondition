@@ -151,6 +151,8 @@ static bool activation_is_release(const message_payload_t *msg, const twai_messa
     (((status_byte) & STATUS_MASK) == 0x05U)
 #define STATUS_STARTED(status_byte) \
     (((status_byte) & STATUS_MASK) == 0x15U)
+// set on EV6 (0x41/0x45/0x55), clear on Ioniq 5 (0x01/0x05/0x15)
+#define STATUS_EV6_BIT 0x40U
 
 #define IS_POWER_STATUS_FRAME(frame_id) \
     ((frame_id) == 0x038U)
@@ -1391,22 +1393,22 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
         // identify the car once so the config's egmp_car_model can be
         // initialized (only while it is still at the default). the car model
         // cannot change without a reboot, so cache the result instead of
-        // re-running this on every periodic status frame.
+        // re-running this on every periodic status frame. only a recognised
+        // status byte is trusted to carry the model bit.
         //   Ioniq 6: 0x0A82AA03
-        //   Ioniq 5: 0x2AD, idle status 0x01
-        //   EV6:     0x2AD, idle status 0x41
+        //   Ioniq 5: 0x2AD, STATUS_EV6_BIT clear
+        //   EV6:     0x2AD, STATUS_EV6_BIT set
         static bool egmp_car_model_detected = false;
-        if (!egmp_car_model_detected) {
+        if (!egmp_car_model_detected
+                && (STATUS_IDLE(status) || STATUS_STARTING(status) || STATUS_STARTED(status))) {
             if (to_push->identifier == 0x0A82AA03U) {
                 config_server_set_egmp_car_model("ioniq6");
-                egmp_car_model_detected = true;
-            } else if (status == 0x01U) {
-                config_server_set_egmp_car_model("ioniq5");
-                egmp_car_model_detected = true;
-            } else if (status == 0x41U) {
+            } else if (status & STATUS_EV6_BIT) {
                 config_server_set_egmp_car_model("ev6");
-                egmp_car_model_detected = true;
+            } else {
+                config_server_set_egmp_car_model("ioniq5");
             }
+            egmp_car_model_detected = true;
         }
     }
 
