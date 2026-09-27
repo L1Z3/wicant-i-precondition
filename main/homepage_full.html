@@ -3469,11 +3469,8 @@ function loadAutoTable(jsonData) {
 			document.getElementById("store_canflt_button").disabled = true;
 			document.querySelector(".store").disabled = true;
             document.getElementById("submit_button").disabled = true;
-			// run after the stored config has been applied so the live model
-			// from /check_status (possibly auto-detected from CAN) wins over
-			// the stale device_config_file served by /load_config
-			checkStatus();
 		};
+		checkStatus();
 		xhttp.open("GET", "/load_config");
 		xhttp.send();
 	}
