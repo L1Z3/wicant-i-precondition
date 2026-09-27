@@ -1350,7 +1350,7 @@
                 <tr>
                     <td>Select Vehicle:</td>
                     <td>
-                        <select id="egmp_car_model" name="egmp_car_model" onchange="updatePreconButtonVisibility(); submit_enable();">
+                        <select id="egmp_car_model" name="egmp_car_model" onchange="syncPreconButtonToggle(); submit_enable();">
                             <option id="egmp_car_model_auto" value="auto">Auto (not detected yet)</option>
                             <option value="ioniq5">Ioniq 5</option>
                             <option value="ev6">EV6</option>
@@ -1397,6 +1397,11 @@
                         <label style="font-weight: normal;">
                             <input type="checkbox" id="precon_button_show_all" onchange="updatePreconButtonVisibility();" />
                             Show all button options
+                        </label>
+                        <br />
+                        <label style="font-weight: normal;">
+                            <input type="checkbox" id="precon_button_show_all_cars" onchange="updatePreconButtonVisibility();" />
+                            Show buttons for all vehicles
                         </label>
                     </td>
                 </tr>
@@ -1476,34 +1481,47 @@
             return selectedVehicle === "auto" ? detectedCarModel : selectedVehicle;
         }
 
-        // If the currently selected button is one of the extra options, tick
-        // "Show all button options". Called on load and again after the
-        // device config populates the dropdown value.
+        // Does this button exist on the given car? Buttons without a
+        // precon_button_car_* class exist on every car.
+        function preconButtonFitsCar(option, carModel) {
+            const carClasses = Array.from(option.classList).filter(className =>
+                className.startsWith("precon_button_car_"));
+            return carModel === null
+                || carClasses.length === 0
+                || carClasses.includes(`precon_button_car_${carModel}`);
+        }
+
+        // If the currently selected button is one that a filter would hide
+        // (an extra option, or a button not on the current car), tick the
+        // matching "show all" box. Called on load, after the device config
+        // populates the dropdowns, when the vehicle changes and when a car is
+        // detected.
         function syncPreconButtonToggle() {
             const preconSelect = document.getElementById("precon_button");
             const selectedOption = preconSelect.options[preconSelect.selectedIndex];
             if (selectedOption && selectedOption.classList.contains("precon_button_extra")) {
                 document.getElementById("precon_button_show_all").checked = true;
             }
+            if (selectedOption && !preconButtonFitsCar(selectedOption, effectivePreconCarModel())) {
+                document.getElementById("precon_button_show_all_cars").checked = true;
+            }
             updatePreconButtonVisibility();
         }
 
         // Client-side only: recompute which preconditioning button options
         // are visible. An option is shown when it exists on the current car
-        // (or no car is known yet) and, for the "extra" options, when "Show
-        // all button options" is checked. The current selection is always
-        // shown. Does not affect the value submitted to the device.
+        // (or "Show buttons for all vehicles" is checked) and, for the "extra"
+        // options, when "Show all button options" is checked. The current
+        // selection is always shown. Does not affect the value submitted to
+        // the device.
         function updatePreconButtonVisibility() {
             const showAll = document.getElementById("precon_button_show_all").checked;
-            const carModel = effectivePreconCarModel();
+            const carModel = document.getElementById("precon_button_show_all_cars").checked
+                ? null : effectivePreconCarModel();
             document.querySelectorAll("#precon_button option").forEach(option => {
-                const carClasses = Array.from(option.classList).filter(className =>
-                    className.startsWith("precon_button_car_"));
-                const carMatches = carModel === null
-                    || carClasses.length === 0
-                    || carClasses.includes(`precon_button_car_${carModel}`);
                 const extraVisible = !option.classList.contains("precon_button_extra") || showAll;
-                option.hidden = !option.selected && !(carMatches && extraVisible);
+                option.hidden = !option.selected
+                    && !(preconButtonFitsCar(option, carModel) && extraVisible);
             });
         }
 		let latest_car_models = null;
@@ -2705,7 +2723,7 @@ function loadAutoTable(jsonData) {
 				detectedCarModel = detected;
 				document.getElementById("egmp_car_model_auto").textContent = detectedOption
 					? `Auto (detected: ${detectedOption.textContent})` : "Auto (not detected yet)";
-				updatePreconButtonVisibility();
+				syncPreconButtonToggle();
 			}
 			document.getElementById("port_status").innerHTML = obj.port;
 			document.getElementById("fw_version").innerHTML = obj.fw_version;
