@@ -1371,7 +1371,7 @@
                 <tr>
                     <td>Preconditioning Activation Button:</td>
                     <td>
-                        <select id="precon_button" name="precon_button" onchange="submit_enable();">
+                        <select id="precon_button" name="precon_button" onchange="updatePreconButtonVisibility(); submit_enable();">
                             <option value="disabled">Disabled</option>
                             <option value="sw_star">Star Button (Steering Wheel)</option>
                             <option class="precon_button_car_ioniq5 precon_button_car_ioniq6" value="avn_star">Star Button (Ioniq 5/6 Climate Bar)</option>
@@ -1476,25 +1476,14 @@
             return selectedVehicle === "auto" ? detectedCarModel : selectedVehicle;
         }
 
-        // If the currently selected button is one of the extra options, show
-        // the full list so the selection stays visible. Called on load and
-        // again after the device config populates the dropdown value.
+        // If the currently selected button is one of the extra options, tick
+        // "Show all button options". Called on load and again after the
+        // device config populates the dropdown value.
         function syncPreconButtonToggle() {
             const preconSelect = document.getElementById("precon_button");
             const selectedOption = preconSelect.options[preconSelect.selectedIndex];
             if (selectedOption && selectedOption.classList.contains("precon_button_extra")) {
                 document.getElementById("precon_button_show_all").checked = true;
-            }
-            // If the selected button belongs to a specific car, select that
-            // car so the button stays visible under the car filter.
-            const carClass = selectedOption && Array.from(selectedOption.classList).find(className =>
-                className.startsWith("precon_button_car_"));
-            if (carClass) {
-                const carModel = carClass.split("_").pop();
-                const validModels = ["ioniq5", "ioniq6", "ev6"];
-                if (validModels.includes(carModel)) {
-                    document.getElementById("egmp_car_model").value = carModel;
-                }
             }
             updatePreconButtonVisibility();
         }
@@ -1502,8 +1491,8 @@
         // Client-side only: recompute which preconditioning button options
         // are visible. An option is shown when it exists on the current car
         // (or no car is known yet) and, for the "extra" options, when "Show
-        // all button options" is checked. Does not affect the value submitted
-        // to the device.
+        // all button options" is checked. The current selection is always
+        // shown. Does not affect the value submitted to the device.
         function updatePreconButtonVisibility() {
             const showAll = document.getElementById("precon_button_show_all").checked;
             const carModel = effectivePreconCarModel();
@@ -1514,7 +1503,7 @@
                     || carClasses.length === 0
                     || carClasses.includes(`precon_button_car_${carModel}`);
                 const extraVisible = !option.classList.contains("precon_button_extra") || showAll;
-                option.hidden = !(carMatches && extraVisible);
+                option.hidden = !option.selected && !(carMatches && extraVisible);
             });
         }
 		let latest_car_models = null;
