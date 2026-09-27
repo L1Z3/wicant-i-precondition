@@ -3405,8 +3405,13 @@ function loadAutoTable(jsonData) {
             document.getElementById("precon_button").value = obj.precon_button;
             // config saved by older firmware has no precon_press key
             document.getElementById("precon_press").value = obj.precon_press || "short";
-            // config saved by older firmware has no egmp_car_model key
-            document.getElementById("egmp_car_model").value = obj.egmp_car_model || "auto";
+            // config saved by older firmware has no egmp_car_model key; the
+            // firmware treats that, or any unrecognised model, as auto
+            const carSelect = document.getElementById("egmp_car_model");
+            carSelect.value = obj.egmp_car_model;
+            if (carSelect.selectedIndex < 0) {
+                carSelect.value = "auto";
+            }
             syncPreconButtonToggle();
 			if(obj.batt_alert_time == "1") {
 				document.getElementById("batt_alert_time").selectedIndex = "0";

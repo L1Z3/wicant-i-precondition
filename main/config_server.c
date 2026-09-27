@@ -2143,17 +2143,16 @@ static void config_server_load_cfg(char *cfg)
 	// firmware, so fall back to the default rather than rejecting the config
 	// could think about being more agressive if auto-detection works properly
 	key = cJSON_GetObjectItem(root,"egmp_car_model");
-	if(key == 0)
+	if(cJSON_IsString(key)
+			&& (strcmp(key->valuestring, "ioniq5") == 0
+				|| strcmp(key->valuestring, "ioniq6") == 0
+				|| strcmp(key->valuestring, "ev6") == 0))
 	{
-		strcpy(device_config.egmp_car_model, "auto");
-	}
-	else if(strlen(key->valuestring) >= sizeof(device_config.egmp_car_model))
-	{
-		goto config_error;
+		strcpy(device_config.egmp_car_model, key->valuestring);
 	}
 	else
 	{
-		strcpy(device_config.egmp_car_model, key->valuestring);
+		strcpy(device_config.egmp_car_model, "auto");
 	}
 	ESP_LOGE(TAG, "device_config.egmp_car_model: %s", device_config.egmp_car_model);
 	//*****
