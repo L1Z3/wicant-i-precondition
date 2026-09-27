@@ -1350,7 +1350,7 @@
                 <tr>
                     <td>Select Vehicle:</td>
                     <td>
-                        <select id="egmp_car_model" name="egmp_car_model" onchange="toggleCarPreconButtonOptions();">
+                        <select id="egmp_car_model" name="egmp_car_model" onchange="updatePreconButtonVisibility();">
                             <option value="unknown">Unknown (show all)</option>
                             <option value="ioniq5">Ioniq 5</option>
                             <option value="ev6">EV6</option>
@@ -1395,7 +1395,7 @@
                         </select>
                         <br />
                         <label style="font-weight: normal;">
-                            <input type="checkbox" id="precon_button_show_all" onchange="togglePreconButtonOptions();" />
+                            <input type="checkbox" id="precon_button_show_all" onchange="updatePreconButtonVisibility();" />
                             Show all button options
                         </label>
                     </td>
@@ -1505,16 +1505,6 @@
                 const extraVisible = !option.classList.contains("precon_button_extra") || showAll;
                 option.hidden = !(carMatches && extraVisible);
             });
-        }
-
-        function togglePreconButtonOptions() {
-            updatePreconButtonVisibility();
-        }
-
-        // Client-side only: re-run the visibility filter when the car model
-        // selector changes.
-        function toggleCarPreconButtonOptions() {
-            updatePreconButtonVisibility();
         }
 		let latest_car_models = null;
 		// does this board have the car-on sense pin? read from /check_status;
