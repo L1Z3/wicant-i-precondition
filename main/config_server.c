@@ -157,7 +157,7 @@ const char device_config_default[] = R"json({
 "mqtt_rx_topic":"wican/%s/can/rx",
 "mqtt_status_topic":"wican/%s/can/status",
 "battery_temp_unit":"c",
-"egmp_car_model":"unknown",
+"egmp_car_model":"auto",
 "precon_mode":"once",
 "precon_button":"sw_star",
 "precon_press":"short"
@@ -1061,8 +1061,14 @@ char *config_server_get_status_json(bool remove_sensitive_info)
         cJSON_AddBoolToObject(root, "precondition_starting", pstate.starting);
 	}
 
-	// live value, including a model auto-detected from CAN this session
-	cJSON_AddStringToObject(root, "egmp_car_model", device_config.egmp_car_model);
+	// car identified from CAN this session; the web UI filters the buttons
+	// by it when the vehicle setting is "auto"
+	egmp_car_model_t car_model;
+	if (precondition_get_car_model(&car_model)) {
+		cJSON_AddStringToObject(root, "egmp_car_model_detected",
+				car_model == EGMP_CAR_IONIQ6 ? "ioniq6"
+				: car_model == EGMP_CAR_EV6 ? "ev6" : "ioniq5");
+	}
 
 	precondition_soc_t soc;
 
@@ -2139,7 +2145,7 @@ static void config_server_load_cfg(char *cfg)
 	key = cJSON_GetObjectItem(root,"egmp_car_model");
 	if(key == 0)
 	{
-		strcpy(device_config.egmp_car_model, "unknown");
+		strcpy(device_config.egmp_car_model, "auto");
 	}
 	else if(strlen(key->valuestring) >= sizeof(device_config.egmp_car_model))
 	{
@@ -3205,55 +3211,4 @@ int8_t config_server_precon_press(void)
 		return PRESS_LONG;
 	}
 	return PRESS_SHORT;
-}
-
-void config_server_set_egmp_car_model(const char *model)
-{
-	// Only initialize the model from detection while it is still at the
-	// factory default; never overwrite a model the user has selected.
-	if(model == NULL
-			|| strcmp(device_config.egmp_car_model, "unknown") != 0
-			|| strcmp(device_config.egmp_car_model, model) == 0)
-	{
-		return;
-	}
-	if(strlen(model) >= sizeof(device_config.egmp_car_model))
-	{
-		return;
-	}
-
-	strcpy(device_config.egmp_car_model, model);
-	ESP_LOGI(TAG, "egmp_car_model initialized from CAN: %s",
-			device_config.egmp_car_model);
-
-	// Persist to config.json so the detection survives a reboot. No restart
-	// here: this runs on the CAN task while the car is talking. The live value
-	// is reported to the web UI through /check_status, not the cached
-	// device_config_file buffer.
-	cJSON *root = cJSON_Parse(device_config_file);
-	if(root == NULL)
-	{
-		return;
-	}
-	cJSON *key = cJSON_GetObjectItem(root, "egmp_car_model");
-	if(key == NULL)
-	{
-		cJSON_AddStringToObject(root, "egmp_car_model", device_config.egmp_car_model);
-	}
-	else
-	{
-		cJSON_SetValuestring(key, device_config.egmp_car_model);
-	}
-	const char *updated = cJSON_Print(root);
-	if(updated != NULL)
-	{
-		FILE *f = fopen(FS_MOUNT_POINT"/config.json", "w");
-		if(f != NULL)
-		{
-			fputs(updated, f);
-			fclose(f);
-		}
-		free((void *)updated);
-	}
-	cJSON_Delete(root);
 }

@@ -382,6 +382,7 @@ static struct {
 
 static QueueHandle_t battery_temperature_queue = NULL;
 static QueueHandle_t battery_soc_queue = NULL;
+static QueueHandle_t car_model_queue = NULL;
 static QueueHandle_t precondition_state_queue = NULL;
 static QueueHandle_t precondition_toggle_queue = NULL;
 
@@ -1390,25 +1391,26 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
             sm_send_event(sm, EV_STATUS_IDLE);
         }
 
-        // identify the car once so the config's egmp_car_model can be
-        // initialized (only while it is still at the default). the car model
-        // cannot change without a reboot, so cache the result instead of
-        // re-running this on every periodic status frame. only a recognised
-        // status byte is trusted to carry the model bit.
+        // identify the car for the web UI's "auto" vehicle setting. the car
+        // model cannot change without a reboot, so publish it once instead of
+        // on every periodic status frame. only a recognised status byte is
+        // trusted to carry the model bit.
         //   Ioniq 6: 0x0A82AA03
         //   Ioniq 5: 0x2AD, STATUS_EV6_BIT clear
         //   EV6:     0x2AD, STATUS_EV6_BIT set
-        static bool egmp_car_model_detected = false;
-        if (!egmp_car_model_detected
+        static bool car_model_detected = false;
+        if (!car_model_detected
                 && (STATUS_IDLE(status) || STATUS_STARTING(status) || STATUS_STARTED(status))) {
+            egmp_car_model_t model;
             if (to_push->identifier == 0x0A82AA03U) {
-                config_server_set_egmp_car_model("ioniq6");
+                model = EGMP_CAR_IONIQ6;
             } else if (status & STATUS_EV6_BIT) {
-                config_server_set_egmp_car_model("ev6");
+                model = EGMP_CAR_EV6;
             } else {
-                config_server_set_egmp_car_model("ioniq5");
+                model = EGMP_CAR_IONIQ5;
             }
-            egmp_car_model_detected = true;
+            xQueueOverwrite(car_model_queue, &model);
+            car_model_detected = true;
         }
     }
 
@@ -1540,6 +1542,8 @@ void precondition_init(void) {
     configASSERT(battery_temperature_queue != NULL);
     battery_soc_queue = xQueueCreate(1, sizeof(precondition_soc_t));
     configASSERT(battery_soc_queue != NULL);
+    car_model_queue = xQueueCreate(1, sizeof(egmp_car_model_t));
+    configASSERT(car_model_queue != NULL);
     precondition_state_queue = xQueueCreate(1, sizeof(precondition_state_t));
     configASSERT(precondition_state_queue != NULL);
     precondition_toggle_queue = xQueueCreate(1, sizeof(uint8_t));
@@ -1581,6 +1585,14 @@ bool precondition_get_battery_soc(precondition_soc_t *out) {
     }
 
     return xQueuePeek(battery_soc_queue, out, 0) == pdTRUE;
+}
+
+bool precondition_get_car_model(egmp_car_model_t *out) {
+    if (out == NULL || car_model_queue == NULL) {
+        return false;
+    }
+
+    return xQueuePeek(car_model_queue, out, 0) == pdTRUE;
 }
 
 bool car_in_ready(void) {

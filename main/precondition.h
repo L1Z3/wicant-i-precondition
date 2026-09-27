@@ -38,6 +38,16 @@ typedef struct {
 
 bool precondition_get_battery_soc(precondition_soc_t *out);
 
+// E-GMP model identified from the precondition status frame. Only the web UI's
+// button filter uses it, when the vehicle setting is "auto".
+typedef enum {
+    EGMP_CAR_IONIQ5,
+    EGMP_CAR_IONIQ6,
+    EGMP_CAR_EV6,
+} egmp_car_model_t;
+
+bool precondition_get_car_model(egmp_car_model_t *out);
+
 // Is the car currently in READY? Tracks the 0x038 power-status edge the same
 // way the state machine does; false until a 0x038 frame is seen. The negation
 // is the persistent state behind the EV_CAR_NOT_READY event.
