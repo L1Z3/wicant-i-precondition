@@ -1,6 +1,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include "beep.h"
 #include "esp_log.h"
 #include "isotp_tx.h"
 #include "track_popup.h"
@@ -43,6 +44,7 @@
 typedef struct {
     size_t size;
     uint8_t data[TRACK_POPUP_MAX_TEXT_BYTES];
+    uint8_t beep_count;
 } track_popup_request_t;
 
 typedef struct {
@@ -338,6 +340,9 @@ static void idle_enter(sm_t *sm) {
 static void idle_tick(sm_t *sm) {
     track_popup_t *service = owner(sm);
     if (xQueueReceive(service->queue, &service->pending_request, 0) == pdTRUE) {
+        if (!beep_play(service->pending_request.beep_count)) {
+            ESP_LOGW(TAG, "could not queue popup beeps");
+        }
         sm_transition(sm, &S_TRIGGER);
     }
 }
@@ -530,19 +535,23 @@ fwd_result_t track_popup_fwd(twai_message_t *msg, can_bus_t fwd_bus) {
     return sm_fwd(&popup.sm, msg, fwd_bus);
 }
 
-bool track_popup_show(const char *utf8_text) {
+static bool queue_popup(const char *utf8_text, uint8_t beep_count) {
     if (popup.queue == NULL) {
         return false;
     }
-    track_popup_request_t request = {0};
+    track_popup_request_t request = { .beep_count = beep_count };
     if (!encode_text(utf8_text, &request)) {
         return false;
     }
     return xQueueSend(popup.queue, &request, 0) == pdTRUE;
 }
 
+bool track_popup_show(const char *utf8_text) {
+    return queue_popup(utf8_text, 1U);
+}
+
 static bool track_popup_show_prefixed(const char *prefix,
-                                      const char *utf8_text) {
+                                      const char *utf8_text, uint8_t beep_count) {
     if (popup.queue == NULL || utf8_text == NULL || utf8_text[0] == '\0') {
         return false;
     }
@@ -556,17 +565,17 @@ static bool track_popup_show_prefixed(const char *prefix,
     }
     memcpy(prefixed, prefix, prefix_size);
     memcpy(prefixed + prefix_size, utf8_text, text_size + 1U);
-    return track_popup_show(prefixed);
+    return queue_popup(prefixed, beep_count);
 }
 
 bool track_popup_show_info(const char *utf8_text) {
-    return track_popup_show_prefixed("ⓘ ", utf8_text);
+    return track_popup_show_prefixed("ⓘ ", utf8_text, 1U);
 }
 
 bool track_popup_show_warning(const char *utf8_text) {
-    return track_popup_show_prefixed("⚠ ", utf8_text);
+    return track_popup_show_prefixed("⚠ ", utf8_text, 2U);
 }
 
 bool track_popup_show_error(const char *utf8_text) {
-    return track_popup_show_prefixed("‼ ", utf8_text);
+    return track_popup_show_prefixed("‼ ", utf8_text, 3U);
 }

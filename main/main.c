@@ -55,6 +55,7 @@
 #include "hw_config.h"
 #include "dev_status.h"
 #include "precondition.h"
+#include "beep.h"
 #include "debug_logs.h"
 #include "debug_logs_config.h"
 
@@ -539,8 +540,8 @@ void app_main(void)
             derived_mac_addr[3], derived_mac_addr[4], derived_mac_addr[5]);
 	
 	config_server_start(&xmsg_ws_tx_queue, &xMsg_Rx_Queue, CONNECTED_LED_GPIO_NUM, (char*)&uid[0]);
-	// must run after config_server_start: entering the initial state reads the
-	// precon mode from the config
+	// These services read wiring and preconditioning settings during initialization.
+	beep_init();
 	precondition_init();
 	slcan_init(&send_to_host);
 
