@@ -37,3 +37,9 @@ int8_t config_server_precon_button(void);
 int8_t config_server_precon_mode(void);
 int8_t config_server_precon_press(void);
 int8_t config_server_get_fwd_en(void);
+
+// charge-limit config, read/written by car_settings.c
+int config_server_get_charge_ac_limit(void);
+int config_server_get_charge_dc_limit(void);
+void config_server_set_charge_ac_limit(uint8_t percent);
+void config_server_set_charge_dc_limit(uint8_t percent);
