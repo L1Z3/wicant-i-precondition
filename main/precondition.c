@@ -154,8 +154,9 @@ static bool activation_is_release(const message_payload_t *msg, const twai_messa
 // set on EV6 (0x41/0x45/0x55), clear on Ioniq 5 (0x01/0x05/0x15)
 #define STATUS_EV6_BIT 0x40U
 
+// 0x038 for Ioniq 5/EV6, 0x00C03503 for Ioniq 6
 #define IS_POWER_STATUS_FRAME(frame_id) \
-    ((frame_id) == 0x038U)
+    ((frame_id) == 0x038U || (frame_id) == 0x00C03503U)
 
 #define IS_BMU_CONTROL_FRAME(frame_id) \
     ((frame_id) == 0x0C7U)
@@ -247,8 +248,8 @@ enum {
     EV_STATUS_IDLE,     // car reports preconditioning off/idle
     EV_STATUS_STARTING, // car reports preconditioning starting
     EV_STATUS_STARTED,  // car reports preconditioning fully running
-    EV_CAR_READY,       // car power entered READY (0x038 edge)
-    EV_CAR_NOT_READY,   // car power left READY (0x038 edge)
+    EV_CAR_READY,       // car power entered READY (power-status edge)
+    EV_CAR_NOT_READY,   // car power left READY (power-status edge)
     EV_TEMPERATURE_FRAME, // valid battery temperature sample received
     EV_SOC_BECAME_LOW,  // HV battery SoC crossed below the start cutoff
     EV_UTILITY_MODE,    // car entered utility mode
@@ -274,9 +275,9 @@ typedef enum {
     PRECON_STATUS_STARTED,
 } precon_status_t;
 
-// most recent power (READY) status reported by the car via 0x038. UNKNOWN
-// until the first such frame, which never arrives on platforms where that
-// frame is unavailable
+// most recent power (READY) status reported by the car via the power-status
+// frame. UNKNOWN until the first such frame, which never arrives on platforms
+// where that frame is unavailable
 typedef enum {
     READY_STATUS_UNKNOWN = 0,
     READY_STATUS_NOT_READY,
@@ -355,10 +356,10 @@ static struct {
 static struct {
     // most recent recognized preconditioning status reported by the car
     precon_status_t precon_status;
-    // latest power (READY) status from 0x038; stays UNKNOWN on platforms where
-    // that frame is unavailable. Shared with sleep/status readers; relaxed
-    // accesses suffice because this value does not signal that other shared
-    // data is ready to read.
+    // latest power (READY) status from the power-status frame; stays UNKNOWN on
+    // platforms where that frame is unavailable. Shared with sleep/status
+    // readers; relaxed accesses suffice because this value does not signal that
+    // other shared data is ready to read.
     _Atomic ready_status_t ready_status;
     bool car_in_utility;
 } platform;
@@ -1331,8 +1332,8 @@ static void precondition_global_tick(sm_t *sm) {
 static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_bus_t rx_bus) {
     track_popup_rx(to_push, rx_bus);
 
-    // 0x038 power status: the low nibble of byte 0 reads 0x04 while the car is
-    // in READY. only act on edges
+    // 0x038/0x00C03503 power status: the low nibble of byte 0 reads 0x04 while
+    // the car is in READY. only act on edges
     if (IS_POWER_STATUS_FRAME(to_push->identifier)
             && rx_bus == CAR_BUS
             && to_push->data_length_code >= 1U) {
@@ -1364,8 +1365,9 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
         // utility mode requested
         platform.car_in_utility = true;
         // only arm the blocker where the READY status is observable: that edge
-        // is the only thing that clears it, so on platforms without 0x038 the
-        // blocker would latch forever and silently forbid every later start
+        // is the only thing that clears it, so on platforms without the
+        // power-status frame the blocker would latch forever and silently
+        // forbid every later start
         update_precon_blocker(
             PRECONDITION_BLOCK_UTILITY_MODE,
             ready_status_available()
