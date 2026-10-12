@@ -1104,8 +1104,9 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 		cJSON_AddStringToObject(root, "car_on_sense_voltage", car_on_sense_voltage_str);
 	}
 
-	// CAN-derived READY state (0x038 power status); shown by the web UI in
-	// place of the car-on sense voltage on boards without the sense pin.
+	// CAN-derived READY state (0x038 power status, 0x00C03503 on Ioniq 6);
+	// shown by the web UI in place of the car-on sense voltage on boards
+	// without the sense pin.
 	cJSON_AddStringToObject(root, "can_ready_state", car_in_ready() ? "Ready" : "Not Ready");
 
 	char uptime_str[32];
