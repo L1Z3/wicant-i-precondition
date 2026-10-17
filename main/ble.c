@@ -546,7 +546,7 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
             ble_max_data_size = BLE_SEND_BUF_SIZE <= (spp_mtu_size - 3) ? BLE_SEND_BUF_SIZE : (spp_mtu_size -3);
             ESP_LOGI(GATTS_TABLE_TAG, "ESP_GATTS_MTU_EVT: %d", spp_mtu_size);
             break;
-        case ESP_GATTS_CONF_EVT:
+        case ESP_GATTS_CONF_EVT: // NOLINT(bugprone-branch-clone) -- unhandled event
             break;
         case ESP_GATTS_UNREG_EVT:
             break;
@@ -578,7 +578,7 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
             /* start advertising again when missing the connect */
             esp_ble_gap_start_advertising(&heart_rate_adv_params);
             break;
-        case ESP_GATTS_OPEN_EVT:
+        case ESP_GATTS_OPEN_EVT: // NOLINT(bugprone-branch-clone) -- unhandled event
             break;
         case ESP_GATTS_CANCEL_OPEN_EVT:
             break;

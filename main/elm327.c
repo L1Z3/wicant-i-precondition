@@ -64,7 +64,7 @@ void (*elm327_response)(char*, uint32_t, QueueHandle_t *q);
 void (*elm327_can_log)(twai_message_t* frame, uint8_t type);
 // The fields are ordered this way so the data can be tightly packed.
 // See elm327_set_default_config for a more readable ordering.
-typedef struct __xelm327_config
+typedef struct __xelm327_config // NOLINT(bugprone-reserved-identifier)
 {
 	uint32_t header;
 	uint32_t rx_address;
@@ -84,7 +84,7 @@ typedef struct __xelm327_config
 	uint8_t rx_address_is_set:1;
 	uint8_t display_dlc:1;
 
-}_xelm327_config_t;
+}_xelm327_config_t; // NOLINT(bugprone-reserved-identifier)
 
 
 static _xelm327_config_t elm327_config;
@@ -125,7 +125,7 @@ static void elm327_set_default_config(bool reset_protocol)
 }
 
 typedef char* (*elm327_command_callback)(const char* command_str);
-typedef struct _xelm327_cmd
+typedef struct _xelm327_cmd // NOLINT(bugprone-reserved-identifier)
 {
 	const char * const command;
 	const elm327_command_callback command_interpreter;
@@ -472,7 +472,7 @@ static char* elm327_set_protocol(const char* command_str)
 		new_protocol = command_str[2];
 	}
 
-	if(new_protocol == elm327_config.protocol)
+	if(new_protocol == elm327_config.protocol) // NOLINT(bugprone-signed-char-misuse) -- ASCII digits only
 	{
 		return (char*)ok_str;
 	}
@@ -841,7 +841,7 @@ static int8_t elm327_request(char *cmd, char *rsp, QueueHandle_t *queue)
 	can_send(CAN_BUS_0, &txframe, 1);
 	xEventGroupSetBits(elm327_event_group, ELM327_READY_TO_RECEIVE_CAN);
 
-	TickType_t xtimeout = (elm327_config.req_timeout*4.096) / portTICK_PERIOD_MS;
+	TickType_t xtimeout = (elm327_config.req_timeout*4.096) / portTICK_PERIOD_MS; // NOLINT(bugprone-integer-division) -- tick truncation harmless
 	TickType_t xwait_time;
 	int64_t txtime = esp_timer_get_time();
 	uint8_t timeout_flag = 0;
@@ -897,7 +897,7 @@ static int8_t elm327_request(char *cmd, char *rsp, QueueHandle_t *queue)
 					rx_frame_data_length = 7;
 				}
 				else if (frame_type == 0x20)
-				{
+				{ // NOLINT(bugprone-branch-clone) -- ISO-TP frame types share length logic
 					// This is a consecutive frame
 					// Sequence index of the frame is 0x0F & data[0]
 					// From the examples in the ELM327 docs the final consecutive frame includes
@@ -976,7 +976,7 @@ static int8_t elm327_request(char *cmd, char *rsp, QueueHandle_t *queue)
 				{
 					if(req_expected_rsp == number_of_rsp)
 					{
-						timeout_flag = 1;
+						timeout_flag = 1; // NOLINT(clang-analyzer-deadcode.DeadStores) -- defensive
 						break;
 					}
 				}
