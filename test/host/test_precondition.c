@@ -131,14 +131,6 @@ static void car_status(uint8_t b, can_bus_t bus) { uint8_t d[8] = {0}; d[1] = b;
 // remap of the 11-bit 0x2AD).
 static void ioniq6_status(uint8_t b, can_bus_t bus) { uint8_t d[8] = {0}; d[1] = b; rx_frame(0x0A82AA03, d, bus); }
 static void car_power(bool ready) { uint8_t d[8] = {0}; d[0] = ready ? 0x04 : 0x00; rx_frame(0x038, d, CAN_BUS_0); }
-// Ioniq 6 carries the power status on the 29-bit 0x00C03503 (the CCU-hub remap
-// of the 11-bit 0x038). Byte 0's low nibble reads 0x04 in READY and 0x01 awake
-// but off, so this takes the raw byte rather than a bool.
-static void ioniq6_power(uint8_t byte0, can_bus_t bus) {
-    uint8_t d[8] = {0};
-    d[0] = byte0;
-    rx_frame(0x00C03503, d, bus);
-}
 // Ioniq 5/EV6 broadcast battery temperature on 0x152 and SoC on 0x2FC; Ioniq 6
 // uses 29-bit extended IDs for the same payloads, and the firmware's
 // IS_BATTERY_TEMPERATURE_FRAME / IS_BATTERY_SOC_FRAME accept either ID. The
@@ -722,65 +714,6 @@ static void run_ioniq6_status_frame(void) {
     ioniq6_status(0x15, CAN_BUS_0);
     CHECK(platform.precon_status == PRECON_STATUS_STARTED);
     expect_state("active");
-}
-
-// The Ioniq 6 form of the power-status frame, 0x00C03503: the 11-bit 0x038 never
-// appears on that car's bus, so this is the only READY source. READY is what
-// gates a repeating mode's relaunch (managed_tick) and arms the utility-mode
-// blocker, so a missed READY edge silently stops continuous/persistent retries.
-static void run_ioniq6_power_status(void) {
-    precondition_init();
-    expect_state("idle");
-    CHECK(platform.ready_status == READY_STATUS_UNKNOWN);
-    CHECK(!car_in_ready());
-
-    // Wrong bus: a head-unit copy of the Ioniq 6 id is not the car's READY.
-    ioniq6_power(0x04, CAN_BUS_1);
-    CHECK(platform.ready_status == READY_STATUS_UNKNOWN);
-    CHECK(!car_in_ready());
-
-    // The 11-bit form still decodes (either ID is accepted)...
-    car_power(true);
-    CHECK(platform.ready_status == READY_STATUS_READY);
-    car_power(false);
-    CHECK(platform.ready_status == READY_STATUS_NOT_READY);
-
-    // ...and the Ioniq 6 id sets READY from byte 0's low nibble, then drops it
-    // again for the 0x01 an awake-but-off car reports.
-    ioniq6_power(0x04, CAN_BUS_0);
-    CHECK(platform.ready_status == READY_STATUS_READY);
-    CHECK(car_in_ready());
-    ioniq6_power(0x01, CAN_BUS_0);
-    CHECK(platform.ready_status == READY_STATUS_NOT_READY);
-    CHECK(!car_in_ready());
-    ioniq6_power(0x04, CAN_BUS_0);                 // READY again for the relaunch
-    CHECK(car_in_ready());
-
-    // READY on this ID is what relaunches a persistent session: start one, take
-    // the car off, then let the Ioniq 6 READY edge drive CAR_START_DELAY.
-    battery_temperature(7, 10);
-    toggle();
-    expect_state("start-burst");
-    for (int i = 0; i < 6; i++) tick1();
-    car_status(0x05, CAN_BUS_0);
-    car_status(0x15, CAN_BUS_0);
-    expect_state("active");
-
-    ioniq6_power(0x01, CAN_BUS_0);                 // car off
-    expect_state("managed");
-    CHECK(!car_in_ready());
-    sent_count = 0;
-    advance_us(REPEATING_MODE_RETRY_INTERVAL_US + 10000000LL);
-    CHECK(sent_count == 0);                        // no nudge while not READY
-    expect_state("managed");
-
-    ioniq6_power(0x04, CAN_BUS_0);                 // READY edge
-    expect_state("car-start-delay");
-    advance_us(PRECONDITION_CAR_START_DELAY_US - 40000);
-    expect_state("car-start-delay");
-    tick1();
-    expect_state("start-burst");
-    CHECK(requested.kind == ATTEMPT_CAR_START);
 }
 
 static void run_automatic_temperature_cutoff(void) {
@@ -1913,7 +1846,6 @@ static const suite_t suites[] = {
     {"precondition battery state of charge", ONCE, PRESS_SHORT, run_battery_soc},
     {"precondition Ioniq 6 battery frames", ONCE, PRESS_SHORT, run_ioniq6_battery_frames},
     {"precondition Ioniq 6 status frame", ONCE, PRESS_SHORT, run_ioniq6_status_frame},
-    {"precondition Ioniq 6 power status", PERSISTENT, PRESS_SHORT, run_ioniq6_power_status},
     {"precondition automatic temperature cutoff", CONTINUOUS, PRESS_SHORT, run_automatic_temperature_cutoff},
     {"precondition persistent temperature cutoff", PERSISTENT, PRESS_SHORT, run_automatic_temperature_cutoff},
     {"precondition continuous cool wait", CONTINUOUS, PRESS_SHORT, run_managed_cool_wait},

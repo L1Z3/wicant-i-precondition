@@ -406,16 +406,16 @@ static void adc_task(void *pvParameters)
         // but a car that looks "on" inhibits sleeping and forces a wake. The
         // car looks on if either the hot-when-on sense pin is above the fixed
         // CAR_ON_THRESHOLD_V (pin-equipped boards only), or the CAN-derived
-        // READY state (0x038, or the 29-bit 0x00C03503 on Ioniq 6) is set.
+        // READY state (0x038 power status) is set.
         //
         // NOTE: neither signal is guaranteed to be reachable today, so this
         // condition may never fire on some setups. Without the sense pin the
         // first term is constant false; car_in_ready() stays false until a
-        // power-status frame is seen, which the bus may never carry; and once
-        // asleep the CAN buses are disabled, so car_in_ready() can no longer
-        // change and the wake path falls back to the battery voltage crossing
-        // the setpoint. Keep the condition anyway: it is the correct one
-        // wherever those signals do exist.
+        // 0x038 frame is seen, which the bus may never carry; and once asleep
+        // the CAN buses are disabled, so car_in_ready() can no longer change
+        // and the wake path falls back to the battery voltage crossing the
+        // setpoint. Keep the condition anyway: it is the correct one wherever
+        // those signals do exist.
         //
         // The two signals are not completely equivalent. The car-on sense pin
         // uses MODULE5 voltage, which is `HOT IN ON OR START`, so lower power 
