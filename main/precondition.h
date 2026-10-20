@@ -27,8 +27,7 @@ typedef struct {
 void precondition_toggle_request(void);
 bool precondition_get_state(precondition_state_t *out);
 
-// SoC is transmitted in half-percent steps on the 0x2FC frame (Ioniq 5/EV6) and
-// the 29-bit 0x0BC2FA02 frame (Ioniq 6).
+// SoC on 0x2FC frame is transmitted in half-percent steps.
 #define BATTERY_SOC_SCALE 0.5f
 
 typedef struct {
