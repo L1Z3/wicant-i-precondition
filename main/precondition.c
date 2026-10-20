@@ -188,24 +188,22 @@ static bool is_utility_request(const twai_message_t *frame) {
 #define REPEATING_MODE_COOL_WAIT_US (3LL * 60LL * 1000000LL)  // continuously below cutoff before first re-nudge
 #define REPEATING_MODE_RETRY_INTERVAL_US (5LL * 60LL * 1000000LL)  // 5 minutes between re-nudges
 
+#define BATTERY_TEMPERATURE_FRAME_ID 0x152U
 #define BATTERY_TEMPERATURE_MIN_INDEX 0U
 #define BATTERY_TEMPERATURE_MAX_INDEX 1U
 #define BATTERY_TEMPERATURE_DATA_LENGTH 2U
 #define PRECONDITION_BATTERY_TEMPERATURE_CUTOFF_C 21
 
-// 0x152 for Ioniq 5/EV6, 0x05415002 for Ioniq 6
-#define IS_BATTERY_TEMPERATURE_FRAME(frame_id) \
-    ((frame_id) == 0x152U || (frame_id) == 0x05415002U)
+#define IS_BATTERY_TEMPERATURE_FRAME(frame_id) ((frame_id) == BATTERY_TEMPERATURE_FRAME_ID)
 
 // High-voltage battery state of charge. Last byte has SoC in half-percent steps.
+#define BATTERY_SOC_FRAME_ID 0x2FCU
 #define BATTERY_SOC_INDEX 7U
 #define BATTERY_SOC_DATA_LENGTH 8U
 #define PRECONDITION_BATTERY_SOC_CUTOFF_PCT 20U
 #define PRECONDITION_BATTERY_SOC_CUTOFF_RAW (PRECONDITION_BATTERY_SOC_CUTOFF_PCT * 2U)
 
-// 0x2FC for Ioniq 5/EV6, 0x0BC2FA02 for Ioniq 6
-#define IS_BATTERY_SOC_FRAME(frame_id) \
-    ((frame_id) == 0x2FCU || (frame_id) == 0x0BC2FA02U)
+#define IS_BATTERY_SOC_FRAME(frame_id) ((frame_id) == BATTERY_SOC_FRAME_ID)
 
 #define CAR_BUS CAN_BUS_0
 #if CAN_BUS_COUNT > 1
