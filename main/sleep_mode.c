@@ -594,6 +594,7 @@ int8_t sleep_mode_init(uint8_t enable, float sleep_volt)
 #include "hw_config.h"
 #include "sdcard.h"
 #include "ble.h"
+#include "precondition.h"
 
 #define ADC_UNIT          ADC_UNIT_1
 #define ADC_CONV_MODE     ADC_CONV_SINGLE_UNIT_1
@@ -925,13 +926,23 @@ void light_sleep_task(void *pvParameters)
             }
         }
 
-        if (ret == ESP_OK && sleep_en == 1) 
+        // Car-off sleep (mode 2) uses the same voltage setpoint as low-voltage
+        // sleep, but a car that looks awake inhibits sleeping and forces a
+        // wake. The Pro has no car-on sense pin, so the CAN-derived READY state
+        // (0x038, or 0x00C03503 on Ioniq 6) is the only signal. It stays false
+        // until a power-status frame is seen, and cannot change once asleep
+        // because the CAN buses are disabled; the wake path then falls back to
+        // the battery voltage crossing the setpoint.
+        bool car_awake = car_in_ready();
+
+        if (ret == ESP_OK && (sleep_en == 1 || sleep_en == 2))
 		{
             // State machine logic
             switch (current_state) 
 			{
                 case STATE_NORMAL:
-                    if (battery_voltage < sleep_voltage) 
+                    if (battery_voltage < sleep_voltage
+                            && !(sleep_en == 2 && car_awake))
 					{
                         ESP_LOGW(TAG, "Battery voltage low (%.2fV), starting low voltage timer", battery_voltage);
                         current_state = STATE_LOW_VOLTAGE;
@@ -940,7 +951,8 @@ void light_sleep_task(void *pvParameters)
                     break;
 
                 case STATE_LOW_VOLTAGE:
-                    if (battery_voltage >= wakeup_voltage) 
+                    if (battery_voltage >= wakeup_voltage
+                            || (sleep_en == 2 && car_awake))
 					{
                         ESP_LOGI(TAG, "Battery voltage recovered (%.2fV)", battery_voltage);
                         current_state = STATE_NORMAL;
@@ -970,7 +982,8 @@ void light_sleep_task(void *pvParameters)
                     break;
 
                 case STATE_SLEEPING:
-                    if (battery_voltage >= wakeup_voltage) 
+                    if (battery_voltage >= wakeup_voltage
+                            || (sleep_en == 2 && car_awake))
 					{
                         ESP_LOGI(TAG, "Voltage above wakeup threshold, starting wakeup timer");
                         current_state = STATE_WAKE_PENDING;
@@ -985,7 +998,8 @@ void light_sleep_task(void *pvParameters)
                     break;
 
                 case STATE_WAKE_PENDING:
-                    if (battery_voltage < wakeup_voltage) 
+                    if (battery_voltage < wakeup_voltage
+                            && !(sleep_en == 2 && car_awake))
 					{
                         // Voltage dropped again, go back to sleep
                         current_state = STATE_SLEEPING;

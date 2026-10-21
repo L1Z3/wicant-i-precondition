@@ -37,7 +37,13 @@ set(srcs
     "multipart_upload.c"
     "sync_sys_time.c"
     "config_mode.c"
+    "utf8_utf16_converter.c"
+    "hsm.c"
+    "isotp_tx.c"
+    "beep.c"
+    "track_popup.c"
     "precondition.c"
+    "persistent_settings.c"
 )
 
 # Define required components

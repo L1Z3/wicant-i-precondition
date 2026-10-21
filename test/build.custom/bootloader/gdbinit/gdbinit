@@ -1,0 +1,2 @@
+source /home/trh/Packages/wicant-i-precondition/test/build.custom/bootloader/gdbinit/symbols
+source /home/trh/Packages/wicant-i-precondition/test/build.custom/bootloader/gdbinit/connect

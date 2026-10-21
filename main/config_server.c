@@ -96,6 +96,9 @@
 #include "ha_webhooks.h"
 #include "autopid_http.h"
 #include "obd2_standard_pids.h"
+#include "precondition.h"
+#include "track_popup.h"
+#include "esp_timer.h"
 
 #include <ws_router.h>
 #include "ws_server.h"
@@ -222,13 +225,14 @@ const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\",\"we
 										\"home_ssid\":\"MeatPi\",\"home_password\":\"TomatoSauce\",\"home_security\":\"wpa3\",\"home_protocol\":\"elm327\",\
 										\"drive_ssid\":\"MeatPi\",\"drive_password\":\"TomatoSauce\",\"drive_security\":\"wpa3\",\"drive_protocol\":\"elm327\",\"drive_connection_type\":\"wifi\",\"drive_mode_timeout\":\"60\",\
 										\"can_datarate\":\"500K\",\
-										\"can_mode\":\"normal\",\"port_type\":\"tcp\",\"port\":\"35000\",\"ap_pass\":\"@meatpi#\",\"protocol\":\"elm327\",\"ble_pass\":\"123456\",\
+										\"can_mode\":\"normal\",\"port_type\":\"tcp\",\"port\":\"35000\",\"ap_pass\":\"@meatpi#\",\"protocol\":\"savvycan\",\"ble_pass\":\"123456\",\
 								\"ble_status\":\"disable\",\"ble_power\":\"9\",\"sleep_status\":\"enable\",\"periodic_wakeup\":\"disable\",\"sleep_volt\":\"13.1\",\"wakeup_volt\":\"13.5\",\"sleep_time\":\"5\",\"wakeup_interval\":\"90\",\"batt_alert\":\"disable\",\
 										\"batt_alert_ssid\":\"MeatPi\",\"batt_alert_pass\":\"TomatoSauce\",\"batt_alert_volt\":\"11.0\",\"batt_alert_protocol\":\"mqtt\",\
 										\"batt_alert_url\":\"mqtt://mqtt.eclipseprojects.io\",\"batt_alert_port\":\"1883\",\"batt_alert_topic\":\"CAR1/voltage\",\"batt_mqtt_user\":\"meatpi\",\
 								\"batt_mqtt_pass\":\"meatpi\",\"batt_alert_time\":\"1\",\"mqtt_en\":\"disable\",\"mqtt_elm327_log\":\"disable\",\"elm327_udp_log\":\"disable\",\"mqtt_url\":\"mqtt://127.0.0.1\",\"mqtt_port\":\"1883\",\
 										\"mqtt_user\":\"meatpi\",\"mqtt_pass\":\"meatpi\",\"mqtt_tx_topic\":\"wican/%s/can/tx\",\"mqtt_rx_topic\":\"wican/%s/can/rx\",\"mqtt_status_topic\":\"wican/%s/can/status\",\"mqtt_security\":\"none\",\"mqtt_cert_set\": \"default\",\"mqtt_skip_cn\":\"disable\",\
-										\"logger_status\":\"disable\",\"log_filesystem\":\"littlefs\",\"log_storage\":\"sdcard\",\"log_period\":\"10\"}";
+										\"logger_status\":\"disable\",\"log_filesystem\":\"littlefs\",\"log_storage\":\"sdcard\",\"log_period\":\"10\",\
+										\"battery_temp_unit\":\"c\",\"egmp_car_model\":\"auto\",\"precon_mode\":\"once\",\"precon_button\":\"sw_star\",\"precon_press\":\"short\"}";
 
 // const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\", \"ap_auto_disable\": \"disable\",\"sta_ssid\":\"MeatPi\",\"sta_pass\":\"TomatoSauce\",\"sta_security\":\"wpa3\",\"can_datarate\":\"500K\",\"can_mode\":\"normal\",\"port_type\":\"tcp\",\"port\":\"35000\",\"ap_pass\":\"@meatpi#\",\"protocol\":\"elm327\",\"ble_pass\":\"123456\",\"ble_status\":\"disable\",\"sleep_status\":\"disable\",\"sleep_volt\":\"13.1\",\"wakeup_volt\":\"13.5\",\"batt_alert\":\"disable\",\"batt_alert_ssid\":\"MeatPi\",\"batt_alert_pass\":\"TomatoSauce\",\"batt_alert_volt\":\"11.0\",\"batt_alert_protocol\":\"mqtt\",\"batt_alert_url\":\"mqtt://mqtt.eclipseprojects.io\",\"batt_alert_port\":\"1883\",\"batt_alert_topic\":\"CAR1/voltage\",\"batt_mqtt_user\":\"meatpi\",\"batt_mqtt_pass\":\"meatpi\",\"batt_alert_time\":\"1\",\"mqtt_en\":\"disable\",\"mqtt_elm327_log\":\"disable\",\"mqtt_url\":\"mqtt://127.0.0.1\",\"mqtt_port\":\"1883\",\"mqtt_user\":\"meatpi\",\"mqtt_pass\":\"meatpi\",\"mqtt_tx_topic\":\"wican/%s/can/tx\",\"mqtt_rx_topic\":\"wican/%s/can/rx\",\"mqtt_status_topic\":\"wican/%s/can/status\"}";
 // const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\", \"ap_auto_disable\": \"disable\",\"sta_ssid\":\"MeatPi\",\"sta_pass\":\"TomatoSauce\",\"sta_security\":\"wpa3\",\"can_datarate\":\"500K\",\"can_mode\":\"normal\",\"port_type\":\"tcp\",\"port\":\"35000\",\"ap_pass\":\"@meatpi#\",\"protocol\":\"elm327\",\"ble_pass\":\"123456\",\"ble_status\":\"disable\",\"sleep_status\":\"disable\",\"sleep_volt\":\"13.1\",\"wakeup_volt\":\"13.5\",\"periodic_wakeup\":\"disable\",\"wakeup_interval\":\"5\",\"batt_alert\":\"disable\",\"batt_alert_ssid\":\"MeatPi\",\"batt_alert_pass\":\"TomatoSauce\",\"batt_alert_volt\":\"11.0\",\"batt_alert_protocol\":\"mqtt\",\"batt_alert_url\":\"mqtt://mqtt.eclipseprojects.io\",\"batt_alert_port\":\"1883\",\"batt_alert_topic\":\"CAR1/voltage\",\"batt_mqtt_user\":\"meatpi\",\"batt_mqtt_pass\":\"meatpi\",\"batt_alert_time\":\"1\",\"mqtt_en\":\"disable\",\"mqtt_elm327_log\":\"disable\",\"mqtt_url\":\"mqtt://127.0.0.1\",\"mqtt_port\":\"1883\",\"mqtt_user\":\"meatpi\",\"mqtt_pass\":\"meatpi\",\"mqtt_tx_topic\":\"wican/%s/can/tx\",\"mqtt_rx_topic\":\"wican/%s/can/rx\",\"mqtt_status_topic\":\"wican/%s/can/status\"}";
@@ -1425,6 +1429,65 @@ static esp_err_t system_commands_handler(httpd_req_t *req)
 }
 
 
+static esp_err_t precondition_toggle_handler(httpd_req_t *req)
+{
+	precondition_toggle_request();
+	const char *resp_str = "Preconditioning toggled";
+	httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
+	return ESP_OK;
+}
+
+static esp_err_t track_popup_handler(httpd_req_t *req)
+{
+	if (req->content_len == 0U)
+	{
+		httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+							"Track popup text cannot be empty");
+		return ESP_FAIL;
+	}
+
+	if (req->content_len > TRACK_POPUP_MAX_TEXT_UTF8_BYTES)
+	{
+		httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE,
+							"Track popup text is too long");
+		return ESP_FAIL;
+	}
+
+	char text[TRACK_POPUP_MAX_TEXT_UTF8_BYTES + 1U];
+	size_t received = 0U;
+	while (received < req->content_len)
+	{
+		int chunk_size = httpd_req_recv(req, text + received,
+										req->content_len - received);
+		if (chunk_size <= 0)
+		{
+			httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT,
+								"Failed to receive track popup text");
+			return ESP_FAIL;
+		}
+		received += (size_t)chunk_size;
+	}
+
+	// track_popup_show accepts a NUL-terminated string, so reject embedded NUL
+	// bytes so we don't only show part of the requested string
+	if (memchr(text, '\0', received) != NULL)
+	{
+		httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+							"Track popup text contains a NUL byte");
+		return ESP_FAIL;
+	}
+	text[received] = '\0';
+
+	if (!track_popup_show(text))
+	{
+		httpd_resp_set_status(req, "503 Service Unavailable");
+		return httpd_resp_send(req, "Track popup is busy or text is too long",
+							   HTTPD_RESP_USE_STRLEN);
+	}
+
+	return httpd_resp_send(req, "Track popup queued", HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t logo_handler(httpd_req_t *req)
 {
     size_t logo_size = logo_end - logo_start;
@@ -1749,6 +1812,57 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	cJSON_AddStringToObject(root, "batt_alert_topic", device_config.batt_alert_topic);
 	cJSON_AddStringToObject(root, "batt_alert_time", device_config.batt_alert_time);
 	cJSON_AddStringToObject(root, "logger_status", device_config.logger_status);
+
+	cJSON_AddStringToObject(root, "battery_temp_unit",
+							config_server_temperature_fahrenheit() ? "f" : "c");
+
+	precondition_temperature_t temperature;
+	if (precondition_get_battery_temperature(&temperature))
+	{
+		cJSON_AddBoolToObject(root, "battery_temp_valid", true);
+		cJSON_AddNumberToObject(root, "battery_temp_min_c", temperature.min_c);
+		cJSON_AddNumberToObject(root, "battery_temp_max_c", temperature.max_c);
+		cJSON_AddNumberToObject(root, "battery_temp_age_ms",
+								(esp_timer_get_time() - temperature.updated_at_us) / 1000);
+	}
+	else
+	{
+		cJSON_AddBoolToObject(root, "battery_temp_valid", false);
+	}
+
+	precondition_state_t pstate;
+	if (precondition_get_state(&pstate))
+	{
+		cJSON_AddBoolToObject(root, "precondition_requested", pstate.requested);
+		cJSON_AddBoolToObject(root, "precondition_active", pstate.active);
+		cJSON_AddBoolToObject(root, "precondition_starting", pstate.starting);
+	}
+
+	// car identified from CAN this session; the web UI filters the buttons
+	// by it when the vehicle setting is "auto"
+	egmp_car_model_t car_model;
+	if (precondition_get_car_model(&car_model))
+	{
+		cJSON_AddStringToObject(root, "egmp_car_model_detected",
+								car_model == EGMP_CAR_IONIQ6 ? "ioniq6"
+								: car_model == EGMP_CAR_EV6 ? "ev6" : "ioniq5");
+	}
+
+	precondition_soc_t soc;
+	if (precondition_get_battery_soc(&soc))
+	{
+		cJSON_AddBoolToObject(root, "battery_soc_valid", true);
+		cJSON_AddNumberToObject(root, "battery_soc_pct", soc.raw * BATTERY_SOC_SCALE);
+		cJSON_AddNumberToObject(root, "battery_soc_age_ms",
+								(esp_timer_get_time() - soc.updated_at_us) / 1000);
+	}
+	else
+	{
+		cJSON_AddBoolToObject(root, "battery_soc_valid", false);
+	}
+
+	// CAN-derived READY state (0x038 power status, 0x00C03503 on Ioniq 6)
+	cJSON_AddStringToObject(root, "can_ready_state", car_in_ready() ? "Ready" : "Not Ready");
 	cJSON_AddStringToObject(root, "log_filesystem", device_config.log_filesystem);
 	cJSON_AddStringToObject(root, "log_period", device_config.log_period);
 	cJSON_AddStringToObject(root, "log_storage", device_config.log_storage);
@@ -2336,6 +2450,18 @@ static const httpd_uri_t logo_uri = {
     .handler   = logo_handler,
     /* Let's pass response string in user
      * context to demonstrate it's usage */
+    .user_ctx  = NULL
+};
+static const httpd_uri_t precondition_toggle = {
+    .uri       = "/precondition_toggle",
+    .method    = HTTP_POST,
+    .handler   = precondition_toggle_handler,
+    .user_ctx  = NULL
+};
+static const httpd_uri_t track_popup = {
+    .uri       = "/track_popup",
+    .method    = HTTP_POST,
+    .handler   = track_popup_handler,
     .user_ctx  = NULL
 };
 static struct file_server_data server_data = {.base_path = FS_MOUNT_POINT""};
@@ -2952,6 +3078,85 @@ static void config_server_load_cfg(char *cfg)
 
 	ESP_LOGI(TAG, "device_config.wakeup_volt: %s", device_config.wakeup_volt);
 	//*****
+
+	//*****
+	// Preconditioning settings. All were added after the initial Pro release,
+	// so a missing key means a config saved by older firmware: fall back to
+	// the default rather than rejecting the whole config.
+	key = cJSON_GetObjectItem(root, "battery_temp_unit");
+	strlcpy(device_config.battery_temp_unit,
+			(cJSON_IsString(key) && key->valuestring
+			 && strcmp(key->valuestring, "f") == 0) ? "f" : "c",
+			sizeof(device_config.battery_temp_unit));
+	ESP_LOGI(TAG, "device_config.battery_temp_unit: %s", device_config.battery_temp_unit);
+	//*****
+
+	//*****
+	key = cJSON_GetObjectItem(root, "egmp_car_model");
+	if(cJSON_IsString(key) && key->valuestring
+			&& (strcmp(key->valuestring, "ioniq5") == 0
+				|| strcmp(key->valuestring, "ioniq6") == 0
+				|| strcmp(key->valuestring, "ev6") == 0))
+	{
+		strlcpy(device_config.egmp_car_model, key->valuestring,
+				sizeof(device_config.egmp_car_model));
+	}
+	else
+	{
+		strlcpy(device_config.egmp_car_model, "auto",
+				sizeof(device_config.egmp_car_model));
+	}
+	ESP_LOGI(TAG, "device_config.egmp_car_model: %s", device_config.egmp_car_model);
+	//*****
+
+	//*****
+	key = cJSON_GetObjectItem(root, "precon_mode");
+	if(cJSON_IsString(key) && key->valuestring
+			&& (strcmp(key->valuestring, "once") == 0
+				|| strcmp(key->valuestring, "continuous") == 0
+				|| strcmp(key->valuestring, "persistent") == 0))
+	{
+		strlcpy(device_config.precon_mode, key->valuestring,
+				sizeof(device_config.precon_mode));
+	}
+	else
+	{
+		strlcpy(device_config.precon_mode, "once",
+				sizeof(device_config.precon_mode));
+	}
+	ESP_LOGI(TAG, "device_config.precon_mode: %s", device_config.precon_mode);
+	//*****
+
+	//*****
+	key = cJSON_GetObjectItem(root, "precon_button");
+	if(cJSON_IsString(key) && key->valuestring && key->valuestring[0] != '\0')
+	{
+		strlcpy(device_config.precon_button, key->valuestring,
+				sizeof(device_config.precon_button));
+	}
+	else
+	{
+		strlcpy(device_config.precon_button, "sw_star",
+				sizeof(device_config.precon_button));
+	}
+	ESP_LOGI(TAG, "device_config.precon_button: %s", device_config.precon_button);
+	//*****
+
+	//*****
+	key = cJSON_GetObjectItem(root, "precon_press");
+	if(cJSON_IsString(key) && key->valuestring
+			&& strcmp(key->valuestring, "long") == 0)
+	{
+		strlcpy(device_config.precon_press, "long",
+				sizeof(device_config.precon_press));
+	}
+	else
+	{
+		strlcpy(device_config.precon_press, "short",
+				sizeof(device_config.precon_press));
+	}
+	ESP_LOGI(TAG, "device_config.precon_press: %s", device_config.precon_press);
+	//*****
 	
 	//*****
 	key = cJSON_GetObjectItem(root,"sleep_time");
@@ -3433,6 +3638,8 @@ static void register_server_uris(void)
 	httpd_register_uri_handler(server, &system_commands);
 	httpd_register_uri_handler(server, &scan_available_pids_uri);
 	httpd_register_uri_handler(server, &std_pid_info);
+	httpd_register_uri_handler(server, &precondition_toggle);
+	httpd_register_uri_handler(server, &track_popup);
 	
 	//Add before this line
 	httpd_register_uri_handler(server, &obd_logger_ws);
@@ -3595,8 +3802,9 @@ static httpd_handle_t config_server_init(void)
                          vrestartTimerCallback
                        );
 
-	// Start the httpd server (reserve extra slots for cert manager endpoints)
-	config.max_uri_handlers = 38;
+	// Start the httpd server (reserve extra slots for cert manager endpoints
+	// and the preconditioning/track-popup endpoints)
+	config.max_uri_handlers = 42;
 	config.stack_size = (10*1024);
 	config.max_open_sockets = 15;
     ESP_LOGI(TAG, "Starting server on port: '%d'", config.server_port);
@@ -3713,13 +3921,15 @@ int8_t config_server_get_ble_config(void)
 
 int8_t config_server_get_sleep_config(void)
 {
-	if(strcmp(device_config.sleep_status, "enable") == 0 || strcmp(device_config.sleep_disable_agree, "no") == 0)
-	{
-		return 1;
-	}
-	else if(strcmp(device_config.sleep_status, "disable") == 0 && strcmp(device_config.sleep_disable_agree, "yes") == 0)
+	if(strcmp(device_config.sleep_status, "disable") == 0 && strcmp(device_config.sleep_disable_agree, "yes") == 0)
 	{
 		return 0;
+	}
+	else if(strcmp(device_config.sleep_status, "car_off") == 0)
+	{
+		// Car-off sleep: same voltage setpoint as low-voltage sleep, but the
+		// car looking awake inhibits sleeping and forces a wake.
+		return 2;
 	}
 	return 1;
 }
@@ -4194,3 +4404,119 @@ void config_server_set_ble_config(uint8_t b)
     cJSON_Delete(root);
 }
 
+
+int8_t config_server_precon_button(void)
+{
+	if(strcmp(device_config.precon_button, "sw_star") == 0)
+	{
+		return SW_STAR;
+	}
+	else if(strcmp(device_config.precon_button, "avn_star") == 0)
+	{
+		return AVN_STAR;
+	}
+	else if(strcmp(device_config.precon_button, "avn_tuner_in") == 0)
+	{
+		return AVN_TUNER_IN;
+	}
+	else if(strcmp(device_config.precon_button, "avn_vol_in") == 0)
+	{
+		return AVN_VOL_IN;
+	}
+	else if(strcmp(device_config.precon_button, "sw_mode") == 0)
+	{
+		return SW_MODE;
+	}
+	else if(strcmp(device_config.precon_button, "sw_speak") == 0)
+	{
+		return SW_SPEAK;
+	}
+	else if(strcmp(device_config.precon_button, "sw_call") == 0)
+	{
+		return SW_CALL;
+	}
+	else if(strcmp(device_config.precon_button, "sw_vol_in") == 0)
+	{
+		return SW_VOL_IN;
+	}
+	else if(strcmp(device_config.precon_button, "sw_vol_up") == 0)
+	{
+		return SW_VOL_UP;
+	}
+	else if(strcmp(device_config.precon_button, "sw_vol_down") == 0)
+	{
+		return SW_VOL_DOWN;
+	}
+	else if(strcmp(device_config.precon_button, "sw_skip_up") == 0)
+	{
+		return SW_SKIP_UP;
+	}
+	else if(strcmp(device_config.precon_button, "sw_skip_down") == 0)
+	{
+		return SW_SKIP_DOWN;
+	}
+	else if(strcmp(device_config.precon_button, "sw_ok") == 0)
+	{
+		return SW_OK;
+	}
+	else if(strcmp(device_config.precon_button, "avn_map") == 0)
+	{
+		return AVN_MAP;
+	}
+	else if(strcmp(device_config.precon_button, "avn_nav") == 0)
+	{
+		return AVN_NAV;
+	}
+	else if(strcmp(device_config.precon_button, "avn_media") == 0)
+	{
+		return AVN_MEDIA;
+	}
+	else if(strcmp(device_config.precon_button, "avn_tuner_up") == 0)
+	{
+		return AVN_TUNER_UP;
+	}
+	else if(strcmp(device_config.precon_button, "avn_tuner_down") == 0)
+	{
+		return AVN_TUNER_DOWN;
+	}
+	else if(strcmp(device_config.precon_button, "ev6_avn_setup") == 0)
+	{
+		return EV6_AVN_SETUP;
+	}
+	else if(strcmp(device_config.precon_button, "disabled") == 0)
+	{
+		return BUTTON_DISABLED;
+	}
+	return SW_STAR;
+}
+
+int8_t config_server_precon_mode(void)
+{
+	if(strcmp(device_config.precon_mode, "once") == 0)
+	{
+		return ONCE;
+	}
+	else if(strcmp(device_config.precon_mode, "continuous") == 0)
+	{
+		return CONTINUOUS;
+	}
+	else if(strcmp(device_config.precon_mode, "persistent") == 0)
+	{
+		return PERSISTENT;
+	}
+	return ONCE;
+}
+
+int8_t config_server_precon_press(void)
+{
+	if(strcmp(device_config.precon_press, "long") == 0)
+	{
+		return PRESS_LONG;
+	}
+	return PRESS_SHORT;
+}
+
+bool config_server_temperature_fahrenheit(void)
+{
+	return strcmp(device_config.battery_temp_unit, "f") == 0;
+}

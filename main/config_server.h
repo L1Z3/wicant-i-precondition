@@ -22,6 +22,7 @@
 
 #pragma once
 #include "esp_tls_crypto.h"
+#include <stdbool.h>
 #include <esp_http_server.h>
 
 #define AP_MODE				0
@@ -53,6 +54,39 @@
 #define SAVVYCAN			2
 #define OBD_ELM327			3
 #define AUTO_PID			4
+
+// Preconditioning modes (precon_mode config value)
+#define ONCE				0
+#define CONTINUOUS			1
+#define PERSISTENT			2
+
+// Activation button press types (precon_press config value)
+#define PRESS_SHORT			0
+#define PRESS_LONG			1
+
+// Activation buttons (precon_button config value). Keep in sync with the
+// table in precondition.c.
+#define BUTTON_DISABLED     -1
+#define SW_STAR				0
+#define AVN_STAR			1
+#define AVN_TUNER_IN		2
+#define AVN_VOL_IN			3
+#define SW_MODE				4
+#define SW_SPEAK			5
+#define SW_CALL				6
+#define SW_VOL_IN			7
+#define SW_VOL_UP			8
+#define SW_VOL_DOWN			9
+#define SW_SKIP_UP			10
+#define SW_SKIP_DOWN		11
+#define SW_OK				12
+#define AVN_MAP				13
+#define AVN_NAV				14
+#define AVN_MEDIA			15
+#define AVN_TUNER_UP		16
+#define AVN_TUNER_DOWN		17
+#define EV6_AVN_SETUP		18
+#define NUM_PRECON_BUTTONS 19
 
 typedef enum
 {
@@ -166,6 +200,14 @@ typedef struct _device_config
 	char log_period[16];
 	char imu_threshold[16];
 	bool debug_enabled;
+	// Preconditioning settings (see the SW_*/AVN_*/ONCE/CONTINUOUS/PERSISTENT
+	// defines above). battery_temp_unit is "c" or "f"; egmp_car_model is
+	// "auto", "ioniq5", "ioniq6", or "ev6".
+	char battery_temp_unit[2];
+	char egmp_car_model[16];
+	char precon_mode[16];
+	char precon_button[32];
+	char precon_press[16];
 }device_config_t;
 
 
@@ -256,3 +298,9 @@ const char *config_server_get_sta_fallback_ssid(int index);
 const char *config_server_get_sta_fallback_pass(int index);
 wifi_security_t config_server_get_sta_fallback_security(int index);
 char *config_server_get_status_json(bool remove_sensitive_info);
+
+// Preconditioning settings accessors
+int8_t config_server_precon_button(void);
+int8_t config_server_precon_mode(void);
+int8_t config_server_precon_press(void);
+bool config_server_temperature_fahrenheit(void);

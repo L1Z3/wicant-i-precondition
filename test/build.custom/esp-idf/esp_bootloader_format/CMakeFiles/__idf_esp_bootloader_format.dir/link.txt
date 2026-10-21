@@ -1,0 +1,2 @@
+/home/trh/.espressif/tools/xtensa-esp-elf/esp-14.2.0_20251107/xtensa-esp-elf/bin/xtensa-esp32s3-elf-ar qc libesp_bootloader_format.a CMakeFiles/__idf_esp_bootloader_format.dir/esp_bootloader_desc.c.obj
+/home/trh/.espressif/tools/xtensa-esp-elf/esp-14.2.0_20251107/xtensa-esp-elf/bin/xtensa-esp32s3-elf-ranlib libesp_bootloader_format.a

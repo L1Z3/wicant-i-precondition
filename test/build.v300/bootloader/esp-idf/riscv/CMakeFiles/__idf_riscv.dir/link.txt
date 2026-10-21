@@ -1,0 +1,2 @@
+/home/trh/.espressif/tools/riscv32-esp-elf/esp-14.2.0_20251107/riscv32-esp-elf/bin/riscv32-esp-elf-ar qc libriscv.a CMakeFiles/__idf_riscv.dir/rv_utils.c.obj
+/home/trh/.espressif/tools/riscv32-esp-elf/esp-14.2.0_20251107/riscv32-esp-elf/bin/riscv32-esp-elf-ranlib libriscv.a

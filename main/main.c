@@ -70,6 +70,7 @@
 #include "cmdline.h"
 #include "dev_status.h"
 #include "precondition.h"
+#include "beep.h"
 #include "wifi_mgr.h"
 #include "vehicle.h"
 #include "wc_timer.h"
@@ -360,13 +361,75 @@ static void can_tx_task(void *pvParameters)
 	}
 }
 #define HEAP_CAPS   (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+
+#if HARDWARE_VER == WICAN_PRO
 #define PRECONDITION_TICK_PERIOD_US 40000
+#define PRECONDITION_SLEEP_TICK_PERIOD_US 1000000
+#define PRECONDITION_TASK_STACK_SIZE (3 * 1024)
+#define PRECONDITION_TASK_PRIORITY 8
+
+static TaskHandle_t precondition_task_handle = NULL;
+static esp_timer_handle_t precondition_timer = NULL;
+
+// The esp_timer task is shared and high priority, so its callback only wakes
+// the dedicated worker. State-machine dispatch and CAN TX run from the worker;
+// NVS-mirrored setting logic has its own lower-priority task.
+static void precondition_timer_callback(void *arg)
+{
+	(void)arg;
+	if(precondition_task_handle != NULL)
+	{
+		xTaskNotifyGive(precondition_task_handle);
+	}
+}
+
+static void precondition_task(void *arg)
+{
+	(void)arg;
+	while(1)
+	{
+		// The one-shot timer produces at most one notification before rearming.
+		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+		if(dev_status_is_bit_set(DEV_AWAKE_BIT))
+		{
+			precondition_tick();
+			// Doing it this way (rather than a periodic 40ms timer) has the
+			// advantage of ensuring at least 40ms elapse between each tick,
+			// even if the task is scheduled late.
+			ESP_ERROR_CHECK(esp_timer_start_once(precondition_timer,
+					PRECONDITION_TICK_PERIOD_US));
+		}
+		else
+		{
+			// Asleep: nothing to dispatch. Rearm slowly so this task does not
+			// wake the CPU out of light sleep 25 times a second (the CAN RX
+			// task is parked on DEV_AWAKE_BIT at the same time).
+			ESP_ERROR_CHECK(esp_timer_start_once(precondition_timer,
+					PRECONDITION_SLEEP_TICK_PERIOD_US));
+		}
+	}
+}
+
+static void precondition_task_start(void)
+{
+	const esp_timer_create_args_t timer_args = {
+		.callback = precondition_timer_callback,
+		.name = "precondition",
+	};
+	ESP_ERROR_CHECK(esp_timer_create(&timer_args, &precondition_timer));
+
+	BaseType_t created = xTaskCreate(precondition_task, "precondition_task",
+			PRECONDITION_TASK_STACK_SIZE, NULL, PRECONDITION_TASK_PRIORITY,
+			&precondition_task_handle);
+	ESP_ERROR_CHECK(created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+	ESP_ERROR_CHECK(esp_timer_start_once(precondition_timer, PRECONDITION_TICK_PERIOD_US));
+}
+#endif // HARDWARE_VER == WICAN_PRO
 
 static void can_rx_task(void *pvParameters)
 {
 //	static uint32_t num_msg = 0;
 	static int64_t time_old = 0;
-	static int64_t precondition_tick_last = 0;
 //	float bvoltage = 0;
 //	time_old = esp_timer_get_time();
 	while(1)
@@ -404,23 +467,20 @@ static void can_rx_task(void *pvParameters)
 		// 	gpio_set_level(USB_ESP_MODE_EN, 0);
 		// }
 
-		// TODO(ejones): ideally, we'd use esp_timer_start_periodic. but for now,
-		// i don't want to deal with race conditions on the precondition globals, so
-		// let's just do it here for now (should be good enough for most cases)
-        if ((esp_timer_get_time() - precondition_tick_last) >= PRECONDITION_TICK_PERIOD_US) {
-            precondition_tick_last = esp_timer_get_time();
-            precondition_tick();
-        }
-
         while(can_receive(&rx_msg, 0) ==  ESP_OK)
         {
-            precondition_can_rx_hook(&rx_msg);
+			#if HARDWARE_VER == WICAN_PRO
+            precondition_can_rx_hook(&rx_msg, CAN_BUS_0);
             {
+                // Single-bus build: FWD_BLOCK cannot pull a frame that is
+                // already on the wire, so only FWD_MODIFIED acts here (inject
+                // a modified duplicate alongside the original frame).
                 twai_message_t fwd_msg = rx_msg;
-                if (precondition_fwd_hook(&fwd_msg) == FWD_MODIFIED) {
+                if (precondition_fwd_hook(&fwd_msg, CAN_BUS_0) == FWD_MODIFIED) {
                     can_send(&fwd_msg, 1);
                 }
             }
+			#endif
 //        	num_msg++;
 
         	process_led(1);
@@ -810,6 +870,13 @@ void app_main(void)
 		config_server_start(&xmsg_ws_tx_queue, &xMsg_Rx_Queue, 0, (char*)&uid[0]);
 	#endif
 
+	#if HARDWARE_VER == WICAN_PRO
+	// These services read wiring and preconditioning settings during
+	// initialization, so they must follow config_server_start().
+	beep_init();
+	precondition_init();
+	#endif
+
 	#if HARDWARE_VER == WICAN_V300 || HARDWARE_VER == WICAN_USB_V100
 	if(config_server_get_sleep_config())
 	{
@@ -1089,7 +1156,12 @@ void app_main(void)
         // }
     }
 
-	
+	#if HARDWARE_VER == WICAN_PRO
+	// Dedicated preconditioning tick task (the CAN RX task must not run the
+	// state machine inline: its dispatch can block on CAN TX).
+	precondition_task_start();
+	#endif
+
 // Declare static stack and task buffers
 	static StackType_t *can_rx_task_stack, *can_tx_task_stack, *obd_rx_task_stack;
 	static StaticTask_t can_rx_task_buffer, can_tx_task_buffer, obd_rx_task_buffer;

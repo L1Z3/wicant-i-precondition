@@ -1,16 +1,58 @@
 #ifndef __PRECONDITION_H__
 #define __PRECONDITION_H__
 
-#include "driver/twai.h"
+#include <stdbool.h>
+#include <stdint.h>
+#include "hsm.h"
 
-typedef enum {
-    FWD_BLOCK,
-    FWD_MODIFIED,
-    FWD_PASSTHROUGH,
-} fwd_result_t;
-
-void precondition_can_rx_hook(twai_message_t *to_push);
-fwd_result_t precondition_fwd_hook(twai_message_t *to_send);
+void precondition_init(void);
+void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus);
+fwd_result_t precondition_fwd_hook(twai_message_t *to_send, can_bus_t fwd_bus);
 void precondition_tick(void);
+
+typedef struct {
+    int8_t min_c;
+    int8_t max_c;
+    int64_t updated_at_us;
+} precondition_temperature_t;
+
+bool precondition_get_battery_temperature(precondition_temperature_t *out);
+
+typedef struct {
+    bool requested;
+    bool active;
+    bool starting;
+} precondition_state_t;
+
+void precondition_toggle_request(void);
+bool precondition_get_state(precondition_state_t *out);
+
+// SoC is transmitted in half-percent steps on the 0x2FC frame (Ioniq 5/EV6) and
+// the 29-bit 0x0BC2FA02 frame (Ioniq 6).
+#define BATTERY_SOC_SCALE 0.5f
+
+typedef struct {
+    // raw byte from the frame; percent is raw * BATTERY_SOC_SCALE
+    uint8_t raw;
+    int64_t updated_at_us;
+} precondition_soc_t;
+
+bool precondition_get_battery_soc(precondition_soc_t *out);
+
+// E-GMP model identified from the precondition status frame. Only the web UI's
+// button filter uses it, when the vehicle setting is "auto".
+typedef enum {
+    EGMP_CAR_IONIQ5,
+    EGMP_CAR_IONIQ6,
+    EGMP_CAR_EV6,
+} egmp_car_model_t;
+
+bool precondition_get_car_model(egmp_car_model_t *out);
+
+// Is the car currently in READY? Tracks the power-status edge (0x038, or the
+// 29-bit 0x00C03503 on Ioniq 6) the same way the state machine does; false until
+// such a frame is seen. The negation is the persistent state behind the
+// EV_CAR_NOT_READY event.
+bool car_in_ready(void);
 
 #endif

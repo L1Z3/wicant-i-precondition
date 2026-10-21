@@ -2720,7 +2720,9 @@ function configureProtocolSettings(elements) {
 }
 
 function configureSleepSettings(elements) {
-    const sleepEnabled = elements.sleepStatus.value === "enable";
+    // Car-off sleep (mode 2) is a sleep mode too: battery alerts apply.
+    const sleepEnabled = elements.sleepStatus.value === "enable"
+        || elements.sleepStatus.value === "car_off";
     const bleEnabled = elements.bleStatus.value === "enable";
     
     if (sleepEnabled) {
@@ -2757,6 +2759,131 @@ function configurePeriodicWakeup(elements) {
     }
 }
 document.getElementById("defaultOpen").click();
+
+// ---------------------------------------------------------------------------
+// Preconditioning / Buttons tab
+// ---------------------------------------------------------------------------
+
+// car identified from CAN this session (from /check_status), or null until
+// the car has been seen
+let detectedCarModel = null;
+
+function formatBatteryTemperature(celsius, unit) {
+    return unit === "f" ? `${Math.round(celsius * 9 / 5 + 32)}°F` : `${celsius}°C`;
+}
+
+function formatAge(ageMs) {
+    const seconds = Math.max(0, Math.round(ageMs / 1000));
+    if (seconds < 60) return `${seconds}s`;
+
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m`;
+
+    const hours = Math.floor(minutes / 60);
+    return `${hours}h`;
+}
+
+// The car the button list is filtered by: the user's vehicle choice, or the
+// detected car when that is "auto". null means no car is known yet, so
+// nothing is filtered by car.
+function effectivePreconCarModel() {
+    const selectedVehicle = document.getElementById("egmp_car_model").value;
+    return selectedVehicle === "auto" ? detectedCarModel : selectedVehicle;
+}
+
+// Does this button exist on the given car? Buttons without a
+// precon_button_car_* class exist on every car.
+function preconButtonFitsCar(option, carModel) {
+    const carClasses = Array.from(option.classList).filter(className =>
+        className.startsWith("precon_button_car_"));
+    return carModel === null
+        || carClasses.length === 0
+        || carClasses.includes(`precon_button_car_${carModel}`);
+}
+
+// Client-side only: recompute which preconditioning button options are
+// visible. An option is shown when it exists on the current car (or "Show
+// buttons for all vehicles" is checked) and, for the "extra" options, when
+// "Show extra button options" is checked. The current selection is always
+// shown, with a warning if it is not on the current car. Does not affect the
+// value submitted to the device.
+function updatePreconButtonVisibility() {
+    const select = document.getElementById("precon_button");
+    const showAllBox = document.getElementById("precon_button_show_all");
+    const showAllCarsBox = document.getElementById("precon_button_show_all_cars");
+    if (!select || !showAllBox || !showAllCarsBox) return;
+
+    const showAll = showAllBox.checked;
+    const effectiveCarModel = effectivePreconCarModel();
+    const carModel = showAllCarsBox.checked ? null : effectiveCarModel;
+    document.querySelectorAll("#precon_button option").forEach(option => {
+        const extraVisible = !option.classList.contains("precon_button_extra") || showAll;
+        option.hidden = !option.selected
+            && !(preconButtonFitsCar(option, carModel) && extraVisible);
+    });
+
+    // the firmware does not check the button against the car, so a mismatched
+    // button would silently never trigger
+    const selectedOption = select.options[select.selectedIndex];
+    const warning = document.getElementById("precon_button_car_warning");
+    const carSelect = document.getElementById("egmp_car_model");
+    if (warning && carSelect && selectedOption
+            && !preconButtonFitsCar(selectedOption, effectiveCarModel)) {
+        const carOption = Array.from(carSelect.options)
+            .find(option => option.value === effectiveCarModel);
+        // U+FE0E asks for the text form of the sign, so it takes the warning
+        // colour instead of rendering as a colour emoji
+        warning.textContent = carOption
+            ? `⚠︎ ${selectedOption.textContent} is not on the ${carOption.textContent}`
+            : `⚠︎ ${selectedOption.textContent} is not available for this vehicle`;
+        warning.style.display = "";
+    } else if (warning) {
+        warning.style.display = "none";
+    }
+}
+
+function preconActivate() {
+    const xhttp = new XMLHttpRequest();
+    xhttp.onload = function() {
+        showNotification(this.responseText, "green");
+        // let the precondition task process the toggle, then refresh the
+        // status rows and the button's Activate/Stop label
+        setTimeout(checkStatus, 200);
+    };
+    xhttp.onerror = function() {
+        showNotification("Failed to toggle preconditioning", "red");
+    };
+    xhttp.open("POST", "/precondition_toggle");
+    xhttp.send();
+}
+
+function showTrackPopup() {
+    const textInput = document.getElementById("track_popup_text");
+    const popupButton = document.getElementById("track_popup_button");
+    if (!textInput || textInput.value.length === 0) {
+        showNotification("Enter track popup text", "red");
+        return;
+    }
+
+    const xhttp = new XMLHttpRequest();
+    popupButton.disabled = true;
+    xhttp.onload = function() {
+        popupButton.disabled = false;
+        if (this.status >= 200 && this.status < 300) {
+            showNotification(this.responseText, "green");
+        } else {
+            showNotification(this.responseText || "Failed to show track popup", "red");
+        }
+    };
+    xhttp.onerror = function() {
+        popupButton.disabled = false;
+        showNotification("Failed to show track popup", "red");
+    };
+    xhttp.open("POST", "/track_popup");
+    xhttp.setRequestHeader("Content-Type", "text/plain; charset=UTF-8");
+    xhttp.send(textInput.value);
+}
+
 function checkStatus() {
     const xhttp = new XMLHttpRequest();
     xhttp.onload = function() {
@@ -2814,6 +2941,56 @@ function checkStatus() {
             document.getElementById("apconfig_warning_div").style.display = "none";
         }
         document.getElementById("batt_voltage").innerHTML = obj.batt_voltage;
+
+        // CAN-derived READY state; the only car-on signal on this board
+        const readyEl = document.getElementById("can_ready_state");
+        if (readyEl) readyEl.innerHTML = obj.can_ready_state || "Unknown";
+
+        const socEl = document.getElementById("battery_soc_status");
+        if (socEl) {
+            socEl.textContent = obj.battery_soc_valid
+                ? `${obj.battery_soc_pct}%; (${formatAge(obj.battery_soc_age_ms)} ago)`
+                : "Waiting for CAN data";
+        }
+
+        const tempEl = document.getElementById("battery_temp_status");
+        if (tempEl) {
+            tempEl.textContent = obj.battery_temp_valid
+                ? `Min: ${formatBatteryTemperature(obj.battery_temp_min_c, obj.battery_temp_unit)}; Max: ${formatBatteryTemperature(obj.battery_temp_max_c, obj.battery_temp_unit)}; (${formatAge(obj.battery_temp_age_ms)} ago)`
+                : "Waiting for CAN data";
+        }
+
+        const requestedEl = document.getElementById("precondition_requested_status");
+        if (requestedEl) requestedEl.textContent = obj.precondition_requested ? "Yes" : "No";
+        const activeEl = document.getElementById("precondition_active_status");
+        if (activeEl) {
+            activeEl.textContent = obj.precondition_starting
+                ? "Starting" : (obj.precondition_active ? "Yes" : "No");
+        }
+        // the button toggles, so label it with the action it will take
+        const activateEl = document.getElementById("precon_activate_button");
+        if (activateEl) {
+            activateEl.value = obj.precondition_requested
+                ? "Stop Preconditioning" : "Activate";
+        }
+
+        // car identified from CAN; the button filter uses it when the vehicle
+        // setting is "auto"
+        const carSelect = document.getElementById("egmp_car_model");
+        const autoOption = document.getElementById("egmp_car_model_auto");
+        if (carSelect && autoOption) {
+            const detectedOption = Array.from(carSelect.options).find(option =>
+                option.value !== "auto" && option.value === obj.egmp_car_model_detected);
+            const detected = detectedOption ? detectedOption.value : null;
+            if (detected !== detectedCarModel) {
+                detectedCarModel = detected;
+                autoOption.textContent = detectedOption
+                    ? `Auto (detected: ${detectedOption.textContent})`
+                    : "Auto (not detected yet)";
+                updatePreconButtonVisibility();
+            }
+        }
+
         if(document.getElementById("batt_alert").value == "enable") {
             document.getElementById("batt_alert_div").style.display = "none";
         } else if(document.getElementById("batt_alert").value == "disable") {
@@ -3237,6 +3414,11 @@ async function postConfig() {
     obj["log_period"] = document.getElementById("log_period").value;
     obj["imu_threshold"] = document.getElementById("imu_threshold").value;
     obj["elm327_udp_log"] = document.getElementById("elm327_udp_log").value;
+    obj["battery_temp_unit"] = document.getElementById("battery_temp_unit").value;
+    obj["egmp_car_model"] = document.getElementById("egmp_car_model").value;
+    obj["precon_mode"] = document.getElementById("precon_mode").value;
+    obj["precon_button"] = document.getElementById("precon_button").value;
+    obj["precon_press"] = document.getElementById("precon_press").value;
 
     // Collect fallback networks (max 5)
     try {
@@ -3735,11 +3917,24 @@ xhttp.onload = async function() {
         } else if(obj.ble_status == "disable") {
             document.getElementById("ble_status").selectedIndex = 1;
         }
-        if(obj.sleep_status == "enable") {
-            document.getElementById("sleep_status").selectedIndex = "0";
-        } else if(obj.sleep_status == "disable") {
-            document.getElementById("sleep_status").selectedIndex = "1";
+        {
+            const sleepSelect = document.getElementById("sleep_status");
+            const sleepMode = obj.sleep_status || "enable";
+            const hasSleepMode = Array.from(sleepSelect.options)
+                .some(option => option.value === sleepMode);
+            sleepSelect.value = hasSleepMode ? sleepMode : "enable";
         }
+
+        // Preconditioning settings (added after the initial Pro release, so
+        // fall back to the firmware defaults when a config predates them)
+        if (obj.battery_temp_unit) {
+            document.getElementById("battery_temp_unit").value = obj.battery_temp_unit;
+        }
+        document.getElementById("egmp_car_model").value = obj.egmp_car_model || "auto";
+        document.getElementById("precon_mode").value = obj.precon_mode || "once";
+        document.getElementById("precon_button").value = obj.precon_button || "sw_star";
+        document.getElementById("precon_press").value = obj.precon_press || "short";
+        updatePreconButtonVisibility();
 
         if(obj.sleep_disable_agree == "yes") {
             document.getElementById("sleep_disable_agree").selectedIndex = "1";

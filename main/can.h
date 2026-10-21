@@ -23,6 +23,18 @@
 #define __CAN_H__
 #include "driver/twai.h"
 
+// CAN bus routing, matching the fork's bus-aware API. The WiCAN Pro has a
+// single on-chip TWAI controller, so CAN_BUS_COUNT is 1 and CAN_BUS_1 exists
+// only so shared code that names a head-unit bus still compiles. The
+// preconditioning and track-popup modules keep the bus-qualified signatures
+// from the fork and route their sends through can_send_on() below.
+typedef enum {
+	CAN_BUS_0 = 0,   /* on-chip TWAI controller */
+	CAN_BUS_1 = 1,   /* not supported at the moment */
+} can_bus_t;
+
+#define CAN_BUS_COUNT			1
+
 #define CAN_5K				0
 #define CAN_10K				1
 #define CAN_20K				2
@@ -60,6 +72,16 @@ void can_set_mask(uint32_t m);
 void can_set_bitrate(uint8_t rate);
 esp_err_t can_receive(twai_message_t *message, TickType_t ticks_to_wait);
 esp_err_t can_send(twai_message_t *message, TickType_t ticks_to_wait);
+
+// Bus-qualified send for code shared with the fork's multi-bus builds. There
+// is only one controller here, so the bus argument is ignored.
+static inline esp_err_t can_send_on(can_bus_t bus, twai_message_t *message,
+				    TickType_t ticks_to_wait)
+{
+	(void)bus;
+	return can_send(message, ticks_to_wait);
+}
+
 void can_init(uint8_t bitrate);
 uint8_t can_is_silent(void);
 bool can_is_enabled(void);

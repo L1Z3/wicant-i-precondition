@@ -1,0 +1,2 @@
+/home/trh/.espressif/tools/riscv32-esp-elf/esp-14.2.0_20251107/riscv32-esp-elf/bin/riscv32-esp-elf-ar qc libmicro-ecc.a "CMakeFiles/__idf_micro-ecc.dir/uECC_verify_antifault.c.obj"
+/home/trh/.espressif/tools/riscv32-esp-elf/esp-14.2.0_20251107/riscv32-esp-elf/bin/riscv32-esp-elf-ranlib libmicro-ecc.a
