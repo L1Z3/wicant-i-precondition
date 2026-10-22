@@ -592,6 +592,10 @@
                     <td><div id="precondition_active_status">Loading...</div></td>
                 </tr>
                 <tr>
+                    <td>Charging:</td>
+                    <td><div id="charge_status">Waiting for CAN data</div></td>
+                </tr>
+                <tr>
                     <td><input id="check_status_button" name="check_status_button" type="button" onclick="checkStatus()"
                             value="Check status" /></td>
                     <td>&nbsp;</td>
@@ -2728,6 +2732,15 @@ function loadAutoTable(jsonData) {
 				document.getElementById("egmp_car_model_auto").textContent = detectedOption
 					? `Auto (detected: ${detectedOption.textContent})` : "Auto (not detected yet)";
 				updatePreconButtonVisibility();
+			}
+			if (obj.car_power_valid) {
+				const raw = ("0" + Number(obj.car_power_raw).toString(16).toUpperCase()).slice(-2);
+				// "Car Power Status (CAN)" above shows READY; this row adds the
+				// charging state plus the raw 0x038 byte and its age
+				const age = formatAge(obj.car_power_age_ms);
+				document.getElementById("charge_status").textContent = `${obj.charging ? "Yes" : "No"} (0x${raw}; ${age} ago)`;
+			} else {
+				document.getElementById("charge_status").textContent = "Waiting for CAN data";
 			}
 			document.getElementById("port_status").innerHTML = obj.port;
 			document.getElementById("fw_version").innerHTML = obj.fw_version;
