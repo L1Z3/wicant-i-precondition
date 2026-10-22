@@ -28,6 +28,8 @@
 #include "nvs_flash.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_chip_info.h"
+#include "esp_heap_caps.h"
 #include <string.h>
 #include "esp_timer.h"
 #include "comm_server.h"
@@ -492,8 +494,60 @@ static void can_rx_task(void *pvParameters)
 	}
 }
 
+static const char *reset_reason_name(esp_reset_reason_t reason)
+{
+	switch (reason) {
+	case ESP_RST_UNKNOWN: return "unknown";
+	case ESP_RST_POWERON: return "power-on";
+	case ESP_RST_EXT: return "external";
+	case ESP_RST_SW: return "software/esp_restart";
+	case ESP_RST_PANIC: return "panic";
+	case ESP_RST_INT_WDT: return "interrupt watchdog";
+	case ESP_RST_TASK_WDT: return "task watchdog";
+	case ESP_RST_WDT: return "other watchdog";
+	case ESP_RST_DEEPSLEEP: return "deep sleep";
+	case ESP_RST_BROWNOUT: return "brownout";
+	case ESP_RST_SDIO: return "sdio";
+	case ESP_RST_USB: return "usb";
+	case ESP_RST_JTAG: return "jtag";
+	case ESP_RST_EFUSE: return "efuse";
+	case ESP_RST_PWR_GLITCH: return "power glitch";
+	case ESP_RST_CPU_LOCKUP: return "cpu lockup";
+	default: return "?";
+	}
+}
+
 void app_main(void)
 {
+	esp_chip_info_t chip_info;
+
+	esp_chip_info(&chip_info);
+	ESP_LOGI(TAG, "===== boot: hw=%s git=%s idf=%s =====",
+			 HARDWARE_VERSION, GIT_SHA, IDF_VER);
+	ESP_LOGI(TAG, "boot: chip=%d rev=%d cores=%d | flash cfg=%s | psram total=%lu bytes "
+			 "(SPIRAM=%d mode=%s) | partition table %s",
+			 chip_info.model, chip_info.revision, (int)chip_info.cores,
+			 CONFIG_ESPTOOLPY_FLASHSIZE,
+			 (unsigned long)heap_caps_get_total_size(MALLOC_CAP_SPIRAM),
+#if CONFIG_SPIRAM
+			 1,
+#else
+			 0,
+#endif
+#if CONFIG_SPIRAM_MODE_OCT
+			 "octal",
+#else
+			 "quad",
+#endif
+			 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME);
+	ESP_LOGI(TAG, "boot: reset reason=%d (%s), heap free=%lu internal=%lu largest=%lu",
+			 esp_reset_reason(), reset_reason_name(esp_reset_reason()),
+			 (unsigned long)esp_get_free_heap_size(),
+			 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+			 (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+
+	hw_config_log();
+
 	dev_status_init();
 	dev_status_set_bits(DEV_AWAKE_BIT);
     ESP_ERROR_CHECK(nvs_flash_init());
@@ -521,11 +575,15 @@ void app_main(void)
     gpio_reset_pin(CAN_STDBY_GPIO_NUM);
     gpio_set_direction(CAN_STDBY_GPIO_NUM, GPIO_MODE_OUTPUT);
     gpio_set_level(CAN_STDBY_GPIO_NUM, 1);
+    ESP_LOGI(TAG, "CAN transceiver STDBY GPIO%d -> 1 (standby) at boot", CAN_STDBY_GPIO_NUM);
 #endif
 #ifdef MCP2518FD_STDBY_GPIO_NUM
     gpio_reset_pin(MCP2518FD_STDBY_GPIO_NUM);
     gpio_set_direction(MCP2518FD_STDBY_GPIO_NUM, GPIO_MODE_OUTPUT);
     gpio_set_level(MCP2518FD_STDBY_GPIO_NUM, 1);
+    ESP_LOGI(TAG, "TCAN3413 STB GPIO%d -> 1 (standby) at boot; the MCP2518FD "
+             "controller is not asleep until bus 1 is enabled and disabled once",
+             MCP2518FD_STDBY_GPIO_NUM);
 #endif
 
     xMsg_Rx_Queue = xQueueCreate(16, sizeof( xdev_buffer) );
@@ -552,6 +610,16 @@ void app_main(void)
 
 	int8_t can_datarate = config_server_get_can_rate();
 	can_init();
+
+	ESP_LOGI(TAG, "CAN config: protocol=%d fwd_en=%d | can0 rate_idx=%d mode=%d | can1 en=%d",
+			 config_server_protocol(), config_server_get_fwd_en(), can_datarate,
+			 config_server_get_can_mode(), config_server_get_can1_en());
+#if CAN_BUS_COUNT > 1
+	ESP_LOGI(TAG, "CAN config: can1 rate_idx=%d mode=%d", config_server_get_can1_rate(),
+			 config_server_get_can1_mode());
+#else
+	ESP_LOGI(TAG, "CAN config: single-bus variant, bus 1 not present");
+#endif
 
 	if(can_datarate != -1)
 	{
@@ -596,7 +664,17 @@ void app_main(void)
 
 	if(config_server_get_can1_en())
 	{
+		ESP_LOGI(TAG, "can1: enabled by config, bringing bus 1 up");
 		can_enable(CAN_BUS_1);
+	}
+	else
+	{
+		ESP_LOGW(TAG, "can1: disabled by config; bus 1 will not be initialised");
+#if HW_HAS_MCP2518FD
+		ESP_LOGW(TAG, "can1: disabled means the MCP2518FD is never created or put in "
+				 "Low Power Mode; expect it to draw its normal operating current "
+				 "while the rest of the device sleeps");
+#endif
 	}
 #endif
 
@@ -666,6 +744,16 @@ void app_main(void)
 //		mqtt_init((char*)&uid[0], CONNECTED_LED_GPIO_NUM, &xmsg_mqtt_rx_queue);
 //	}
 
+
+	ESP_LOGI(TAG, "boot CAN setup complete: protocol=%d, can0=%d, bus1_present=%d",
+			 protocol, (int)can_is_enabled(CAN_BUS_0),
+#if CAN_BUS_COUNT > 1
+			 (int)can_is_enabled(CAN_BUS_1)
+#else
+			 0
+#endif
+			 );
+	can_dump_diagnostics("boot");
 
 	wifi_network_init(NULL, NULL);
 	int32_t port = config_server_get_port();

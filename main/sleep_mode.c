@@ -556,17 +556,44 @@ static void adc_task(void *pvParameters)
 	//    	ESP_LOGI(TAG, "value: %u",adc_val);
 			if(sleep_state == SLEEP_STATE)
 			{
-				ESP_LOGW(TAG, "sleeping");
-                                // todo (trh): add config option to leave
-                                // can busses up in sleep.
+				// This block runs again after every 2 s light-sleep wake,
+				// so the verbose CAN dump is rate-limited while the buses
+				// are already down.
+				static int64_t s_last_diag_us;
+				int64_t diag_now = esp_timer_get_time();
+				bool diag = (diag_now - s_last_diag_us) >= 60LL * 1000 * 1000;
+
+				if (diag)
+				{
+					s_last_diag_us = diag_now;
+					ESP_LOGW(TAG, "sleeping: entering light sleep with CAN buses being disabled");
+					can_dump_diagnostics("pre-sleep");
+				}
 				for(int bus = 0; bus < CAN_BUS_COUNT; bus++)
 				{
+					if (diag)
+					{
+						ESP_LOGI(TAG, "sleep: can_disable(bus %d) (enabled=%d)",
+								 bus, (int)can_is_enabled((can_bus_t)bus));
+					}
 					can_disable(bus);
 				}
+				if (diag)
+				{
+					can_dump_diagnostics("post-sleep-disable");
+				}
+
 				wifi_network_deinit();
 				ble_disable();
 				esp_sleep_enable_timer_wakeup(2*1000000);
-				esp_light_sleep_start();;
+				int64_t t_sleep = esp_timer_get_time();
+				esp_light_sleep_start();
+				if (diag)
+				{
+					ESP_LOGI(TAG, "woke from light sleep after %lld ms, cause=%d",
+							 (long long)((esp_timer_get_time() - t_sleep) / 1000),
+							 (int)esp_sleep_get_wakeup_cause());
+				}
 			}
 			else vTaskDelay(pdMS_TO_TICKS(1000));
     	}

@@ -169,4 +169,8 @@
 
 esp_err_t hw_config_get_device_id(char *uid);
 
+// Log the compile-time variant, pin map and feature flags at boot. Diagnostic
+// only; this is intentionally verbose for the EB-FD bring-up.
+void hw_config_log(void);
+
 #endif

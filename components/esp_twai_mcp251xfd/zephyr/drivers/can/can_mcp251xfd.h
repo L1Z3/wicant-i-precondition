@@ -513,6 +513,11 @@ struct mcp251xfd_data {
 	uint8_t current_mcp251xfd_mode;
 	int tdco;
 
+	/* LOCAL PATCH: bring-up diagnostics. Counted in the interrupt thread, */
+	/* logged from the adapter's dump.                                    */
+	uint32_t rx_overflow_count;
+	uint32_t tef_overflow_count;
+
 	struct mcp251xfd_spi_data spi_data;
 
 };
