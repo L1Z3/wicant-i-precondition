@@ -59,6 +59,7 @@
 #include "math.h"
 #include "dev_status.h"
 #include "precondition.h"
+#include "file_logs.h"
 
 #define TAG 			  __func__
 
@@ -537,6 +538,7 @@ static void adc_task(void *pvParameters)
 						if((esp_timer_get_time() - wakeup_detect_time) > WAKEUP_TIME_DELAY)
 						{
 							ESP_LOGI(TAG, "Wake up now...");
+							file_logs_flush();
 							esp_restart();
 
 						}

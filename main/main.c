@@ -60,6 +60,7 @@
 #include "beep.h"
 #include "debug_logs.h"
 #include "debug_logs_config.h"
+#include "file_logs.h"
 
 #define TAG 		__func__
 
@@ -519,6 +520,10 @@ static const char *reset_reason_name(esp_reset_reason_t reason)
 
 void app_main(void)
 {
+	// Hook esp_log before anything else logs; lines are buffered in RAM
+	// until file_logs_start() can write them out post filesystem mount
+	file_logs_early_init();
+
 	esp_chip_info_t chip_info;
 
 	esp_chip_info(&chip_info);
@@ -603,6 +608,20 @@ void app_main(void)
             derived_mac_addr[3], derived_mac_addr[4], derived_mac_addr[5]);
 	
 	config_server_start(&xmsg_ws_tx_queue, &xMsg_Rx_Queue, CONNECTED_LED_GPIO_NUM, (char*)&uid[0]);
+	// config_server_start mounted the filesystem and loaded the config, so
+	// logging to flash can start now (or be torn down if configured off)
+	if(config_server_get_log_to_file())
+	{
+		file_logs_set_max_total(config_server_get_log_size());
+		file_logs_start();
+	}
+	else
+	{
+		// No flash writes, but keep capturing to the RAM ring so /logs
+		// still shows the recent log
+		file_logs_ram_only();
+	}
+
 	// These services read wiring and preconditioning settings during initialization.
 	beep_init();
 	precondition_init();
@@ -848,8 +867,9 @@ void app_main(void)
 	// pdTRUE, /* BIT_0 should be cleared before returning. */
 	// pdFALSE, /* Don't wait for both bits, either bit will do. */
 	// portMAX_DELAY);/* Wait forever. */  
-	// esp_log_level_set("*", ESP_LOG_NONE);
-	esp_log_level_set("*", ESP_LOG_WARN);
+	// Boot always logs at the compiled-in default level; from here on the
+	// configured post-boot level applies (default warn)
+	esp_log_level_set("*", config_server_get_log_level());
 	// esp_log_level_set("autopid_parser", ESP_LOG_ERROR);
 	// esp_log_level_set("autopid_task", ESP_LOG_ERROR);
 	// esp_log_level_set("elm327_process_cmd", ESP_LOG_ERROR);

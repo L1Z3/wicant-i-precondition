@@ -190,6 +190,19 @@ void filesystem_delete_all(void)
     }
 }
 
+esp_err_t filesystem_get_usage(size_t *total, size_t *used)
+{
+    if (!initialized)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    #ifdef USE_FATFS
+    return ESP_ERR_NOT_SUPPORTED;
+    #else
+    return esp_littlefs_info("storage", total, used);
+    #endif
+}
+
 void filesystem_init(void)
 {
     if (initialized) 
@@ -245,7 +258,9 @@ void filesystem_init(void)
     }
     else
     {
-            ESP_LOGI(TAG, "Partition size: total: %d, used: %d", total, used);
+            ESP_LOGI(TAG, "Partition: used %u/%u KB, free %u KB",
+                     (unsigned)(used / 1024), (unsigned)(total / 1024),
+                     (unsigned)((total - used) / 1024));
     }
     initialized = 1;
     #endif
