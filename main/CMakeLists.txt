@@ -6,10 +6,19 @@ idf_component_register(
          "main_glue.c"
          "main_heap.c"
          "main_park.c"
+         "main_precondition.c"
+         "main_precondition_http.c"
+         "precondition.c"
+         "hsm.c"
+         "isotp_tx.c"
+         "track_popup.c"
+         "beep.c"
+         "persistent_settings.c"
+         "utf8_utf16_converter.c"
          "main_safemode.c"
          "main_sleep.c"
     INCLUDE_DIRS "."
-    EMBED_FILES "web/safemode.html"
+    EMBED_FILES "web/safemode.html" "web/precondition.html"
     REQUIRES api_http autopid ha_webhooks data_destinations battery_monitor ble_manager bridge_manager
              ble_http ble_j2534
              bridge_endpoints
@@ -31,4 +40,5 @@ idf_component_register(
              esp_timer nvs_flash app_update spi_flash
              button_manager multipart_upload esp_wifi esp_http_server
              esp_partition esp_driver_gpio
+             driver
 )

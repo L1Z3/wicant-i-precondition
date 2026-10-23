@@ -85,6 +85,7 @@
 #include "main_glue.h"
 #include "main_heap.h"
 #include "main_park.h"
+#include "main_precondition.h"
 #include "main_safemode.h"
 #include "bridge_endpoints.h"
 #include "mqtt_can.h"
@@ -253,6 +254,13 @@ void app_main(void)
         components that declare sources/actions in their inits */
     main_boot_init("autopid_init", autopid_init); /* /data mounted above */
     main_boot_init("ha_webhooks_init", ha_webhooks_init); /* HA telemetry link */
+    /* E-GMP manual preconditioning: its settings group (main_precondition.c) */
+    main_boot_init("main_precondition_register_settings",
+              main_precondition_register_settings);
+    /* ... and on a fresh device, the CAN bus it needs (can_manager registered
+       above; saved before the apply pass so this boot already has it) */
+    main_boot_init("main_precondition_can_defaults",
+              main_precondition_can_defaults);
     main_boot_init("data_destinations_init", data_destinations_init); /* MQTT /
         HTTP(S) / ABRP cyclic pushes of the autopid snapshot */
     main_boot_init("data_logger_init", data_logger_init);
@@ -299,6 +307,8 @@ void app_main(void)
     main_boot_init("script_engine_register_http", script_engine_register_http);
     main_boot_init("config_backup_register_http", config_backup_register_http);
     main_boot_init("fw_update_register_http", fw_update_register_http);
+    main_boot_init("main_precondition_register_http",
+              main_precondition_register_http);
     /* CLI commands: each component registers its own INSIDE its settings
        apply, gated by its `cli` setting (meatpi 2026-07-05, ownership
        lives in the component, not here); main_cli adds only the
@@ -374,6 +384,9 @@ void app_main(void)
     main_boot_start("uds_manager", uds_manager_start);
     main_boot_start("script_engine", script_engine_start);
     bool apid_ok = main_boot_start("autopid", autopid_start);
+    /* AFTER can_manager (it subscribes to the bus) and autopid (it
+       publishes the HV battery temperature as two external values) */
+    main_boot_start("precondition", main_precondition_start);
     /* HA telemetry poster: reads autopid's snapshot + cached config */
     main_boot_start("ha_webhooks", ha_webhooks_start);
     /* data destinations poster - autopid snapshot -> MQTT / HTTP(S) / ABRP

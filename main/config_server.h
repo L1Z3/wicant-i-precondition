@@ -1,0 +1,44 @@
+/*
+ * The slice of the wicant-i-precondition firmware's config_server.h that
+ * precondition.c uses. The values come from the "precondition" settings
+ * group; see main_precondition.c.
+ */
+#pragma once
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#define ONCE				0
+#define CONTINUOUS			1
+#define PERSISTENT			2
+
+#define PRESS_SHORT			0
+#define PRESS_LONG			1
+
+#define BUTTON_DISABLED     -1
+#define SW_STAR				0
+#define AVN_STAR			1
+#define AVN_TUNER_IN		2
+#define AVN_VOL_IN			3
+#define SW_MODE				4
+#define SW_SPEAK			5
+#define SW_CALL				6
+#define SW_VOL_IN			7
+#define SW_VOL_UP			8
+#define SW_VOL_DOWN			9
+#define SW_SKIP_UP			10
+#define SW_SKIP_DOWN		11
+#define SW_OK				12
+#define AVN_MAP				13
+#define AVN_NAV				14
+#define AVN_MEDIA			15
+#define AVN_TUNER_UP		16
+#define AVN_TUNER_DOWN		17
+#define EV6_AVN_SETUP		18
+#define NUM_PRECON_BUTTONS 19
+
+int8_t config_server_precon_button(void);
+int8_t config_server_precon_mode(void);
+int8_t config_server_precon_press(void);
+bool config_server_temperature_fahrenheit(void);
+int8_t config_server_get_fwd_en(void);

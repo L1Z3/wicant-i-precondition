@@ -681,6 +681,18 @@ The backup that carries everything: a file for the computer with every part that
 
 Config = `/api/settings/config_backup` (`auto_copy` default true, `cli`). Today's `GET /api/settings/backup` (section 2) stays and its document (`wican_backup: 1`) restores through `inspect` as the settings part. The file browser (section 6) refuses `/data/certs`, `/data/backups` and `/sd/backups` since the same day.
 
+## 6e17. Preconditioning: main registers its own routes
+
+E-GMP manual battery preconditioning (`main/main_precondition*.c`). Its
+settings are the `precondition` group (`mode`, `button`, `press`,
+`temp_unit`); the page `/precondition.html` drives these routes.
+
+| Route | Method | Behavior |
+|---|---|---|
+| `/api/precondition` | GET | `{"requested":false,"active":false,"starting":false,"car_ready":true,"car_model":"ioniq6","temp_unit":"c","battery_temp":{"min_c":21,"max_c":23,"age_ms":340},"battery_soc":{"pct":71.5,"age_ms":120}}`. `car_model` is what the status frame identified this boot (`ioniq5`/`ioniq6`/`ev6`, `null` until seen); `battery_temp` and `battery_soc` are `null` until their frames have been seen |
+| `/api/precondition/toggle` | POST | no body: the same as a press of the activation button in the car (start, or stop when requested). `{"ok":true}` |
+| `/api/precondition/popup` | POST | the text as a `text/plain` UTF-8 body, at most 150 bytes / 50 characters: shown on the dash as a track popup. `{"ok":true}`; 400 empty or contains NUL, 413 too long, 503 a popup is still being sent |
+
 ## 7. WiFi: `wifi_manager` registers its own routes
 
 | Route | Method | Behavior |

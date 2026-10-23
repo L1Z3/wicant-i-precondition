@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Preconditioning</title>
+<style>
+  :root { color-scheme: light dark; --bg: #f6f7f9; --card: #fff; --fg: #1d2127;
+          --muted: #667085; --line: #e3e6ea; --accent: #1f6feb; --stop: #c4352b; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #111418; --card: #1a1f25; --fg: #e6e8eb; --muted: #98a1ad;
+            --line: #2a3139; --accent: #4c8dff; --stop: #e5534b; }
+  }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg);
+         font: 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 480px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 4px 0 16px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+          padding: 14px 16px; margin-bottom: 14px; }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 6px 0; border-bottom: 1px solid var(--line); }
+  tr:last-child td { border-bottom: 0; }
+  td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+  td:first-child { color: var(--muted); }
+  button { width: 100%; padding: 12px; font: inherit; font-weight: 600; color: #fff;
+           background: var(--accent); border: 0; border-radius: 8px; cursor: pointer; }
+  button.stop { background: var(--stop); }
+  button:disabled { opacity: .6; cursor: default; }
+  .row { display: flex; gap: 8px; }
+  .row input { flex: 1; min-width: 0; padding: 10px; font: inherit; color: var(--fg);
+               background: var(--bg); border: 1px solid var(--line); border-radius: 8px; }
+  .row button { width: auto; padding: 10px 14px; }
+  #msg { min-height: 1.4em; margin-top: 8px; color: var(--muted); font-size: 13px; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Preconditioning</h1>
+  <div class="card">
+    <table>
+      <tr><td>Car</td><td id="car">Waiting for CAN data</td></tr>
+      <tr><td>Car ready</td><td id="ready">-</td></tr>
+      <tr><td>Preconditioning requested</td><td id="requested">-</td></tr>
+      <tr><td>Preconditioning active</td><td id="active">-</td></tr>
+      <tr><td>HV battery state of charge</td><td id="soc">Waiting for CAN data</td></tr>
+      <tr><td>HV battery temperature</td><td id="temp">Waiting for CAN data</td></tr>
+    </table>
+  </div>
+  <div class="card">
+    <button id="toggle" type="button">Start preconditioning</button>
+  </div>
+  <div class="card">
+    <div class="row">
+      <input id="popup" type="text" maxlength="50" autocomplete="off"
+             placeholder="Text to show in the car">
+      <button id="show" type="button">Show</button>
+    </div>
+    <div id="msg"></div>
+  </div>
+  <p><a href="/">Back to the WiCAN</a></p>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const CARS = { ioniq5: "Ioniq 5", ioniq6: "Ioniq 6", ev6: "EV6" };
+
+function age(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return s + "s";
+  const m = Math.floor(s / 60);
+  return m < 60 ? m + "m" : Math.floor(m / 60) + "h";
+}
+
+function temp(c, unit) {
+  return unit === "f" ? Math.round(c * 9 / 5 + 32) + "°F" : c + "°C";
+}
+
+async function refresh() {
+  try {
+    const r = await fetch("/api/precondition", { cache: "no-store" });
+    const o = await r.json();
+    $("car").textContent = o.car_model ? CARS[o.car_model] : "Waiting for CAN data";
+    $("ready").textContent = o.car_ready ? "Ready" : "Not ready";
+    $("requested").textContent = o.requested ? "Yes" : "No";
+    $("active").textContent = o.starting ? "Starting" : (o.active ? "Yes" : "No");
+    $("soc").textContent = o.battery_soc
+      ? `${o.battery_soc.pct}% (${age(o.battery_soc.age_ms)} ago)` : "Waiting for CAN data";
+    $("temp").textContent = o.battery_temp
+      ? `Min ${temp(o.battery_temp.min_c, o.temp_unit)}, max ${temp(o.battery_temp.max_c, o.temp_unit)} (${age(o.battery_temp.age_ms)} ago)`
+      : "Waiting for CAN data";
+    const b = $("toggle");
+    b.textContent = o.requested ? "Stop preconditioning" : "Start preconditioning";
+    b.classList.toggle("stop", o.requested);
+  } catch (e) {
+    $("car").textContent = "No connection";
+  }
+}
+
+$("toggle").onclick = async () => {
+  $("toggle").disabled = true;
+  try { await fetch("/api/precondition/toggle", { method: "POST" }); }
+  finally { $("toggle").disabled = false; setTimeout(refresh, 200); }
+};
+
+async function showPopup() {
+  const text = $("popup").value;
+  if (!text) { $("msg").textContent = "Enter some text first."; return; }
+  $("show").disabled = true;
+  try {
+    const r = await fetch("/api/precondition/popup", {
+      method: "POST", headers: { "Content-Type": "text/plain; charset=UTF-8" }, body: text });
+    const o = await r.json().catch(() => ({}));
+    $("msg").textContent = r.ok ? "Sent to the car." : (o.error || "Could not show the popup.");
+  } catch (e) {
+    $("msg").textContent = "Could not show the popup.";
+  } finally {
+    $("show").disabled = false;
+  }
+}
+$("show").onclick = showPopup;
+$("popup").onkeydown = e => { if (e.key === "Enter") showPopup(); };
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
