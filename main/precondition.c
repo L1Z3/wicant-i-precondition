@@ -212,8 +212,10 @@ static bool is_utility_request(const twai_message_t *frame) {
 
 // Battery conditioning mode is a latched vehicle setting. The car broadcasts
 // it on 0x25D D6 bit 7, so the check needs no probe: 0x80 = enabled,
-// 0x40 = disabled
+// 0x40 = disabled. The Ioniq 6 CCU hub re-addresses the frame to the 29-bit
+// 0x09425A03 (BMS_04_100ms_1..4 family, base 0x25A, index 3); same bytes.
 #define CONDITIONING_MODE_FRAME_ID 0x25DU
+#define CONDITIONING_MODE_FRAME_ID_IONIQ6 0x09425A03U
 #define CONDITIONING_MODE_INDEX 5U
 #define CONDITIONING_MODE_DATA_LENGTH 6U
 #define CONDITIONING_MODE_ENABLED_MASK 0x80U
@@ -224,7 +226,8 @@ static bool is_utility_request(const twai_message_t *frame) {
 #define CONDITIONING_MODE_PHASE2_TICKS 3U // E007 message
 #define CONDITIONING_MODE_TICKS (CONDITIONING_MODE_PHASE1_TICKS + CONDITIONING_MODE_PHASE2_TICKS)
 
-#define IS_CONDITIONING_MODE_FRAME(frame_id) ((frame_id) == CONDITIONING_MODE_FRAME_ID)
+#define IS_CONDITIONING_MODE_FRAME(frame_id) \
+    ((frame_id) == CONDITIONING_MODE_FRAME_ID || (frame_id) == CONDITIONING_MODE_FRAME_ID_IONIQ6)
 
 #define CAR_BUS CAN_BUS_0
 #if CAN_BUS_COUNT > 1
@@ -347,7 +350,6 @@ typedef uint8_t precondition_blockers_t;
 
 enum {
     PRECONDITION_BLOCK_NONE = 0U,
-    // Higher bits have higher display and stop-reason priority.
     // Higher bits have higher display and stop-reason priority.
     // The car's conditioning mode being off only ranks above nothing: the
     // firmware turns it back on itself (see PRECONDITION_BLOCK_ABORTS), so a

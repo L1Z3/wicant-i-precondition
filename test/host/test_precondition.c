@@ -871,6 +871,17 @@ static void run_conditioning_mode_check(void) {
     rx_frame_len(0x25D, short_frame, CONDITIONING_MODE_DATA_LENGTH - 1, CAN_BUS_0);
     CHECK(platform.conditioning_mode == CONDITIONING_MODE_UNKNOWN);
 
+    // The Ioniq 6 CCU hub re-addresses the frame to 0x09425A03. Both ids are
+    // decoded, and the payload layout is unchanged, so the same bit decides.
+    uint8_t ioniq6_frame[8] = {0};
+    ioniq6_frame[5] = 0x80;
+    rx_frame(0x09425A03U, ioniq6_frame, CAN_BUS_0);
+    CHECK(platform.conditioning_mode == CONDITIONING_MODE_ENABLED);
+    ioniq6_frame[5] = 0x40;
+    rx_frame(0x09425A03U, ioniq6_frame, CAN_BUS_0);
+    CHECK(platform.conditioning_mode == CONDITIONING_MODE_DISABLED);
+    platform.conditioning_mode = CONDITIONING_MODE_UNKNOWN;  // back to the unknown case
+
     // Unknown means "not confirmed enabled": the enable burst goes out first
     // anyway, then the normal start burst.
     sent_count = 0;
