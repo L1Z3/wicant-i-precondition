@@ -14,9 +14,8 @@ esp_err_t main_precondition_register_settings(void);
  *  can_manager_init registers its group, BEFORE settings_manager_start. */
 esp_err_t main_precondition_can_defaults(void);
 
-/** GET /api/precondition, POST /api/precondition/toggle and /popup, and the
- *  /precondition.html page. In the *_register_http block, BEFORE
- *  web_ui_v2_register. */
+/** GET /api/precondition, POST /api/precondition/toggle and /popup. In the
+ *  *_register_http block. */
 esp_err_t main_precondition_register_http(void);
 
 /** Starts the tasks. AFTER can_manager_start; the frame task subscribes to

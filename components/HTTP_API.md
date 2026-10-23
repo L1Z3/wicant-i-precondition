@@ -685,7 +685,7 @@ Config = `/api/settings/config_backup` (`auto_copy` default true, `cli`). Today'
 
 E-GMP manual battery preconditioning (`main/main_precondition*.c`). Its
 settings are the `precondition` group (`mode`, `button`, `press`,
-`temp_unit`); the page `/precondition.html` drives these routes.
+`temp_unit`); the web UI's Preconditioning page drives these routes.
 
 | Route | Method | Behavior |
 |---|---|---|

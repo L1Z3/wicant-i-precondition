@@ -18,7 +18,7 @@ idf_component_register(
          "main_safemode.c"
          "main_sleep.c"
     INCLUDE_DIRS "."
-    EMBED_FILES "web/safemode.html" "web/precondition.html"
+    EMBED_FILES "web/safemode.html"
     REQUIRES api_http autopid ha_webhooks data_destinations battery_monitor ble_manager bridge_manager
              ble_http ble_j2534
              bridge_endpoints

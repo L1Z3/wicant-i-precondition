@@ -1,12 +1,10 @@
 /**
  * @file main_precondition_http.c
  * @brief Preconditioning over HTTP: its status, the start/stop toggle and
- *        the dash popup, plus /precondition.html, a page that drives them.
+ *        the dash popup. The web UI's Preconditioning page drives them.
  *
  * The old firmware's web UI had these on its home page (POST
  * /precondition_toggle, POST /track_popup, and fields in its status JSON).
- * v6's UI is not ours to change, so they are routes of their own here and a
- * small page beside it.
  *
  *   GET  /api/precondition         status, see status_handler()
  *   POST /api/precondition/toggle  start, or stop, as the button in the car
@@ -161,11 +159,6 @@ static esp_err_t popup_handler(httpd_req_t *req)
     return send_json(req, NULL, "{\"ok\":true}");
 }
 
-extern const uint8_t precondition_html_start[]
-    asm("_binary_precondition_html_start");
-extern const uint8_t precondition_html_end[]
-    asm("_binary_precondition_html_end");
-
 esp_err_t main_precondition_register_http(void)
 {
     static const httpd_uri_t URIS[] =
@@ -177,26 +170,11 @@ esp_err_t main_precondition_register_http(void)
         { .uri = "/api/precondition/popup", .method = HTTP_POST,
           .handler = popup_handler },
     };
-    static const http_asset_t ASSETS[] =
-    {
-        { .uri = "/precondition.html", .content_type = "text/html",
-          .data_start = precondition_html_start,
-          .data_end = precondition_html_end },
-        { 0 },
-    };
-
     esp_err_t err = http_server_manager_register_handlers(
         URIS, sizeof(URIS) / sizeof(URIS[0]));
-    if (err != ESP_OK)
-    {
-        return err;
-    }
-    /* earlier asset tables win on a conflicting URI: this one is registered
-       before web_ui_v2's (main.c) */
-    err = http_server_manager_register_assets(ASSETS);
     if (err == ESP_OK)
     {
-        ESP_LOGI(TAG, "/api/precondition and /precondition.html registered");
+        ESP_LOGI(TAG, "/api/precondition registered");
     }
     return err;
 }
