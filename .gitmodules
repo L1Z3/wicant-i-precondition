@@ -1,0 +1,4 @@
+[submodule "components/meatpi"]
+	path = components/meatpi
+	url = https://github.com/fsckyou2/meatpi-components.git
+	branch = wican-pro-precond

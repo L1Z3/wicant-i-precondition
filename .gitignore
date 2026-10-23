@@ -79,9 +79,6 @@ docs/node_modules
 #managed components
 managed_components/
 
-# meatpi-components checkout (own git repo, auto-cloned by the root
-# CMakeLists: never commit it into this tree)
-components/meatpi/
 .vscode/
 
 # Clangd Cache
