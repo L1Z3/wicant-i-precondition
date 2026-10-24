@@ -390,7 +390,10 @@ static void precondition_rx_task(void *arg)
         }
         publish_battery(now);
 
-        if (xQueueReceive(s_q, &f, pdMS_TO_TICKS(PRECON_RX_IDLE_MS)) == pdTRUE)
+        /* as the tick: once sleep_manager clears AWAKE, ahead of taking
+           the bus down, frames are only drained, and nothing is sent */
+        if (xQueueReceive(s_q, &f, pdMS_TO_TICKS(PRECON_RX_IDLE_MS)) == pdTRUE
+            && dev_status_manager_is_set(DEV_STATUS_BIT_AWAKE))
         {
             frame_in(&f);
         }
