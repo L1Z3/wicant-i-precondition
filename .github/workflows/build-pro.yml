@@ -1,0 +1,109 @@
+name: Build WiCAN Pro firmware
+
+# Builds the WiCAN Pro (v6) firmware with stock ESP-IDF v6.0.2 on every push
+# and pull request to the Pro branch. A release tag, meatPi's base version
+# and then ours (v6.0.0p-beta.2_pro-0.2.0, or ..._pro-0.2.1-beta), is also
+# published as a GitHub release with its images.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - wican-pro-v6-beta-precond
+  push:
+    branches:
+      - wican-pro-v6-beta-precond
+    tags:
+      - 'v*_pro-*'
+
+# Cancel superseded runs on the same ref to save runner minutes.
+concurrency:
+  group: build-pro-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: espressif/idf:v6.0.2
+
+    steps:
+      - name: Checkout (with the meatpi-components submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # all history and tags, for the git describe in the build id
+          fetch-depth: 0
+
+      # the container runs as root over a checkout owned by the runner
+      - name: Trust the checkout
+        run: git config --global --add safe.directory '*'
+
+      - name: Build
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh"
+          idf.py build
+          idf.py merge-bin -o factory.bin
+
+      - name: Check a release tag is what the build reports
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          build=$(git describe --tags --match 'v*_pro-*' --always --dirty)
+          if [ "$build" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::the build reports $build, not $GITHUB_REF_NAME"
+            exit 1
+          fi
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          name=wican-fw_obd_pro_$(git describe --tags --match 'v*_pro-*' --always --dirty)
+          mkdir dist
+          # the OTA image: the web UI's update page, or POST /api/ota/upload
+          cp build/wican-fw_obd_pro.bin "dist/$name.bin"
+          # one image for a USB flash at 0x0 of a fresh device
+          cp build/factory.bin "dist/${name}_factory.bin"
+          # the separate images with their offsets, for esptool
+          mkdir "dist/$name"
+          cp build/bootloader/bootloader.bin \
+             build/partition_table/partition-table.bin \
+             build/ota_data_initial.bin \
+             build/wican-fw_obd_pro.bin \
+             build/flash_args build/flasher_args.json "dist/$name/"
+          (cd dist && tar czf "${name}_flash.tar.gz" "$name" && rm -r "$name")
+          (cd dist && sha256sum * > SHA256SUMS)
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the images
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download the images
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # notes from the tag's message; a -beta or -alfa tag is a prerelease
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pre=""
+          case "$GITHUB_REF_NAME" in *-beta*|*-alfa*) pre=--prerelease ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --notes-from-tag \
+            --title "WiCAN Pro $GITHUB_REF_NAME" $pre
