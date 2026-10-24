@@ -22,6 +22,7 @@
 #include "config_server.h"
 #include "precondition.h"
 #include "track_popup.h"
+#include "utf8_utf16_converter.h"
 
 #include "main_precondition.h"
 
@@ -114,7 +115,8 @@ static esp_err_t toggle_handler(httpd_req_t *req)
 }
 
 /* POST /api/precondition/popup, the text as a text/plain body: shown on the
-   dash as a track popup. 503 when a popup is still being sent. */
+   dash as a track popup. 413 past the popup's 50 UTF-16 units, 503 when two
+   popups are already waiting. */
 static esp_err_t popup_handler(httpd_req_t *req)
 {
     char text[TRACK_POPUP_MAX_TEXT_UTF8_BYTES + 1U];
@@ -151,10 +153,18 @@ static esp_err_t popup_handler(httpd_req_t *req)
     }
     text[received] = '\0';
 
+    /* the byte limit above lets through up to 150 ASCII characters; the
+       dash takes 50 UTF-16 units (an emoji is two) */
+    if (utf8_to_utf16((const utf8_t *)text, received, NULL, 0U)
+        > TRACK_POPUP_MAX_TEXT_CODE_UNITS)
+    {
+        return send_error(req, "413 Content Too Large",
+                          "popup text is too long");
+    }
+
     if (!track_popup_show(text))
     {
-        return send_error(req, "503 Service Unavailable",
-                          "popup busy, or text too long");
+        return send_error(req, "503 Service Unavailable", "popup busy");
     }
     return send_json(req, NULL, "{\"ok\":true}");
 }
