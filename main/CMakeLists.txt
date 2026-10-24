@@ -40,5 +40,8 @@ idf_component_register(
              esp_timer nvs_flash app_update spi_flash
              button_manager multipart_upload esp_wifi esp_http_server
              esp_partition esp_driver_gpio
+             # only for driver/twai_types_legacy.h, which the main/driver/twai.h
+             # shim includes for precondition.c's frame type: nothing of the
+             # legacy TWAI driver is linked
              driver
 )
