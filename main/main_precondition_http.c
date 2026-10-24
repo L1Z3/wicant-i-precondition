@@ -121,6 +121,7 @@ static esp_err_t popup_handler(httpd_req_t *req)
 {
     char text[TRACK_POPUP_MAX_TEXT_UTF8_BYTES + 1U];
     size_t received = 0U;
+    int retries = 0;
 
     if (req->content_len == 0U)
     {
@@ -136,6 +137,12 @@ static esp_err_t popup_handler(httpd_req_t *req)
     {
         int n = httpd_req_recv(req, text + received,
                                req->content_len - received);
+        /* a slow client: give it a few more receive timeouts, as the
+           other upload handlers do */
+        if (n == HTTPD_SOCK_ERR_TIMEOUT && retries++ < 5)
+        {
+            continue;
+        }
         if (n <= 0)
         {
             return send_error(req, "408 Request Timeout",
