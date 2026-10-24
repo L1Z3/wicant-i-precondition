@@ -47,7 +47,8 @@
   uPlot chart library under `cache/www/`) and nothing there is needed
   for the firmware to work; a missing file is a plain 404.
 - **JSON in, JSON out** (`application/json`), except the log-ring dump
-  (`text/plain`). Errors: `{"error":"<human message>"}` with 4xx/5xx.
+  (`text/plain`) and the precondition popup's body (`text/plain` in,
+  §6e17). Errors: `{"error":"<human message>"}` with 4xx/5xx.
 - **GET never mutates. Mutations are PUT/POST/DELETE.** Reboot-affecting
   writes follow the settings model (§4.2): persist → respond → reboot via
   `restart_tracker_restart()`, never a raw `esp_restart()`.
@@ -681,7 +682,7 @@ The backup that carries everything: a file for the computer with every part that
 
 Config = `/api/settings/config_backup` (`auto_copy` default true, `cli`). Today's `GET /api/settings/backup` (section 2) stays and its document (`wican_backup: 1`) restores through `inspect` as the settings part. The file browser (section 6) refuses `/data/certs`, `/data/backups` and `/sd/backups` since the same day.
 
-## 6e17. Preconditioning: main registers its own routes
+## 6e17. Preconditioning: main registers its own routes (2026-10-23)
 
 E-GMP manual battery preconditioning (`main/main_precondition*.c`). Its
 settings are the `precondition` group (`mode`, `button`, `press`,
@@ -766,4 +767,5 @@ Config strictly via `/api/settings/wifi_manager`: no bespoke config routes.
 | `/api/webhook` | `ha_webhooks` (feature layer): HA integration discovery push (GET/POST/DELETE); outbound telemetry `{status,autopid_data,config,gps}` poster (`gps` = the contract §5.4 block for HA's Location tracker, 2026-09-09). See `ha_webhooks/HTTP_API.md` | http_server_manager (private) |
 | `/api/backup*` | `config_backup` (service layer, §6e16): the backup that carries everything, the copies on the device, the sealed restore. See `config_backup/HTTP_API.md` | settings_manager, filesystem, dev_status_manager, http_server_manager (private) |
 | `/api/fw_update*` | `fw_update` (service layer, §6b2, 2026-10-18): the manifest check, the pull install through ota_manager's pipe, the job record, the rollback state. See `fw_update/HTTP_API.md` | ota_manager, http_client_manager, partition_migrate, restart_tracker, settings_manager, config_backup, http_server_manager (private) |
+| `/api/precondition*` | `main` (`main_precondition_http.c`, §6e17): E-GMP manual battery preconditioning's status, start/stop toggle and dash popup | precondition, track_popup, http_server_manager (private) |
 | future: `/api/can/*`, `/api/obd/*`, … | their feature components | http_server_manager (private) |
