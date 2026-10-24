@@ -277,23 +277,31 @@ static StaticQueue_t s_q_buf;
 static uint8_t s_q_store[PRECON_Q_LEN * sizeof(can_core_frame_t)]
     EXT_RAM_BSS_ATTR;
 static int s_sub = -1;
+static uint32_t s_drops_seen;
 
-static bool still_subscribed(void)
+static bool still_subscribed(can_manager_subscriber_t *sub)
 {
-    can_manager_subscriber_t sub;
-
     /* after a can_manager_stop() our index is free, or someone else's */
-    return s_sub >= 0 && can_manager_subscriber_get(s_sub, &sub)
-           && sub.name != NULL && strcmp(sub.name, PRECON_SUB_NAME) == 0;
+    return s_sub >= 0 && can_manager_subscriber_get(s_sub, sub)
+           && sub->name != NULL && strcmp(sub->name, PRECON_SUB_NAME) == 0;
 }
 
 static void subscribe(void)
 {
     static bool warned;
+    can_manager_subscriber_t sub;
     int idx;
 
-    if (still_subscribed())
+    if (still_subscribed(&sub))
     {
+        /* our queue overflowed: a frame task that falls behind misses
+           button presses, so say so */
+        if (sub.drops != s_drops_seen)
+        {
+            ESP_LOGW(TAG, "%lu frames dropped: the frame task fell behind",
+                     (unsigned long)(sub.drops - s_drops_seen));
+            s_drops_seen = sub.drops;
+        }
         return;
     }
 
@@ -304,6 +312,7 @@ static void subscribe(void)
     if (err == ESP_OK)
     {
         s_sub = idx;
+        s_drops_seen = 0;   /* a new subscription counts from 0 */
         (void)can_manager_subscriber_name(idx, PRECON_SUB_NAME);
         warned = false;
         ESP_LOGI(TAG, "listening on the CAN bus");
