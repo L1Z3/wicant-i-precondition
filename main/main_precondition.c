@@ -417,6 +417,8 @@ static void tick_timer_cb(void *arg)
 
 static void precondition_tick_task(void *arg)
 {
+    bool warned = false;
+
     (void)arg;
     for (;;)
     {
@@ -427,7 +429,23 @@ static void precondition_tick_task(void *arg)
         {
             precondition_tick();
         }
-        (void)esp_timer_start_once(s_tick_timer, PRECON_TICK_US);
+
+        esp_err_t err = esp_timer_start_once(s_tick_timer, PRECON_TICK_US);
+        if (err == ESP_OK)
+        {
+            warned = false;
+            continue;
+        }
+        /* nothing else wakes this task: tick on a plain delay, trying the
+           timer again each time, rather than stop for good */
+        if (!warned)
+        {
+            warned = true;
+            ESP_LOGE(TAG, "tick timer not rearmed (%s): ticking on a delay",
+                     esp_err_to_name(err));
+        }
+        vTaskDelay(pdMS_TO_TICKS(PRECON_TICK_US / 1000));
+        xTaskNotifyGive(xTaskGetCurrentTaskHandle());
     }
 }
 
