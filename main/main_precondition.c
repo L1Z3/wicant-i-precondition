@@ -72,12 +72,33 @@ static const char *TAG = "precondition";
 
 /* ---- settings ------------------------------------------------------------ */
 
-/* Same names and order as the old firmware's web UI. The CSV is what the
-   settings schema enforces, the table what the names mean. */
-#define BUTTONS_CSV "disabled,sw_star,avn_star,avn_tuner_in,avn_vol_in," \
-                    "ev6_avn_setup,sw_mode,sw_speak,sw_call,sw_vol_in," \
-                    "sw_vol_up,sw_vol_down,sw_skip_up,sw_skip_down,sw_ok," \
-                    "avn_map,avn_nav,avn_media,avn_tuner_up,avn_tuner_down"
+/* Every activation button: its settings name and precondition.c's id, in
+   the old firmware's web UI order. The settings schema's list and the
+   lookup in on_apply() are both made from this one table. */
+#define PRECON_BUTTONS(X)                   \
+    X("disabled",       BUTTON_DISABLED)    \
+    X("sw_star",        SW_STAR)            \
+    X("avn_star",       AVN_STAR)           \
+    X("avn_tuner_in",   AVN_TUNER_IN)       \
+    X("avn_vol_in",     AVN_VOL_IN)         \
+    X("ev6_avn_setup",  EV6_AVN_SETUP)      \
+    X("sw_mode",        SW_MODE)            \
+    X("sw_speak",       SW_SPEAK)           \
+    X("sw_call",        SW_CALL)            \
+    X("sw_vol_in",      SW_VOL_IN)          \
+    X("sw_vol_up",      SW_VOL_UP)          \
+    X("sw_vol_down",    SW_VOL_DOWN)        \
+    X("sw_skip_up",     SW_SKIP_UP)         \
+    X("sw_skip_down",   SW_SKIP_DOWN)       \
+    X("sw_ok",          SW_OK)              \
+    X("avn_map",        AVN_MAP)            \
+    X("avn_nav",        AVN_NAV)            \
+    X("avn_media",      AVN_MEDIA)          \
+    X("avn_tuner_up",   AVN_TUNER_UP)       \
+    X("avn_tuner_down", AVN_TUNER_DOWN)
+
+#define BUTTON_ROW(name, id) { (name), (id) },
+#define BUTTON_CSV(name, id) "," name
 
 static const struct
 {
@@ -85,27 +106,12 @@ static const struct
     int8_t      id;
 } BUTTONS[] =
 {
-    { "disabled",       BUTTON_DISABLED },
-    { "sw_star",        SW_STAR },
-    { "avn_star",       AVN_STAR },
-    { "avn_tuner_in",   AVN_TUNER_IN },
-    { "avn_vol_in",     AVN_VOL_IN },
-    { "ev6_avn_setup",  EV6_AVN_SETUP },
-    { "sw_mode",        SW_MODE },
-    { "sw_speak",       SW_SPEAK },
-    { "sw_call",        SW_CALL },
-    { "sw_vol_in",      SW_VOL_IN },
-    { "sw_vol_up",      SW_VOL_UP },
-    { "sw_vol_down",    SW_VOL_DOWN },
-    { "sw_skip_up",     SW_SKIP_UP },
-    { "sw_skip_down",   SW_SKIP_DOWN },
-    { "sw_ok",          SW_OK },
-    { "avn_map",        AVN_MAP },
-    { "avn_nav",        AVN_NAV },
-    { "avn_media",      AVN_MEDIA },
-    { "avn_tuner_up",   AVN_TUNER_UP },
-    { "avn_tuner_down", AVN_TUNER_DOWN },
+    PRECON_BUTTONS(BUTTON_ROW)
 };
+
+/* "disabled,sw_star,...": the names as one literal, each after a comma,
+   and the first comma skipped */
+#define BUTTONS_CSV (PRECON_BUTTONS(BUTTON_CSV) + 1)
 
 static const settings_field_t FIELDS[] =
 {
