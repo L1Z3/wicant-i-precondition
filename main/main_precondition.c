@@ -25,6 +25,7 @@
  * Needs the native bus: can_manager.enabled, baud 500, silent off. A fresh
  * device gets that from main_precondition_can_defaults().
  */
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -246,7 +247,7 @@ esp_err_t main_precondition_can_defaults(void)
 esp_err_t can_send(can_bus_t bus, twai_message_t *message,
                    TickType_t ticks_to_wait)
 {
-    static uint32_t drop_cnt;
+    static atomic_uint_fast32_t drop_cnt; /* four tasks send */
     esp_err_t err = ESP_ERR_INVALID_STATE;
 
     /* Called from the frame and tick tasks and the beep and popup workers,
@@ -264,10 +265,16 @@ esp_err_t can_send(can_bus_t bus, twai_message_t *message,
                                message->rtr, message->data,
                                message->data_length_code);
     }
-    if (err != ESP_OK && (++drop_cnt % 64U) == 1U)
+    if (err != ESP_OK)
     {
-        ESP_LOGW(TAG, "%lu frames not sent (%s)", (unsigned long)drop_cnt,
-                 esp_err_to_name(err));
+        uint32_t n = (uint32_t)atomic_fetch_add_explicit(&drop_cnt, 1,
+                                                         memory_order_relaxed)
+                     + 1U;
+        if ((n % 64U) == 1U)
+        {
+            ESP_LOGW(TAG, "%lu frames not sent (%s)", (unsigned long)n,
+                     esp_err_to_name(err));
+        }
     }
     return err;
 }
