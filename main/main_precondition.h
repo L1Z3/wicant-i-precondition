@@ -10,7 +10,8 @@
 esp_err_t main_precondition_register_settings(void);
 
 /** Turns the CAN bus on when no CAN settings have been saved yet (first
- *  boot, factory reset), so preconditioning works out of the box. AFTER
+ *  boot, factory reset, or a Pro coming from other firmware that never
+ *  saved them), so preconditioning works out of the box. AFTER
  *  can_manager_init registers its group, BEFORE settings_manager_start. */
 esp_err_t main_precondition_can_defaults(void);
 

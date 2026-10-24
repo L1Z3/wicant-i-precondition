@@ -28,7 +28,6 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/stat.h>
 
 #include "esp_attr.h"
 #include "esp_log.h"
@@ -199,23 +198,21 @@ esp_err_t main_precondition_register_settings(void)
     return settings_manager_register(&DESC);
 }
 
-/* settings_manager keeps each group in <SM_DIR>/<name>.json; no file means
-   nobody has saved CAN settings yet (first boot, or after a factory reset) */
-#define CANM_SETTINGS_FILE "/settings/cfg/can_manager.json"
-
 esp_err_t main_precondition_can_defaults(void)
 {
-    struct stat st;
-
-    if (stat(CANM_SETTINGS_FILE, &st) == 0)
+    /* Nobody has saved CAN settings yet: a fresh device, a factory reset, or
+       a Pro that ran other firmware and never had the bus configured. Saved
+       settings, the bus off included, are the user's and stay as they are. */
+    if (settings_manager_is_saved("can_manager"))
     {
         return ESP_OK;
     }
 
-    /* can_manager ships with the bus off; preconditioning is the reason
-       this firmware exists, so a fresh device brings it up. baud 500 and
-       silent off are already its defaults, and set() fills them in. Saved
-       before settings_manager_start, so this boot applies it. */
+    /* can_manager ships with the bus off, and preconditioning needs it on.
+       set() replaces the whole group, but with nothing saved the other
+       fields are still their defaults (baud 500, silent off), so they stay
+       as they are. Saving before settings_manager_start() means this boot
+       already uses it. */
     cJSON *in = cJSON_CreateObject();
     if (in == NULL || cJSON_AddBoolToObject(in, "enabled", true) == NULL)
     {
