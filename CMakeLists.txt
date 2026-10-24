@@ -78,10 +78,12 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 # reads the file because CONFIG_APP_PROJECT_VER_FROM_CONFIG is off); the
 # git describe of the build goes into the WICAN_FW_BUILD define, which main
 # hands to dev_status_manager (`fw_build` on /api/info and the About page).
+# Only our own release tags count (v6.0.0p-beta.2_pro-0.2.0: meatPi's base,
+# then ours), so a merged meatPi tag doesn't stand in for our version.
 # build/flash_args and build/project_description.json (app_bin) always name
 # the current image - tools/fw_bin.py resolves it for scripts.
 execute_process(
-    COMMAND git describe --tags --always --dirty
+    COMMAND git describe --tags --match "v*_pro-*" --always --dirty
     WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}"
     OUTPUT_VARIABLE WICAN_GIT_DESC
     OUTPUT_STRIP_TRAILING_WHITESPACE
