@@ -1,51 +1,36 @@
 cmake_minimum_required(VERSION 3.16)
 
-# Components live in the meatpi-components repo
-# (github.com/meatpiHQ/meatpi-components). Clone it next to this
-# checkout, or point the MEATPI_COMPONENTS_PATH environment variable at
-# its components/ directory. The components/ dir in this repo holds
-# only non-component files (docs, legacy reference).
+# Components live in our fork of the meatpi-components repo
+# (github.com/fsckyou2/meatpi-components), pinned as the git submodule
+# components/meatpi. MEATPI_COMPONENTS_PATH (its components/ directory)
+# overrides the submodule, to build against another checkout. The
+# components/ dir in this repo otherwise holds only non-component files
+# (docs, legacy reference).
 if(DEFINED ENV{MEATPI_COMPONENTS_PATH})
     file(TO_CMAKE_PATH "$ENV{MEATPI_COMPONENTS_PATH}" MEATPI_COMPONENTS_PATH)
     if(NOT EXISTS "${MEATPI_COMPONENTS_PATH}")
         message(FATAL_ERROR "MEATPI_COMPONENTS_PATH does not exist: "
                             "${MEATPI_COMPONENTS_PATH}")
     endif()
+    message(WARNING "MEATPI_COMPONENTS_PATH overrides the components/meatpi "
+                    "submodule: ${MEATPI_COMPONENTS_PATH}")
 else()
-    set(MEATPI_COMPONENTS_PATH "")
-    foreach(_cand
-            "${CMAKE_CURRENT_LIST_DIR}/components/meatpi/components"
-            "${CMAKE_CURRENT_LIST_DIR}/../meatpi-components/components"
-            "${CMAKE_CURRENT_LIST_DIR}/../../wican-fw-dev/meatpi-components/components")
-        get_filename_component(_cand "${_cand}" ABSOLUTE)
-        if(EXISTS "${_cand}")
-            set(MEATPI_COMPONENTS_PATH "${_cand}")
-            break()
-        endif()
-    endforeach()
-    if(NOT MEATPI_COMPONENTS_PATH)
-        # Not cloned yet: fetch it INTO this checkout (self-contained;
-        # components/meatpi/ is gitignored) so the search finds it on
-        # every future configure.
-        set(_meatpi_dest "${CMAKE_CURRENT_LIST_DIR}/components/meatpi")
-        set(_meatpi_url "https://github.com/meatpiHQ/meatpi-components.git")
-        if(DEFINED ENV{MEATPI_COMPONENTS_GIT_URL})
-            set(_meatpi_url "$ENV{MEATPI_COMPONENTS_GIT_URL}")
-        endif()
-        message(STATUS "meatpi-components not found: cloning "
-                       "${_meatpi_url} into ${_meatpi_dest}")
+    set(MEATPI_COMPONENTS_PATH
+        "${CMAKE_CURRENT_LIST_DIR}/components/meatpi/components")
+    if(NOT EXISTS "${MEATPI_COMPONENTS_PATH}")
+        # Cloned without --recursive: fetch the pinned commit. Any other
+        # copy (a sibling checkout, meatpiHQ's) builds without our changes.
+        message(STATUS "components/meatpi is empty: fetching the submodule")
         execute_process(
             COMMAND ${CMAKE_COMMAND} -E env GIT_TERMINAL_PROMPT=0
-                    git clone "${_meatpi_url}" "${_meatpi_dest}"
-            RESULT_VARIABLE _meatpi_clone_rc)
-        if(_meatpi_clone_rc EQUAL 0 AND EXISTS "${_meatpi_dest}/components")
-            set(MEATPI_COMPONENTS_PATH "${_meatpi_dest}/components")
-        else()
+                    git submodule update --init components/meatpi
+            WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}"
+            RESULT_VARIABLE _meatpi_rc)
+        if(NOT _meatpi_rc EQUAL 0 OR NOT EXISTS "${MEATPI_COMPONENTS_PATH}")
             message(FATAL_ERROR
-                "meatpi-components could not be cloned automatically: "
-                "clone github.com/meatpiHQ/meatpi-components to "
-                "components/meatpi in this checkout (or next to it), or "
-                "set MEATPI_COMPONENTS_PATH to its components/ directory")
+                "components/meatpi is empty and could not be fetched: run "
+                "`git submodule update --init` in this checkout (or clone "
+                "it with --recursive)")
         endif()
     endif()
 endif()
