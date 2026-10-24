@@ -48,13 +48,15 @@ static esp_err_t send_error(httpd_req_t *req, const char *status,
     return send_json(req, status, body);
 }
 
+/* NULL for a model this file doesn't know yet: reported as not seen */
 static const char *car_model_name(egmp_car_model_t model)
 {
     switch (model)
     {
+        case EGMP_CAR_IONIQ5: return "ioniq5";
         case EGMP_CAR_IONIQ6: return "ioniq6";
         case EGMP_CAR_EV6:    return "ev6";
-        default:              return "ioniq5";
+        default:              return NULL;
     }
 }
 
@@ -78,9 +80,11 @@ static esp_err_t status_handler(httpd_req_t *req)
     int64_t now = esp_timer_get_time();
 
     (void)precondition_get_state(&st);
-    if (precondition_get_car_model(&car))
+    const char *car_name = precondition_get_car_model(&car)
+                               ? car_model_name(car) : NULL;
+    if (car_name != NULL)
     {
-        snprintf(model, sizeof(model), "\"%s\"", car_model_name(car));
+        snprintf(model, sizeof(model), "\"%s\"", car_name);
     }
     if (precondition_get_battery_temperature(&t))
     {
