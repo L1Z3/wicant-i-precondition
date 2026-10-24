@@ -385,7 +385,8 @@ void app_main(void)
     main_boot_start("script_engine", script_engine_start);
     bool apid_ok = main_boot_start("autopid", autopid_start);
     /* AFTER can_manager (it subscribes to the bus) and autopid (it
-       publishes the HV battery temperature as two external values) */
+       publishes the HV battery's min and max temperature and its state of
+       charge as external values) */
     main_boot_start("precondition", main_precondition_start);
     /* HA telemetry poster: reads autopid's snapshot + cached config */
     main_boot_start("ha_webhooks", ha_webhooks_start);

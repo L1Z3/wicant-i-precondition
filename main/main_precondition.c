@@ -4,9 +4,10 @@
  *        from the wicant-i-precondition firmware.
  *
  * precondition.c and the modules it uses (hsm, isotp_tx, track_popup, beep,
- * persistent_settings, utf8_utf16_converter) are that firmware's, unchanged,
- * so a later version can be dropped in as is. This file supplies what they
- * expect from around them there:
+ * persistent_settings, utf8_utf16_converter) are that firmware's, unchanged
+ * but for track_popup.c's fallback media source (Bluetooth audio, which the
+ * cluster shows in parallel mode), so a later version can be dropped in with
+ * that reapplied. This file supplies what they expect from around them there:
  *
  *  - can_send() (can.h), on can_manager_send();
  *  - the config_server getters (config_server.h), from the "precondition"
@@ -242,9 +243,10 @@ esp_err_t can_send(can_bus_t bus, twai_message_t *message,
     static uint32_t drop_cnt;
     esp_err_t err = ESP_ERR_INVALID_STATE;
 
-    /* can_manager_send() bounds its own wait, and only waits at all when
-       the node can't talk yet, so ask first rather than stall the task
-       that also runs the tick */
+    /* Called from the frame and tick tasks and the beep and popup workers,
+       none of which should block on the bus. can_manager_send() waits only
+       while the node can't talk, so ask first; it can still wait up to
+       100 ms if the link drops between the two. */
     (void)ticks_to_wait;
     if (bus != CAN_BUS_0)
     {
@@ -467,7 +469,8 @@ esp_err_t main_precondition_start(void)
     }
 
     /* both read the settings applied above; precondition_init also starts
-       the NVS writer and the track popup's ISO-TP worker */
+       the track popup's ISO-TP worker, and in Persistent mode the NVS
+       writer */
     beep_init();
     precondition_init();
 

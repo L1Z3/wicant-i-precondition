@@ -16,8 +16,9 @@
 #define TRACK_POPUP_MEDIA_OFF_TYPE 0x14U
 #define TRACK_POPUP_MEDIA_FRAME_ID 0x4CEU
 
-// Bluetooth audio as fallback category: from beside the head unit (parallel
-// mode) the cluster shows it with media off, where "Sounds of Nature" failed
+// Bluetooth audio as fallback category: in parallel mode, beside the head
+// unit, the cluster shows a Bluetooth audio popup even while media is off,
+// and not a "Sounds of Nature" one
 #define TRACK_POPUP_FALLBACK_MEDIA_TYPE 0x10U
 #define TRACK_POPUP_FALLBACK_ISOTP_TX_ID 0x6D4U
 #define TRACK_POPUP_FALLBACK_ISOTP_FLOW_CONTROL_ID 0x6B4U
