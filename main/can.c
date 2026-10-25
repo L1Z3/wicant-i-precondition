@@ -33,6 +33,8 @@
 #include "esp_twai_onchip.h"
 #include "can.h"
 #include "hw_config.h"
+#include "sleep_mode.h"
+#include "file_logs.h"
 #if HW_HAS_MCP2515 || HW_HAS_MCP2518FD
 #include "driver/spi_master.h"
 #endif
@@ -1591,6 +1593,25 @@ void can_dump_diagnostics(const char *why)
 			 (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
 			 (unsigned long)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
 			 (unsigned long)(can_rx_queue ? uxQueueMessagesWaiting(can_rx_queue) : 0));
+
+	{
+		// The ADC task logs one summary every 30 s; the 60 s dump also
+		// carries the latest value even when the capture's level hides the
+		// per-read ADC lines.
+		float vbat = 0.0f, car_on = 0.0f;
+		int vbat_ok = sleep_mode_get_voltage(&vbat);
+		int car_ok = sleep_mode_get_car_on_sense_voltage(&car_on);
+		ESP_LOGI(TAG, "adc: vbat=%.2f V (%d), car_on=%.2f V (%d)",
+				 vbat, vbat_ok, car_on, car_ok);
+
+		// RAM-only captures have no file_flush statistics, so show the ring
+		// state here as well. In file mode `written` is the on-flash total.
+		uint32_t log_buffered = 0, log_dropped = 0, log_written = 0;
+		file_logs_get_stats(&log_buffered, &log_dropped, &log_written);
+		ESP_LOGI(TAG, "log: buffered=%lu B, dropped=%lu B, written=%lu B, ram_only=%d",
+				 (unsigned long)log_buffered, (unsigned long)log_dropped,
+				 (unsigned long)log_written, (int)file_logs_is_ram_only());
+	}
 
 	for (int bus = 0; bus < CAN_BUS_COUNT; bus++)
 	{

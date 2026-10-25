@@ -257,11 +257,24 @@ void oneshot_adc_init(void)
 #endif
 }
 
+#define ADC_DIAG_SLOTS          8
+#define ADC_DIAG_INTERVAL_US    (30LL * 1000 * 1000)
+
 esp_err_t read_ss_adc_voltage(float *voltage_out, adc_channel_t adc_ch)
 {
     if (voltage_out == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
+
+    // The ADC task reads every 1-2 s (including while asleep). Logging every
+    // read at Info, plus five raw samples, filled the log and hid the rest
+    // of the capture; keep one sample and a summary per channel every 30 s.
+    static int64_t s_last_diag_us[ADC_DIAG_SLOTS];
+    int adc_slot = (int)adc_ch;
+    int64_t now_us = esp_timer_get_time();
+    bool log_diag = (adc_slot >= 0 && adc_slot < ADC_DIAG_SLOTS &&
+                     (s_last_diag_us[adc_slot] == 0 ||
+                      (now_us - s_last_diag_us[adc_slot]) >= ADC_DIAG_INTERVAL_US));
 
     const int NUM_SAMPLES = 8; // Similar to conv_frame_size in continuous version
     uint32_t sum_raw = 0;
@@ -304,11 +317,12 @@ esp_err_t read_ss_adc_voltage(float *voltage_out, adc_channel_t adc_ch)
             if (raw_value < min_raw) min_raw = raw_value;
             if (raw_value > max_raw) max_raw = raw_value;
             
-            // Print first few samples for debugging
-            if (valid_samples <= 5)
+            // One raw sample per diagnostic interval; the summary below
+            // carries min/max/avg for the full burst.
+            if (log_diag && valid_samples == 1)
 			{
-                ESP_LOGI(TAG, "Sample[%d]: Chan=%d, Raw=%d, Voltage=%dmV", 
-                        (int)valid_samples, adc_ch, raw_value, voltage);
+                ESP_LOGI(TAG, "Sample[1]: Chan=%d, Raw=%d, Voltage=%dmV",
+                        adc_ch, raw_value, voltage);
             }
             
             // Small delay between readings
@@ -326,10 +340,16 @@ esp_err_t read_ss_adc_voltage(float *voltage_out, adc_channel_t adc_ch)
         volt_rounded = roundf(volt_rounded * 10.0f) / 10.0f;
         *voltage_out = volt_rounded;
         
-        ESP_LOGI(TAG, "Summary: Raw=%d (min=%lu, max=%lu, avg of %lu), Voltage=%.2f V [%s]", 
-                 avg_raw, min_raw, max_raw, valid_samples, *voltage_out,
-                 cali_handle != NULL ? "CALIBRATED" : "UNCALIBRATED");
-                 
+        if (log_diag)
+        {
+            s_last_diag_us[adc_slot] = now_us;
+            ESP_LOGI(TAG, "Summary: Chan=%d, Raw=%d (min=%lu, max=%lu, avg of %lu), "
+                     "Voltage=%.2f V [%s]",
+                     adc_ch, avg_raw, (unsigned long)min_raw, (unsigned long)max_raw,
+                     (unsigned long)valid_samples, *voltage_out,
+                     cali_handle != NULL ? "CALIBRATED" : "UNCALIBRATED");
+        }
+
         return ESP_OK;
     }
     

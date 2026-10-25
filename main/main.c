@@ -64,6 +64,21 @@
 
 #define TAG 		__func__
 
+// Compile-time timestamp source, logged at boot so a capture can be checked
+// against the build that produced it. RTOS ticks pause in light sleep, so
+// CONFIG_LOG_TIMESTAMP_SOURCE_SYSTEM is what makes sleep time visible.
+#if CONFIG_LOG_TIMESTAMP_SOURCE_SYSTEM
+#define LOG_TS_NAME "system"
+#elif CONFIG_LOG_TIMESTAMP_SOURCE_SYSTEM_FULL
+#define LOG_TS_NAME "system_full"
+#elif CONFIG_LOG_TIMESTAMP_SOURCE_UNIX
+#define LOG_TS_NAME "unix"
+#elif CONFIG_LOG_TIMESTAMP_SOURCE_RTOS
+#define LOG_TS_NAME "rtos"
+#else
+#define LOG_TS_NAME "none"
+#endif
+
 #define GPIO_OUTPUT_PIN_SEL  ((1ULL<<CONNECTED_LED_GPIO_NUM) | (1ULL<<ACTIVE_LED_GPIO_NUM) | (1ULL<<PWR_LED_GPIO_NUM))
 
 static QueueHandle_t xMsg_Tx_Queue, xMsg_Rx_Queue, xmsg_ws_tx_queue, xmsg_ble_tx_queue, xmsg_obd_rx_queue, xmsg_mqtt_rx_queue;
@@ -670,6 +685,19 @@ void app_main(void)
 		file_logs_ram_only();
 	}
 
+	// One line that pins down exactly how this capture is configured; the
+	// timestamp source is compile-time and easy to get wrong when only the
+	// web UI setting is changed.
+	ESP_LOGW(TAG, "logging: file=%d level=%d size=%lu KB ram_only=%d timestamp=%s",
+			 (int)config_server_get_log_to_file(),
+			 (int)config_server_get_log_level(),
+			 (unsigned long)(config_server_get_log_size() / 1024),
+			 (int)file_logs_is_ram_only(), LOG_TS_NAME);
+#if CONFIG_LOG_TIMESTAMP_SOURCE_RTOS
+	ESP_LOGW(TAG, "logging: RTOS timestamps pause in light sleep; rebuild with "
+			 "CONFIG_LOG_TIMESTAMP_SOURCE_SYSTEM to see real sleep time");
+#endif
+
 	// These services read wiring and preconditioning settings during initialization.
 	beep_init();
 	precondition_init();
@@ -928,8 +956,34 @@ void app_main(void)
 	// pdFALSE, /* Don't wait for both bits, either bit will do. */
 	// portMAX_DELAY);/* Wait forever. */  
 	// Boot always logs at the compiled-in default level; from here on the
-	// configured post-boot level applies (default warn)
-	esp_log_level_set("*", config_server_get_log_level());
+	// configured post-boot level applies (default warn). CAN/ADC diagnostics
+	// stay at Info even at the default Warn so a capture does not silently
+	// omit the 60 s dump, ADC summaries or bus state recovery; Error/None
+	// still means fully quiet.
+	esp_log_level_t post_level = config_server_get_log_level();
+	esp_log_level_set("*", post_level);
+	if (post_level == ESP_LOG_WARN || post_level == ESP_LOG_INFO)
+	{
+		static const char *const diag_tags[] = {
+			"can_dump_diagnostics",
+			"read_ss_adc_voltage",
+			"adc_task",
+			"mcp251xfd",
+			"can_mcp251xfd",
+			"mcp251xfd_spi",
+			"file_logs",
+			"can_recovery_task",
+			"can_enable",
+			"can_disable",
+			"can_bus1_create_node",
+			"can_mcp2518fd_bus_init",
+			"can_transceiver_standby",
+		};
+		for (size_t i = 0; i < sizeof(diag_tags) / sizeof(diag_tags[0]); i++)
+		{
+			esp_log_level_set(diag_tags[i], ESP_LOG_INFO);
+		}
+	}
 	// esp_log_level_set("autopid_parser", ESP_LOG_ERROR);
 	// esp_log_level_set("autopid_task", ESP_LOG_ERROR);
 	// esp_log_level_set("elm327_process_cmd", ESP_LOG_ERROR);

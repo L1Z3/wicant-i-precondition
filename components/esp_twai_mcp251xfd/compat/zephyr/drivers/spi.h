@@ -5,6 +5,7 @@
 #include "hal/spi_ll.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "log_flash.h"
 #include <zephyr/device.h>
 
 // Bring-up diagnostics for the direct (LL) SPI path. The spin limit is a
@@ -57,6 +58,13 @@ static inline int spi_transfer_ll(spi_dev_t *hw, const void *tx, void *rx, size_
 	size_t bits = len * 8;
 	int64_t t0 = esp_timer_get_time();
 	uint32_t spins = 0;
+	// Snapshot the file-log flash marker before the transfer. The LL loop
+	// runs from flash; if a littlefs write/erase starts while it polls, the
+	// CPU cannot execute the next instruction until the cache is back, and
+	// the sequence counter changes even though active is false again by the
+	// time we log.
+	uint32_t log_flash_seq0 = log_flash_seq();
+	bool log_flash_active0 = log_flash_active();
 
 	if (len > SOC_SPI_MAXIMUM_BUFFER_SIZE) {
 		ESP_LOGE(SPI_LL_TAG, "transfer too long for the LL path: %u bytes", (unsigned)len);
@@ -75,16 +83,23 @@ static inline int spi_transfer_ll(spi_dev_t *hw, const void *tx, void *rx, size_
 		if (++spins >= SPI_LL_TIMEOUT_SPINS) {
 			s_timeouts++;
 			ESP_LOGE(SPI_LL_TAG, "LL transfer stuck: len=%u bits=%u spins=%lu "
-				 "cmd_usr=%lu done=%d timeouts=%lu (SPI clock/CS/MISO fault?)",
+				 "cmd_usr=%lu done=%d timeouts=%lu log_flash=%d seq=%lu (SPI "
+				 "clock/CS/MISO or cache stall?)",
 				 (unsigned)len, (unsigned)bits, (unsigned long)spins,
 				 (unsigned long)spi_ll_get_running_cmd(hw),
-				 spi_ll_usr_is_done(hw), (unsigned long)s_timeouts);
+				 spi_ll_usr_is_done(hw), (unsigned long)s_timeouts,
+				 log_flash_active(), (unsigned long)log_flash_seq());
 			return -EIO;
 		}
 	}
 	if (rx) {
 		spi_ll_read_buffer(hw, rx, bits);
 	}
+
+	uint32_t log_flash_seq1 = log_flash_seq();
+	bool log_flash_active1 = log_flash_active();
+	bool log_flash_during = log_flash_active0 || log_flash_active1 ||
+				 log_flash_seq1 != log_flash_seq0;
 
 	int64_t dt = esp_timer_get_time() - t0;
 	s_xfers++;
@@ -97,11 +112,14 @@ static inline int spi_transfer_ll(spi_dev_t *hw, const void *tx, void *rx, size_
 		if (now_us - s_slow_log_us > 1000000LL) {
 			s_slow_log_us = now_us;
 			ESP_LOGW(SPI_LL_TAG, "slow LL transfer: %lld us (len=%u bits=%u, "
-				 "max=%lu us, avg=%lu us over %lu transfers)",
+				 "max=%lu us, avg=%lu us over %lu transfers, log_flash=%d "
+				 "act=%d/%d seq=%lu->%lu)",
 				 (long long)dt, (unsigned)len, (unsigned)bits,
 				 (unsigned long)s_max_us,
 				 (unsigned long)(s_xfers ? s_total_us / s_xfers : 0),
-				 (unsigned long)s_xfers);
+				 (unsigned long)s_xfers, log_flash_during,
+				 log_flash_active0, log_flash_active1,
+				 (unsigned long)log_flash_seq0, (unsigned long)log_flash_seq1);
 		}
 	}
 	int64_t now_us = esp_timer_get_time();

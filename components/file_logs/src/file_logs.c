@@ -15,10 +15,14 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
+#include "log_flash.h"
 #include "file_logs.h"
 #include "file_logs_config.h"
 
 #if FILE_LOGS_ENABLE
+
+#define TAG "file_logs"
 
 static vprintf_like_t s_orig_vprintf = NULL;
 
@@ -53,6 +57,14 @@ static long s_max_file_size = FILE_LOGS_MAX_FILE_SIZE;
 // Bumped after every completed drain (data on flash, fsync done) so
 // file_logs_flush() callers can tell when their request went through
 static volatile uint32_t s_flush_cycles = 0;
+// Diagnostics: how long each drain takes, and whether it is the kind of
+// littlefs write/erase that can stall the flash-resident SPI LL loop.
+static uint32_t s_flush_count = 0;
+static int64_t s_max_flush_us = 0;
+static int64_t s_last_flush_us = 0;
+static int64_t s_last_slow_flush_log_us = 0;
+static int64_t s_last_flush_stats_log_us = 0;
+static size_t s_last_flush_bytes = 0;
 // Active readers of the log files, guarded by s_file_mutex; rotation is
 // deferred while nonzero (littlefs rename/unlink fail on files with open FDs)
 static int s_readers = 0;
@@ -311,6 +323,7 @@ static void log_file_rotate_if_needed(void)
         // A reader is streaming the files; retry on a later drain cycle
         return;
     }
+    log_flash_begin();
     if (s_file)
     {
         fclose(s_file);
@@ -323,15 +336,17 @@ static void log_file_rotate_if_needed(void)
         // Rename failed: truncate in place rather than growing without bound
         unlink(FILE_LOGS_CUR_PATH);
     }
+    log_flash_end();
     s_generation++;
 }
 
 // Must be called with s_file_mutex held. Copies ring contents out in chunks
 // and appends them to the current log file.
-static void drain_to_file(void)
+static void drain_to_file_inner(void)
 {
     if (!log_file_open())
     {
+        s_last_flush_bytes = 0;
         return;
     }
 
@@ -422,7 +437,56 @@ static void drain_to_file(void)
         }
     }
     log_file_rotate_if_needed();
+    s_last_flush_bytes = total_written;
     s_flush_cycles++;
+}
+
+// Wraps the drain so every littlefs write/erase (open, fwrite, fsync,
+// rotation) is visible to the SPI LL path, and records how long the drain
+// took. The log lines are written after log_flash_end(): they describe the
+// operation but are not themselves part of it.
+static void drain_to_file(void)
+{
+    int64_t t0 = esp_timer_get_time();
+    log_flash_begin();
+    drain_to_file_inner();
+    log_flash_end();
+
+    int64_t us = esp_timer_get_time() - t0;
+    s_flush_count++;
+    s_last_flush_us = us;
+    if (us > s_max_flush_us)
+    {
+        s_max_flush_us = us;
+    }
+
+    uint32_t buffered = 0, dropped = 0, written = 0;
+    file_logs_get_stats(&buffered, &dropped, &written);
+
+    if (us > 2000)
+    {
+        int64_t now = esp_timer_get_time();
+        if (now - s_last_slow_flush_log_us > 1000000LL)
+        {
+            s_last_slow_flush_log_us = now;
+            ESP_LOGW(TAG, "flush took %lld ms (wrote %lu B, max=%lld ms, "
+                     "%lu flushes, buffered=%lu B, dropped=%lu B)",
+                     (long long)(us / 1000), (unsigned long)s_last_flush_bytes,
+                     (long long)(s_max_flush_us / 1000), (unsigned long)s_flush_count,
+                     (unsigned long)buffered, (unsigned long)dropped);
+        }
+    }
+
+    int64_t now = esp_timer_get_time();
+    if (now - s_last_flush_stats_log_us >= 60000000LL)
+    {
+        s_last_flush_stats_log_us = now;
+        ESP_LOGI(TAG, "flush stats: %lu flushes, last=%lld ms/%lu B, max=%lld ms, "
+                 "written=%lu B, buffered=%lu B, dropped=%lu B",
+                 (unsigned long)s_flush_count, (long long)(s_last_flush_us / 1000),
+                 (unsigned long)s_last_flush_bytes, (long long)(s_max_flush_us / 1000),
+                 (unsigned long)written, (unsigned long)buffered, (unsigned long)dropped);
+    }
 }
 
 static void drain_locked(void)
@@ -454,10 +518,11 @@ void file_logs_flush(void)
     xTaskNotifyGive(s_flush_task);
     for (int i = 0; i < 200; i++)
     {
-        portENTER_CRITICAL(&s_lock);
-        size_t used = s_used;
-        portEXIT_CRITICAL(&s_lock);
-        if (s_flush_cycles != start && used == 0)
+        // The drain increments s_flush_cycles only after fsync/rotation. Do
+        // not also require s_used == 0: the drain wrapper logs its own
+        // timing/statistics line after the drain, which would otherwise make
+        // every /logs request wait the full 2 s for the ring to be empty.
+        if (s_flush_cycles != start)
         {
             return;
         }
@@ -490,6 +555,7 @@ void file_logs_start(void)
     // Boot marker so consecutive boots are easy to tell apart in the file
     if (xSemaphoreTake(s_file_mutex, portMAX_DELAY) == pdTRUE)
     {
+        log_flash_begin();
         if (log_file_open())
         {
             int n = fprintf(s_file, "\n==== boot (reset: %s, fw: %s) ====\n",
@@ -500,6 +566,7 @@ void file_logs_start(void)
                 s_written += (uint32_t)n;
             }
         }
+        log_flash_end();
         xSemaphoreGive(s_file_mutex);
     }
 
@@ -515,8 +582,10 @@ bool file_logs_delete(void)
     if (!s_file_mutex)
     {
         // Not started: nothing holds the files open
+        log_flash_begin();
         unlink(FILE_LOGS_CUR_PATH);
         unlink(FILE_LOGS_OLD_PATH);
+        log_flash_end();
         s_generation++;
         return true;
     }
@@ -528,6 +597,7 @@ bool file_logs_delete(void)
     if (s_readers == 0)
     {
         // Close our append FD first: littlefs cannot unlink an open file
+        log_flash_begin();
         if (s_file)
         {
             fclose(s_file);
@@ -537,6 +607,7 @@ bool file_logs_delete(void)
         // Missing files are fine, ignore unlink errors
         unlink(FILE_LOGS_CUR_PATH);
         unlink(FILE_LOGS_OLD_PATH);
+        log_flash_end();
         s_generation++;
         ok = true;
     }
