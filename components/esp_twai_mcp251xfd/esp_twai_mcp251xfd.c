@@ -264,9 +264,17 @@ static esp_err_t node_enable(twai_node_handle_t handle)
 	int started_before = node->data.common.started;
 	int64_t t0 = esp_timer_get_time();
 
-	ESP_LOGI(TAG, "node_enable: listen_only=%d driver_state=%s started=%d mode=%u",
+	// Re-enable the INT pin in case this node was disabled without being
+	// deleted (controller_sleep() normally goes through node_delete).
+	k_mutex_lock(&node->data.mutex, K_FOREVER);
+	node->data.int_suspended = false;
+	int int_ret = gpio_pin_interrupt_configure_dt(&node->config.int_gpio_dt,
+						      GPIO_INT_LEVEL_ACTIVE);
+	k_mutex_unlock(&node->data.mutex);
+
+	ESP_LOGI(TAG, "node_enable: listen_only=%d driver_state=%s started=%d mode=%u int_gpio=%d",
 		 node->listen_only, mcp251xfd_state_name(node->data.state), started_before,
-		 (unsigned)node->data.next_mcp251xfd_mode);
+		 (unsigned)node->data.next_mcp251xfd_mode, int_ret);
 	node->state = TWAI_ERROR_ACTIVE;
 	int ret = can_start(&node->dev);
 	ESP_LOGI(TAG, "node_enable: can_start -> %d after %lld ms (started=%d, driver_state=%s)",
@@ -430,6 +438,19 @@ static int controller_sleep(mcp251xfd_node_t *node)
 		ESP_LOGW(TAG, "controller_sleep: driver thread did not go idle; leaving the "
 			 "controller awake");
 		ret = -EBUSY;
+	}
+
+	if (ret == 0) {
+		// The thread has finished. Mark it suspended while holding the same
+		// mutex the thread uses before re-enabling the pin, then disable the
+		// pin: a queued edge can no longer read INT from the sleeping part.
+		k_mutex_lock(&node->data.mutex, K_FOREVER);
+		node->data.int_suspended = true;
+		int gpio_ret = gpio_pin_interrupt_configure_dt(&node->config.int_gpio_dt,
+							      GPIO_INT_DISABLE);
+		k_mutex_unlock(&node->data.mutex);
+		ESP_LOGI(TAG, "controller_sleep: INT GPIO%d disabled -> %d (suspended=%d)",
+			 node->config.int_gpio_dt.pin, gpio_ret, node->data.int_suspended);
 	}
 
 	k_mutex_lock(&node->data.mutex, K_FOREVER);
@@ -756,6 +777,10 @@ esp_err_t twai_new_node_mcp251xfd(spi_host_device_t host, const twai_mcp251xfd_n
 	// enabled interrupt to mean that the driver's thread is idle.
 	int ret = controller_reset(s_node);
 	if (ret == 0) {
+		// controller_sleep() leaves the pin disabled and marks the driver so
+		// the INT thread won't re-enable it; a reused node must clear that
+		// before the interrupt is enabled again.
+		s_node->data.int_suspended = false;
 		ret = gpio_pin_interrupt_configure_dt(&s_node->config.int_gpio_dt, GPIO_INT_LEVEL_ACTIVE);
 		ESP_LOGI(TAG, "twai_new_node: INT GPIO%d interrupt -> %d",
 			 s_node->config.int_gpio_dt.pin, ret);

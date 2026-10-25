@@ -1185,8 +1185,22 @@ static void mcp251xfd_handle_interrupts(const struct device *dev)
 	// LOCAL PATCH: a state read failed after CERRIF was cleared (see below).
 	bool state_pending = false;
 
+	// LOCAL PATCH: can_stop()/controller_sleep() set started=false before the
+	// controller enters its low-power transition. A GPIO edge that was
+	// already queued can still run this handler; reading INT then races with
+	// the sleep sequence and returns a CRC error from the sleeping part.
+	if (!dev_data->common.started) {
+		return;
+	}
+
 	while (1) {
 		bool progress = false;
+
+		// A stop can happen while this loop is draining a burst; check
+		// again before each register read, not just at function entry.
+		if (!dev_data->common.started) {
+			break;
+		}
 
 		k_mutex_lock(&dev_data->mutex, K_FOREVER);
 		reg_int_hw = mcp251xfd_read_crc(dev, MCP251XFD_REG_INT, sizeof(*reg_int_hw));
@@ -1325,12 +1339,19 @@ static void mcp251xfd_int_thread(const struct device *dev)
 		k_sem_take(&dev_data->int_sem, K_FOREVER);
 		mcp251xfd_handle_interrupts(dev);
 
-		/* Re-enable pin interrupts */
-		ret = gpio_pin_interrupt_configure_dt(&dev_cfg->int_gpio_dt, GPIO_INT_LEVEL_ACTIVE);
-		if (ret < 0) {
-			LOG_ERR("Couldn't enable pin interrupt [%d]", ret);
-			k_oops();
+		/* Re-enable pin interrupts, unless the adapter is putting the
+		 * controller to sleep. Holding the driver mutex makes this
+		 * check+enable atomic with controller_sleep()'s set+disable. */
+		k_mutex_lock(&dev_data->mutex, K_FOREVER);
+		if (!dev_data->int_suspended) {
+			ret = gpio_pin_interrupt_configure_dt(&dev_cfg->int_gpio_dt,
+							     GPIO_INT_LEVEL_ACTIVE);
+			if (ret < 0) {
+				LOG_ERR("Couldn't enable pin interrupt [%d]", ret);
+				k_oops();
+			}
 		}
+		k_mutex_unlock(&dev_data->mutex);
 	}
 }
 
