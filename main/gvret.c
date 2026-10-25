@@ -38,6 +38,7 @@
 #include "config_server.h"
 #include "gvret.h"
 #include "comm_server.h"
+#include "wifi_network.h"
 
 #define TAG 		__func__
 
@@ -707,13 +708,26 @@ static void gvret_broadcast_task(void *pvParameters)
 	while(1)
 	{
 		vTaskDelay(pdMS_TO_TICKS(1000));
+
+		// Stay quiet while Wi-Fi is down (light sleep, BLE takeover, etc.):
+		// the socket has no route and sendto() returns ENOTCONN every second.
+		if(!wifi_network_is_initialized())
+		{
+			continue;
+		}
+
 		if(!tcp_port_open())
 		{
 			int err = sendto(sock, buff, 4, 0, (struct sockaddr *)&broadcastAddr, sizeof(broadcastAddr));
 			if (err < 0)
 			{
-				ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
-//				break;
+				static int64_t last_error_us;
+				int64_t now = esp_timer_get_time();
+				if((now - last_error_us) > 60000000LL)
+				{
+					last_error_us = now;
+					ESP_LOGW(TAG, "broadcast send failed: errno %d", errno);
+				}
 			}
 		}
 	}

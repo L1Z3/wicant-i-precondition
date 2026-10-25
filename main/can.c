@@ -75,6 +75,10 @@ static twai_node_handle_t can_node[CAN_BUS_COUNT];
 // so create/delete/transmit are serialized under it to prevent use-after-free.
 // Don't hold it across a blocking call.
 static SemaphoreHandle_t node_lock[CAN_BUS_COUNT];
+// Serializes the driver transmit (and the SPI transfer inside it) without
+// holding node_lock across it. can_disable() takes this before node_lock, so
+// an in-flight send can never outlive its node.
+static SemaphoreHandle_t tx_lock[CAN_BUS_COUNT];
 // One queue shared by all buses; can_receive() returns the bus tag.
 static QueueHandle_t can_rx_queue = NULL;
 // Per-bus "enabled" bits (BIT(bus)). These are state flags, not events:
@@ -959,6 +963,11 @@ void can_enable(can_bus_t bus)
 	if (err == ESP_OK)
 	{
 		can_tx_slots_reset(bus);	// fresh node: all slots are free
+		// The new node starts in the active state; do not inherit a stale
+		// warning/error-passive flag from the previous node (recovery), or
+		// can_is_active() would gate forwarding forever.
+		can_diag[bus].last_state = TWAI_ERROR_ACTIVE;
+		can_diag[bus].last_state_us = 0;
 		can_transceiver_standby(bus, false);
 		int64_t t_enable0 = esp_timer_get_time();
 		err = twai_node_enable(can_node[bus]);
@@ -1017,8 +1026,19 @@ void can_disable(can_bus_t bus)
 		return;
 	}
 
-	// The node is deleted with node_lock held so a concurrent can_send() can never touch a freed handle
+	// The node is deleted with node_lock held so a concurrent can_send() can
+	// never touch a freed handle. tx_lock is taken first: can_send() releases
+	// node_lock before the driver/SPI call, so waiting for tx_lock is what
+	// quiesces an in-flight transmit without holding node_lock for 14 ms.
 	int64_t t_total0 = esp_timer_get_time();
+	int64_t t_txlock0 = esp_timer_get_time();
+	xSemaphoreTake(tx_lock[bus], portMAX_DELAY);
+	int64_t txlock_wait_us = esp_timer_get_time() - t_txlock0;
+	if (txlock_wait_us > 5000)
+	{
+		ESP_LOGW(TAG, "bus %d: disable waited %lld ms for tx_lock",
+				 bus, (long long)(txlock_wait_us / 1000));
+	}
 	int64_t t_lock0 = esp_timer_get_time();
 	xSemaphoreTake(node_lock[bus], portMAX_DELAY);
 	int64_t lock_wait_us = esp_timer_get_time() - t_lock0;
@@ -1038,6 +1058,7 @@ void can_disable(can_bus_t bus)
 		// Bus is already off
 		ESP_LOGD(TAG, "bus %d: disable: already off, nothing to do", bus);
 		xSemaphoreGive(node_lock[bus]);
+		xSemaphoreGive(tx_lock[bus]);
 		return;
 	}
 	ESP_LOGI(TAG, "bus %d: disabling (node=%p, state=%s, tx_done=%lu)",
@@ -1074,13 +1095,15 @@ void can_disable(can_bus_t bus)
 #else
 	bool sleeping = false;
 #endif
-	ESP_LOGI(TAG, "bus %d: disabled in %lld ms (lock wait=%lld ms, stop=%lld ms, "
-			 "standby=%lld ms, delete/LPM=%lld ms); mcp2518fd_sleeping=%d",
+	ESP_LOGI(TAG, "bus %d: disabled in %lld ms (tx_lock wait=%lld ms, lock wait=%lld ms, "
+			 "stop=%lld ms, standby=%lld ms, delete/LPM=%lld ms); mcp2518fd_sleeping=%d",
 			 bus, (long long)((esp_timer_get_time() - t_total0) / 1000),
+			 (long long)(txlock_wait_us / 1000),
 			 (long long)(lock_wait_us / 1000), (long long)(stop_us / 1000),
 			 (long long)(stby_us / 1000), (long long)(del_us / 1000), sleeping);
 
 	xSemaphoreGive(node_lock[bus]);
+	xSemaphoreGive(tx_lock[bus]);
 }
 
 // Config setters. As in the legacy driver, they are no-ops while the bus is
@@ -1217,6 +1240,7 @@ void can_init(void)
 	for (int bus = 0; bus < CAN_BUS_COUNT; bus++)
 	{
 		node_lock[bus] = xSemaphoreCreateMutex();
+		tx_lock[bus] = xSemaphoreCreateMutex();
 		tx_slot_sem[bus] = xSemaphoreCreateCounting(CAN_TX_SLOT_COUNT, CAN_TX_SLOT_COUNT);
 		can_cfg[bus] = (can_cfg_t){
 			.bus_state = OFF_BUS,
@@ -1334,6 +1358,18 @@ esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_w
 		return ESP_ERR_TIMEOUT;
 	}
 
+	// tx_lock serializes the driver transmit. It is taken BEFORE node_lock
+	// and held until the SPI transaction finishes; node_lock is released
+	// before the driver call, so a slow SPI transfer no longer blocks
+	// enable/disable or the diagnostics dump.
+	int64_t t_txlock0 = esp_timer_get_time();
+	if (xSemaphoreTake(tx_lock[bus], portMAX_DELAY) != pdTRUE)
+	{
+		xSemaphoreGive(tx_slot_sem[bus]);
+		return ESP_ERR_TIMEOUT;
+	}
+	int64_t txlock_wait_us = esp_timer_get_time() - t_txlock0;
+
 	// Synchronize against enable/disable deleting the node out from under
 	// us. Safe to wait unbounded: every holder keeps this lock only for
 	// short non-blocking sections.
@@ -1364,6 +1400,7 @@ esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_w
 					 bus, can_cfg[bus].bus_state == ON_BUS ? "on" : "off", can_node[bus]);
 		}
 		xSemaphoreGive(node_lock[bus]);
+		xSemaphoreGive(tx_lock[bus]);
 		xSemaphoreGive(tx_slot_sem[bus]);
 		return ESP_ERR_INVALID_STATE;
 	}
@@ -1398,6 +1435,7 @@ esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_w
 				 (unsigned long)can_diag[bus].tx_success,
 				 (unsigned long)can_diag[bus].tx_aborted);
 		xSemaphoreGive(node_lock[bus]);
+		xSemaphoreGive(tx_lock[bus]);
 		xSemaphoreGive(tx_slot_sem[bus]);	// no-op if reset already refilled it
 		return ESP_ERR_TIMEOUT;
 	}
@@ -1417,16 +1455,25 @@ esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_w
 	slot->frame.buffer = slot->data;
 	slot->frame.buffer_len = message->rtr ? 0 : dlc;
 
+	// The node pointer stays valid because tx_lock is held and
+	// can_disable() takes it before node_lock and before deleting the node.
+	int64_t node_hold_us = esp_timer_get_time() - t_acquired;
+	if (node_hold_us > can_diag[bus].max_hold_us)
+	{
+		can_diag[bus].max_hold_us = node_hold_us;
+	}
+	xSemaphoreGive(node_lock[bus]);
+
 	// Timeout 0: the slot semaphore already did the waiting (queue space is
-	// guaranteed), and staying non-blocking keeps the node_lock hold short
+	// guaranteed), and staying non-blocking keeps the driver call short.
 	int64_t t_tx0 = esp_timer_get_time();
 	esp_err_t err = twai_node_transmit(can_node[bus], &slot->frame, 0);
 	int64_t tx_us = esp_timer_get_time() - t_tx0;
 
 	if (err != ESP_OK)
 	{
-		// Frame never reached the driver: put the slot straight back, before
-		// releasing node_lock so a bus recreate can't reuse it meanwhile
+		// Frame never reached the driver: put the slot straight back while
+		// tx_lock still excludes a bus recreate.
 		portENTER_CRITICAL(&tx_slot_mux);
 		tx_slot_used[bus] &= ~BIT(slot - &tx_slot[bus][0]);
 		portEXIT_CRITICAL(&tx_slot_mux);
@@ -1469,21 +1516,19 @@ esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_w
 		}
 	}
 
-	// Measure the whole node_lock critical section: this is the hold that can
-	// starve forwarding while the MCP2518FD resets or sleeps.
-	int64_t hold_us = esp_timer_get_time() - t_acquired;
-	if (hold_us > can_diag[bus].max_hold_us)
+	// node_lock is released before the driver call now, so report both
+	// values: a long tx with a short node_lock is the SPI/queue problem,
+	// not lock contention.
+	if ((node_hold_us > 5000 || tx_us > 5000) &&
+		can_diag_should_log(&dbg_slow_send_log_us[bus], 1000000))
 	{
-		can_diag[bus].max_hold_us = hold_us;
-	}
-	if (hold_us > 5000 && can_diag_should_log(&dbg_slow_send_log_us[bus], 1000000))
-	{
-		ESP_LOGW(TAG, "bus %d: can_send held node_lock for %lld ms (tx=%lld us, lock wait=%lld ms)",
-				 bus, (long long)(hold_us / 1000), (long long)tx_us,
-				 (long long)(lock_wait_us / 1000));
+		ESP_LOGW(TAG, "bus %d: can_send timing: node_lock=%lld ms tx_lock_wait=%lld ms "
+				 "tx=%lld ms (lock wait=%lld ms)",
+				 bus, (long long)(node_hold_us / 1000), (long long)(txlock_wait_us / 1000),
+				 (long long)(tx_us / 1000), (long long)(lock_wait_us / 1000));
 	}
 
-	xSemaphoreGive(node_lock[bus]);
+	xSemaphoreGive(tx_lock[bus]);
 	return err;
 }
 
@@ -1494,6 +1539,19 @@ bool can_is_enabled(can_bus_t bus)
 		return false;
 	}
 	return can_cfg[bus].bus_state == ON_BUS;
+}
+
+// True when the bus is enabled and the driver's last reported state is
+// active. Forwarding uses this to avoid feeding a bus that is warning,
+// error-passive or bus-off; a failed frame there would only block the RX
+// path and burn TX slots.
+bool can_is_active(can_bus_t bus)
+{
+	if (!can_is_enabled(bus))
+	{
+		return false;
+	}
+	return can_diag[bus].last_state == TWAI_ERROR_ACTIVE;
 }
 
 // True if any bus is up--one atomic read instead of a per-bus loop

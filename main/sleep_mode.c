@@ -350,6 +350,9 @@ static void adc_task(void *pvParameters)
     static int64_t pub_time = 0;
     static float alert_voltage = 0;
     static uint64_t alert_time;
+    // Wi-Fi/BLE/CAN are torn down once per sleep entry, not on every 2 s
+    // timer wake. The flag survives transitions into and out of WAKEUP_STATE.
+    static bool sleep_teardown_done = false;
 	uint64_t sleep_time = 0;
     alert_time = config_server_get_alert_time();
     alert_time *= (3600000000);
@@ -467,6 +470,7 @@ static void adc_task(void *pvParameters)
 					}
 					else if((esp_timer_get_time() - sleep_detect_time) > sleep_time)
 					{
+						sleep_teardown_done = false;
 						sleep_state = SLEEP_STATE;
 					}
 
@@ -474,7 +478,6 @@ static void adc_task(void *pvParameters)
 				}
 				case SLEEP_STATE:
 				{
-					ESP_LOGI(TAG, "Go to sleep");
 					if(awake_wanted)
 					{
 						wakeup_detect_time = esp_timer_get_time();
@@ -558,43 +561,37 @@ static void adc_task(void *pvParameters)
 	//    	ESP_LOGI(TAG, "value: %u",adc_val);
 			if(sleep_state == SLEEP_STATE)
 			{
-				// This block runs again after every 2 s light-sleep wake,
-				// so the verbose CAN dump is rate-limited while the buses
-				// are already down.
-				static int64_t s_last_diag_us;
-				int64_t diag_now = esp_timer_get_time();
-				bool diag = (diag_now - s_last_diag_us) >= 60LL * 1000 * 1000;
-
-				if (diag)
+				// The 2 s timer wake re-enters this block; the teardown below
+				// must happen only on the first pass, or the log and flash
+				// are flooded (and Wi-Fi/BLE are re-deinitialized) for the
+				// whole time the car is parked.
+				if(!sleep_teardown_done)
 				{
-					s_last_diag_us = diag_now;
-					ESP_LOGW(TAG, "sleeping: entering light sleep with CAN buses being disabled");
+					sleep_teardown_done = true;
+					ESP_LOGW(TAG, "entering light sleep: disabling CAN buses, Wi-Fi and BLE");
 					can_dump_diagnostics("pre-sleep");
-				}
-				for(int bus = 0; bus < CAN_BUS_COUNT; bus++)
-				{
-					if (diag)
+					for(int bus = 0; bus < CAN_BUS_COUNT; bus++)
 					{
 						ESP_LOGI(TAG, "sleep: can_disable(bus %d) (enabled=%d)",
 								 bus, (int)can_is_enabled((can_bus_t)bus));
+						can_disable(bus);
 					}
-					can_disable(bus);
-				}
-				if (diag)
-				{
 					can_dump_diagnostics("post-sleep-disable");
+					wifi_network_deinit();
+					ble_disable();
 				}
 
-				wifi_network_deinit();
-				ble_disable();
 				esp_sleep_enable_timer_wakeup(2*1000000);
 				int64_t t_sleep = esp_timer_get_time();
 				esp_light_sleep_start();
-				if (diag)
+				// A timer wake is the normal 2 s battery check; only log
+				// unexpected wake sources.
+				esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+				if (cause != ESP_SLEEP_WAKEUP_TIMER)
 				{
 					ESP_LOGI(TAG, "woke from light sleep after %lld ms, cause=%d",
 							 (long long)((esp_timer_get_time() - t_sleep) / 1000),
-							 (int)esp_sleep_get_wakeup_cause());
+							 (int)cause);
 				}
 			}
 			else vTaskDelay(pdMS_TO_TICKS(1000));

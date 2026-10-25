@@ -34,6 +34,7 @@
  #include "config_server.h"
  #include "ble.h"
  #include "dev_status.h"
+#include "wifi_network.h"
  
  #define WIFI_CONNECTED_BIT 			BIT0
  #define WIFI_FAIL_BIT     			BIT1
@@ -167,6 +168,13 @@
  
  void wifi_network_deinit(void)
  {
+     // Idempotent: the sleep path calls this once, but the BLE path can also
+     // call it, and the radio may already be down.
+     if(!wifi_network_is_initialized())
+     {
+         return;
+     }
+
      xEventGroupWaitBits(s_wifi_event_group,
                          WIFI_CONNECT_IDLE_BIT,
                          pdFALSE,
@@ -229,6 +237,18 @@
          return (ux_bits & WIFI_CONNECTED_BIT);
      }
      else return 0;
+ }
+
+ // Whether the Wi-Fi driver has been initialized and not yet deinitialized.
+ // Used by background tasks (e.g. the GVRET broadcast socket) to stay quiet
+ // while the device is sleeping or BLE has taken over the radio.
+ bool wifi_network_is_initialized(void)
+ {
+     if(s_wifi_event_group == NULL)
+     {
+         return false;
+     }
+     return (xEventGroupGetBits(s_wifi_event_group) & WIFI_INIT_BIT) != 0;
  }
  
  static void wifi_conn_task(void *pvParameters)
