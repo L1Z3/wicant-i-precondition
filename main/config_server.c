@@ -845,7 +845,17 @@ static esp_err_t logs_handler(httpd_req_t *req)
 		}
 	}
 
-	file_logs_flush();
+	// Don't force a littlefs write on every live-view poll. Drains in the
+	// can_re capture took 20-460 ms while the viewer polls every 2 s; those
+	// cache stalls hit the Wi-Fi/TCP path too. The 10 s background flush
+	// still bounds latency, and a 5 s floor keeps the view reasonably fresh.
+	static int64_t last_logs_flush_us;
+	int64_t now_us = esp_timer_get_time();
+	if (now_us - last_logs_flush_us >= 5000000LL)
+	{
+		last_logs_flush_us = now_us;
+		file_logs_flush();
+	}
 
 	// Defers rotation while we hold the files open: littlefs cannot
 	// rename/unlink a file with an open FD. Also pins the generation and
