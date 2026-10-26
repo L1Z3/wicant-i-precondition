@@ -598,6 +598,13 @@ void app_main(void)
 	{
 		can_enable(CAN_BUS_1);
 	}
+
+	// MITM: the head unit reaches the rest of the bus only through us, so
+	// both buses come up now, before any protocol is set up, and stay up
+	if(config_server_get_fwd_en())
+	{
+		can_lock_bridge();
+	}
 #endif
 
 	protocol = config_server_protocol();
