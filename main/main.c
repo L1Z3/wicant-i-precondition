@@ -706,6 +706,25 @@ void app_main(void)
 	int8_t can_datarate = config_server_get_can_rate();
 	can_init();
 
+	// Start the consumers before the first can_enable() below. The
+	// 256-entry RX queue filled during boot in the can_re log (255 bus-0
+	// and 38 bus-1 frames dropped) because can_rx_task was created after
+	// the transports and Wi-Fi started.
+	can_fwd_queue = xQueueCreate(CAN_FWD_QUEUE_LEN, sizeof(can_fwd_item_t));
+	if (can_fwd_queue != NULL)
+	{
+		xTaskCreate(can_fwd_task, "can_fwd_task", 1024*3, NULL, 5, NULL);
+	}
+	else
+	{
+		ESP_LOGE(TAG, "can_fwd_queue create failed; forwarding disabled");
+	}
+
+	// Prio 7: the CAN datapath must preempt the TCP streaming tasks (prio 5)
+	// instead of timeslicing with them. Safe only because can_rx_task blocks
+	// in can_receive() when idle (see the receive loop).
+	xTaskCreate(can_rx_task, "can_rx_task", 1024*3, (void*)AF_INET, 7, NULL);
+
 	ESP_LOGI(TAG, "CAN config: protocol=%d fwd_en=%d | can0 rate_idx=%d mode=%d | can1 en=%d",
 			 config_server_protocol(), config_server_get_fwd_en(), can_datarate,
 			 config_server_get_can_mode(), config_server_get_can1_en());
@@ -903,22 +922,6 @@ void app_main(void)
     }
 	wc_mdns_init((char*)uid, hardware_version, firmware_version);
 	precondition_task_start();
-    // Forwarding runs on its own task so the RX task never waits for the
-    // target bus's driver/SPI transfer.
-    can_fwd_queue = xQueueCreate(CAN_FWD_QUEUE_LEN, sizeof(can_fwd_item_t));
-    if (can_fwd_queue != NULL)
-    {
-        xTaskCreate(can_fwd_task, "can_fwd_task", 1024*3, NULL, 5, NULL);
-    }
-    else
-    {
-        ESP_LOGE(TAG, "can_fwd_queue create failed; forwarding disabled");
-    }
-
-    // Prio 7: the CAN datapath must preempt the TCP streaming tasks (prio 5)
-    // instead of timeslicing with them. Safe only because can_rx_task blocks
-    // in can_receive() when idle (see the receive loop).
-    xTaskCreate(can_rx_task, "can_rx_task", 1024*3, (void*)AF_INET, 7, NULL);
     xTaskCreate(can_tx_task, "can_tx_task", 1024*3, (void*)AF_INET, 5, NULL);
 
     // sleep_config: 1 = low-voltage sleep, 2 = car-off sleep. Both run the
