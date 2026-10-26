@@ -312,7 +312,7 @@ static void precondition_task_start(void)
 // 14 ms SPI transfers) must not block the RX task: dropping a forwarded frame
 // is preferable to dropping bus-0 traffic and the GVRET stream.
 // ---------------------------------------------------------------------------
-#define CAN_FWD_QUEUE_LEN 64
+#define CAN_FWD_QUEUE_LEN 256
 typedef struct {
 	twai_message_t message;
 	can_bus_t bus;
@@ -713,7 +713,7 @@ void app_main(void)
 	can_fwd_queue = xQueueCreate(CAN_FWD_QUEUE_LEN, sizeof(can_fwd_item_t));
 	if (can_fwd_queue != NULL)
 	{
-		xTaskCreate(can_fwd_task, "can_fwd_task", 1024*3, NULL, 5, NULL);
+		xTaskCreate(can_fwd_task, "can_fwd_task", 1024*3, NULL, 6, NULL);
 	}
 	else
 	{
