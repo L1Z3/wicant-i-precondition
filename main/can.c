@@ -156,6 +156,28 @@ static TaskHandle_t can_recovery_task_handle = NULL;
 static volatile uint32_t can_busoff_pending;	// bitmask, set from driver callbacks and the stall check
 static uint32_t can_busoff_count[CAN_BUS_COUNT];
 
+// MITM forwarding lock (can_lock_bridge). The head unit only reaches the rest
+// of the bus through us, so while it's set nothing a client does reaches the
+// buses: can_disable() refuses (slcan close, an ELM327 protocol change,
+// SavvyCAN bus setup, an upload), and so do the config setters, even while
+// recovery has a bus down, so a bus always comes back as it was locked. The
+// recovery task takes buses down through can_disable_node(), and brings back
+// any that end up down. Sleep parks the buses (can_park), which also unlocks.
+static volatile bool bridge_locked;
+// Set for good by can_park(): can_enable() refuses until the restart that
+// waking is
+static volatile bool can_parked;
+// Rate limit for the "kept on" warning, which a client can trigger per poll
+#define CAN_LOCK_LOG_US 60000000
+static int64_t lock_log_us[CAN_BUS_COUNT];
+// A locked bus that's down (it failed to come up, or a recreate failed) is
+// retried after 1 s, doubling up to 32 s
+#define CAN_LOCK_RETRY_BACKOFF_MAX 5
+static int64_t lock_retry_at_us[CAN_BUS_COUNT];
+static uint8_t lock_retry_backoff[CAN_BUS_COUNT];
+
+static void can_disable_node(can_bus_t bus);
+
 // Driver callbacks run in ISR context for the on-chip controller and in a
 // driver task for the SPI controllers, so they pick FreeRTOS APIs to match.
 
@@ -312,14 +334,50 @@ static void can_check_tx_stalls(void)
 	}
 }
 
+// Brings back any bus that's down while MITM forwarding is locked (it failed
+// to come up, or a recreate failed), with backoff (CAN_LOCK_RETRY_BACKOFF_MAX).
+// Runs in the recovery task, so it never sees a recovery's own 250 ms gap.
+static void can_retry_locked_buses(void)
+{
+	int64_t now = esp_timer_get_time();
+
+	for (int bus = 0; bus < CAN_BUS_COUNT; bus++)
+	{
+		if (!bridge_locked || can_is_enabled((can_bus_t)bus))
+		{
+			lock_retry_at_us[bus] = 0;
+			lock_retry_backoff[bus] = 0;
+			continue;
+		}
+		if (lock_retry_at_us[bus] == 0)
+		{
+			lock_retry_at_us[bus] = now + (1000000LL << lock_retry_backoff[bus]);
+			continue;
+		}
+		if (now < lock_retry_at_us[bus])
+		{
+			continue;
+		}
+		ESP_LOGW(TAG, "bus %d: down with MITM forwarding locked, bringing it up", bus);
+		can_enable((can_bus_t)bus);
+		lock_retry_at_us[bus] = 0;
+		if (!can_is_enabled((can_bus_t)bus) && lock_retry_backoff[bus] < CAN_LOCK_RETRY_BACKOFF_MAX)
+		{
+			lock_retry_backoff[bus]++;
+		}
+	}
+}
+
 static void can_recovery_task(void *arg)
 {
 	(void)arg;
 	while (1)
 	{
-		// Woken for bus-off, and periodically to look for TX stalls
+		// Woken for bus-off, and periodically to look for TX stalls and for
+		// locked buses that are down
 		ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(CAN_TX_STALL_CHECK_MS));
 		can_check_tx_stalls();
+		can_retry_locked_buses();
 
 		// Tear down first so can_send() fails fast (bus enable bit cleared)
 		// instead of burning its full timeout per frame against a dead node.
@@ -343,7 +401,7 @@ static void can_recovery_task(void *arg)
 			can_busoff_count[bus]++;
 			ESP_LOGW(TAG, "bus %d: failure #%lu, recreating node (%lu TX dropped so far)",
 					 bus, can_busoff_count[bus], tx_drop_count[bus]);
-			can_disable((can_bus_t)bus);
+			can_disable_node((can_bus_t)bus);
 		}
 
 		if (pending == 0)
@@ -647,9 +705,10 @@ void can_enable(can_bus_t bus)
 	// can_send()/can_disable() touching the node handle.
 	xSemaphoreTake(node_lock[bus], portMAX_DELAY);
 
-	if (can_cfg[bus].bus_state == ON_BUS)
+	// Bus is already on, or parked for sleep (checked under node_lock, so a
+	// retry or recovery enable racing can_park() can't win)
+	if (can_cfg[bus].bus_state == ON_BUS || can_parked)
 	{
-		// Bus is already on
 		xSemaphoreGive(node_lock[bus]);
 		return;
 	}
@@ -721,7 +780,7 @@ void can_enable(can_bus_t bus)
 
 // Tear a bus down: stops the interrupt sources (no callbacks after this), then
 // delete frees the node.
-void can_disable(can_bus_t bus)
+static void can_disable_node(can_bus_t bus)
 {
 	if (bus >= CAN_BUS_COUNT || s_can_event_group == NULL)
 	{
@@ -752,13 +811,90 @@ void can_disable(can_bus_t bus)
 	xSemaphoreGive(node_lock[bus]);
 }
 
+void can_disable(can_bus_t bus)
+{
+	if (bridge_locked && bus < CAN_BUS_COUNT)
+	{
+		int64_t now = esp_timer_get_time();
+		if (lock_log_us[bus] == 0 || now - lock_log_us[bus] >= CAN_LOCK_LOG_US)
+		{
+			lock_log_us[bus] = now;
+			ESP_LOGW(TAG, "bus %d: kept on, MITM forwarding is locked", bus);
+		}
+		return;
+	}
+	can_disable_node(bus);
+}
+
+void can_park(void)
+{
+	if (!can_parked)
+	{
+		ESP_LOGI(TAG, "buses parked for sleep");
+	}
+	// Before taking the buses down, so a retry or recovery re-enable
+	// already in progress can't bring one back
+	can_parked = true;
+	bridge_locked = false;
+	for (int bus = 0; bus < CAN_BUS_COUNT; bus++)
+	{
+		can_disable_node((can_bus_t)bus);
+	}
+}
+
+void can_lock_bridge(void)
+{
+	// Set first, so nothing reconfigures a bus between here and its enable
+	bridge_locked = true;
+	ESP_LOGI(TAG, "MITM forwarding locked");
+
+	for (int bus = 0; bus < CAN_BUS_COUNT; bus++)
+	{
+		// Forwarding needs normal mode, every frame and retransmission.
+		// Modes and filters are creation-time: recreate the node if needed.
+		// The settings go in before the node comes down, so a recovery
+		// re-enable in between brings it back with them.
+		bool recreate = can_cfg[bus].silent || can_cfg[bus].loopback || !can_cfg[bus].auto_tx
+						|| can_cfg[bus].filter != 0 || can_cfg[bus].mask != 0xFFFFFFFF;
+		if (can_cfg[bus].silent)
+		{
+			ESP_LOGI(TAG, "bus %d: configured listen-only, but MITM forwarding needs normal mode", bus);
+		}
+		can_cfg[bus].silent = 0;
+		can_cfg[bus].loopback = 0;
+		can_cfg[bus].auto_tx = 1;
+		can_cfg[bus].filter = 0;
+		can_cfg[bus].mask = 0xFFFFFFFF;
+		if (recreate)
+		{
+			can_disable_node((can_bus_t)bus);
+		}
+		can_enable((can_bus_t)bus);
+		if (!can_is_enabled((can_bus_t)bus))
+		{
+			ESP_LOGE(TAG, "bus %d: down with MITM forwarding locked, will retry", bus);
+		}
+	}
+#if CAN_BUS_COUNT > 1
+	if (can_cfg[CAN_BUS_0].rate != can_cfg[CAN_BUS_1].rate)
+	{
+		ESP_LOGW(TAG, "MITM: bus 0 and bus 1 bitrates differ; check the CAN settings");
+	}
+#endif
+}
+
 // Config setters. As in the legacy driver, they are no-ops while the bus is
 // ON: values are latched into the node at the next can_enable(). Callers
-// that reconfigure at runtime (slcan/gvret/elm327) always disable first.
+// that reconfigure at runtime (slcan/gvret/elm327) disable first. While MITM
+// forwarding is locked they're no-ops whether the bus is on or not.
+static bool can_cfg_frozen(can_bus_t bus)
+{
+	return bus >= CAN_BUS_COUNT || bridge_locked || can_cfg[bus].bus_state == ON_BUS;
+}
 
 void can_set_silent(can_bus_t bus, uint8_t flag)
 {
-	if (bus >= CAN_BUS_COUNT || can_cfg[bus].bus_state == ON_BUS)
+	if (can_cfg_frozen(bus))
 	{
 		return;
 	}
@@ -767,7 +903,7 @@ void can_set_silent(can_bus_t bus, uint8_t flag)
 
 void can_set_loopback(can_bus_t bus, uint8_t flag)
 {
-	if (bus >= CAN_BUS_COUNT || can_cfg[bus].bus_state == ON_BUS)
+	if (can_cfg_frozen(bus))
 	{
 		return;
 	}
@@ -785,7 +921,7 @@ uint8_t can_is_silent(can_bus_t bus)
 
 void can_set_auto_retransmit(can_bus_t bus, uint8_t flag)
 {
-	if (bus >= CAN_BUS_COUNT || can_cfg[bus].bus_state == ON_BUS)
+	if (can_cfg_frozen(bus))
 	{
 		return;
 	}
@@ -807,7 +943,7 @@ void can_set_auto_retransmit(can_bus_t bus, uint8_t flag)
 
 void can_set_filter(can_bus_t bus, uint32_t f)
 {
-	if (bus >= CAN_BUS_COUNT || can_cfg[bus].bus_state == ON_BUS)
+	if (can_cfg_frozen(bus))
 	{
 		return;
 	}
@@ -816,7 +952,7 @@ void can_set_filter(can_bus_t bus, uint32_t f)
 
 void can_set_mask(can_bus_t bus, uint32_t m)
 {
-	if (bus >= CAN_BUS_COUNT || can_cfg[bus].bus_state == ON_BUS)
+	if (can_cfg_frozen(bus))
 	{
 		return;
 	}
@@ -825,7 +961,7 @@ void can_set_mask(can_bus_t bus, uint32_t m)
 
 void can_set_bitrate(can_bus_t bus, uint8_t rate)
 {
-	if (bus >= CAN_BUS_COUNT || can_cfg[bus].bus_state == ON_BUS)
+	if (can_cfg_frozen(bus))
 	{
 		return;
 	}

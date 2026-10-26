@@ -54,6 +54,13 @@ typedef struct {
 void can_init(void);
 void can_enable(can_bus_t bus);
 void can_disable(can_bus_t bus);
+// MITM: brings every bus up in normal mode, accepting every frame, and keeps
+// it so: can_disable() and the config setters refuse, and a bus that goes
+// down is brought back. Until can_park().
+void can_lock_bridge(void);
+// Sleep: takes every bus down for good (unlocking MITM forwarding); no bus
+// comes up again until the restart that waking is
+void can_park(void);
 void can_set_silent(can_bus_t bus, uint8_t flag);
 void can_set_loopback(can_bus_t bus, uint8_t flag);
 void can_set_auto_retransmit(can_bus_t bus, uint8_t flag);
