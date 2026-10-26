@@ -41,7 +41,11 @@ CONFIG_LOG_TIMESTAMP_SOURCE_SYSTEM=y
 # internal), so a browser on the config page starved the GVRET server's
 # accept() with ENFILE until the keep-alive connections idled out.
 CONFIG_LWIP_MAX_SOCKETS=16
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=20480
+# GVRET at ~1.1k frames/s can pause a slow client for 1.5-2.1 s. The 20 KB
+# send buffer plus the 128-frame producer queue overflowed in ~1 s, dropping
+# 19k frames and closing six sessions in the can_re capture. 48 KB covers the
+# measured stalls with the 20 KB peer window.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=49152
 CONFIG_LWIP_TCP_WND_DEFAULT=20480
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=64
 CONFIG_LWIP_HOOK_IP6_INPUT_NONE=y
