@@ -79,6 +79,10 @@ static twai_node_handle_t can_node[CAN_BUS_COUNT];
 // so create/delete/transmit are serialized under it to prevent use-after-free.
 // Don't hold it across a blocking call.
 static SemaphoreHandle_t node_lock[CAN_BUS_COUNT];
+// Serializes the driver transmit (and the SPI transfer inside it) without
+// holding node_lock across it. can_disable() takes this before node_lock, so
+// an in-flight send can never outlive its node.
+static SemaphoreHandle_t tx_lock[CAN_BUS_COUNT];
 // One queue shared by all buses; can_receive() returns the bus tag.
 static QueueHandle_t can_rx_queue = NULL;
 // Per-bus "enabled" bits (BIT(bus)). These are state flags, not events:
@@ -150,6 +154,11 @@ static int64_t tx_drop_log_us[CAN_BUS_COUNT];
 #define CAN_TX_STALL_CHECK_MS 250
 // Error-passive per the last state change, set in can_on_state_change()
 static volatile bool bus_err_passive[CAN_BUS_COUNT];
+// The driver's last reported state per bus, set in can_on_state_change() and
+// reset to active in can_enable() (a fresh node starts active). Forwarding
+// gates on this via can_is_active() so a warning/error-passive target bus is
+// not fed frames that would only block the RX path and burn TX slots.
+static volatile twai_error_state_t bus_last_state[CAN_BUS_COUNT];
 // Recovery only helps a bus whose peers are there but starved. With no peer
 // at all (a head unit asleep while forwarding continues), every recovery
 // stalls again, and each one costs 250 ms of downtime. So each stall recovery
@@ -418,6 +427,7 @@ static CAN_ISR_ATTR bool can_on_state_change(twai_node_handle_t handle, const tw
 	(void)handle;
 	can_bus_t bus = (can_bus_t)(uintptr_t)user_ctx;
 	bus_err_passive[bus] = (edata->new_sta == TWAI_ERROR_PASSIVE);
+	bus_last_state[bus] = edata->new_sta;
 	if (edata->new_sta != TWAI_ERROR_BUS_OFF)
 	{
 		return false;
@@ -891,6 +901,10 @@ void can_enable(can_bus_t bus)
 		{
 			xQueueReset(can_rx_queue);
 		}
+		// The new node starts in the active state; do not inherit a stale
+		// warning/error-passive flag from the previous node (recovery), or
+		// can_is_active() would gate forwarding forever.
+		bus_last_state[bus] = TWAI_ERROR_ACTIVE;
 		can_transceiver_standby(bus, false);
 		err = twai_node_enable(can_node[bus]);
 	}
@@ -923,13 +937,18 @@ static void can_disable_node(can_bus_t bus)
 		return;
 	}
 
-	// The node is deleted with node_lock held so a concurrent can_send() can never touch a freed handle
+	// The node is deleted with node_lock held so a concurrent can_send() can
+	// never touch a freed handle. tx_lock is taken first: can_send() releases
+	// node_lock before the driver/SPI call, so waiting for tx_lock is what
+	// quiesces an in-flight transmit without holding node_lock for 14 ms.
+	xSemaphoreTake(tx_lock[bus], portMAX_DELAY);
 	xSemaphoreTake(node_lock[bus], portMAX_DELAY);
 
 	if (can_cfg[bus].bus_state != ON_BUS)
 	{
 		// Bus is already off
 		xSemaphoreGive(node_lock[bus]);
+		xSemaphoreGive(tx_lock[bus]);
 		return;
 	}
 	// The enable bit goes first so new senders fail fast instead of piling up on the lock.
@@ -945,6 +964,7 @@ static void can_disable_node(can_bus_t bus)
 	can_cfg[bus].bus_state = OFF_BUS;
 
 	xSemaphoreGive(node_lock[bus]);
+	xSemaphoreGive(tx_lock[bus]);
 }
 
 void can_disable(can_bus_t bus)
@@ -1141,6 +1161,7 @@ void can_init(void)
 	for (int bus = 0; bus < CAN_BUS_COUNT; bus++)
 	{
 		node_lock[bus] = xSemaphoreCreateMutex();
+		tx_lock[bus] = xSemaphoreCreateMutex();
 		tx_slot_sem[bus] = xSemaphoreCreateCounting(CAN_TX_SLOT_COUNT, CAN_TX_SLOT_COUNT);
 		can_cfg[bus] = (can_cfg_t){
 			.bus_state = OFF_BUS,
@@ -1420,6 +1441,12 @@ static esp_err_t can_send_frame(can_bus_t bus, twai_message_t *message, TickType
 		return ESP_ERR_TIMEOUT;
 	}
 
+	// tx_lock serializes the driver transmit. It is taken BEFORE node_lock
+	// and held until the SPI transaction finishes; node_lock is released
+	// before the driver call, so a slow SPI transfer no longer blocks
+	// enable/disable or the diagnostics dump.
+	xSemaphoreTake(tx_lock[bus], portMAX_DELAY);
+
 	// Synchronize against enable/disable deleting the node out from under
 	// us. Safe to wait unbounded: every holder keeps this lock only for
 	// short non-blocking sections.
@@ -1428,6 +1455,7 @@ static esp_err_t can_send_frame(can_bus_t bus, twai_message_t *message, TickType
 	if (can_cfg[bus].bus_state != ON_BUS || can_node[bus] == NULL)
 	{
 		xSemaphoreGive(node_lock[bus]);
+		xSemaphoreGive(tx_lock[bus]);
 		xSemaphoreGive(tx_slot_sem[bus]);
 		return ESP_ERR_INVALID_STATE;
 	}
@@ -1436,7 +1464,7 @@ static esp_err_t can_send_frame(can_bus_t bus, twai_message_t *message, TickType
 	// order can diverge from allocation order when a transmit fails, hence
 	// the bitmask instead of a ring index. The pool can still come up empty
 	// if can_tx_slots_reset() refilled the semaphore while we held a permit
-	// waiting on node_lock (bus recreated under us) -- drop, don't assert.
+	// waiting on tx_lock (bus recreated under us) -- drop, don't assert.
 	can_tx_slot_t *slot = NULL;
 	int64_t now = esp_timer_get_time();
 	portENTER_CRITICAL(&tx_slot_mux);
@@ -1456,6 +1484,7 @@ static esp_err_t can_send_frame(can_bus_t bus, twai_message_t *message, TickType
 	if (slot == NULL)
 	{
 		xSemaphoreGive(node_lock[bus]);
+		xSemaphoreGive(tx_lock[bus]);
 		xSemaphoreGive(tx_slot_sem[bus]);	// no-op if reset already refilled it
 		return ESP_ERR_TIMEOUT;
 	}
@@ -1491,14 +1520,18 @@ static esp_err_t can_send_frame(can_bus_t bus, twai_message_t *message, TickType
 	(void)ours;
 #endif
 
+	// The node pointer stays valid because tx_lock is held and
+	// can_disable() takes it before node_lock and before deleting the node.
+	xSemaphoreGive(node_lock[bus]);
+
 	// Timeout 0: the slot semaphore already did the waiting (queue space is
-	// guaranteed), and staying non-blocking keeps the node_lock hold short
+	// guaranteed), and staying non-blocking keeps the driver call short.
 	esp_err_t err = twai_node_transmit(can_node[bus], &slot->frame, 0);
 
 	if (err != ESP_OK)
 	{
-		// Frame never reached the driver: put the slot straight back, before
-		// releasing node_lock so a bus recreate can't reuse it meanwhile
+		// Frame never reached the driver: put the slot straight back while
+		// tx_lock still excludes a bus recreate.
 		portENTER_CRITICAL(&tx_slot_mux);
 		tx_slot_used[bus] &= ~BIT(slot - &tx_slot[bus][0]);
 		portEXIT_CRITICAL(&tx_slot_mux);
@@ -1509,7 +1542,8 @@ static esp_err_t can_send_frame(can_bus_t bus, twai_message_t *message, TickType
 			ESP_LOGE(TAG, "bus %d: transmit failed: %s", bus, esp_err_to_name(err));
 		}
 	}
-	xSemaphoreGive(node_lock[bus]);
+
+	xSemaphoreGive(tx_lock[bus]);
 	return err;
 }
 
@@ -1520,6 +1554,19 @@ bool can_is_enabled(can_bus_t bus)
 		return false;
 	}
 	return can_cfg[bus].bus_state == ON_BUS;
+}
+
+// True when the bus is enabled and the driver's last reported state is
+// active. Forwarding uses this to avoid feeding a bus that is warning,
+// error-passive or bus-off; a failed frame there would only block the RX
+// path and burn TX slots.
+bool can_is_active(can_bus_t bus)
+{
+	if (!can_is_enabled(bus))
+	{
+		return false;
+	}
+	return bus_last_state[bus] == TWAI_ERROR_ACTIVE;
 }
 
 // True if any bus is up--one atomic read instead of a per-bus loop
