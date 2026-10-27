@@ -1315,7 +1315,8 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     ESP_LOGI(TAG, "Receiving file : %s...", filename);
 
     /* Retrieve the pointer to scratch buffer for temporary storage */
-    char *buf = ((struct file_server_data *)req->user_ctx)->scratch;
+    char *scratch = ((struct file_server_data *)req->user_ctx)->scratch;
+    char *buf = scratch;
     int received = 0;
 
     /* Content length of the request gives
@@ -1361,7 +1362,10 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     while (remaining > 0)
     {
 //        ESP_LOGI(TAG, "Remaining size : %d", remaining);
-        /* Receive the file part by part into a buffer */
+        /* Receive the file part by part into a buffer, always at the start of
+         * scratch: the first part's header parse advances buf past the header,
+         * and receiving there would overrun scratch. */
+        buf = scratch;
         if ((received = httpd_req_recv(req, buf, MIN(remaining, SCRATCH_BUFSIZE))) <= 0)
         {
             if (received == HTTPD_SOCK_ERR_TIMEOUT)
@@ -1402,7 +1406,7 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
         }
         total_size += received;
         /* Write buffer content to file on storage */
-        if (received && (ESP_OK != esp_ota_write( update_handle, (const void *)buf, received)))
+        if (received > 0 && (ESP_OK != esp_ota_write( update_handle, (const void *)buf, received)))
         {
             ESP_LOGE(TAG, "File write failed!");
             esp_ota_abort(update_handle);
@@ -1424,7 +1428,7 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     /* Close file upon upload completion */
     ESP_LOGI(TAG, "File reception complete: %lu", total_size);
 
-    if ((received = httpd_req_recv(req, buf, SCRATCH_BUFSIZE)) <= 0)
+    if ((received = httpd_req_recv(req, scratch, SCRATCH_BUFSIZE)) <= 0)
     {
         ESP_LOGE(TAG, "File reception failed!");
         esp_ota_abort(update_handle);
@@ -1503,7 +1507,8 @@ static esp_err_t upload_car_data_handler(httpd_req_t *req)
     ESP_LOGI(TAG, "Receiving file : %s...", filename);
 
     /* Retrieve the pointer to scratch buffer for temporary storage */
-    char *buf = ((struct file_server_data *)req->user_ctx)->scratch;
+    char *scratch = ((struct file_server_data *)req->user_ctx)->scratch;
+    char *buf = scratch;
     int received = 0;
 
     /* Content length of the request gives
@@ -1526,7 +1531,10 @@ static esp_err_t upload_car_data_handler(httpd_req_t *req)
     while (remaining > 0)
     {
 //        ESP_LOGI(TAG, "Remaining size : %d", remaining);
-        /* Receive the file part by part into a buffer */
+        /* Receive the file part by part into a buffer, always at the start of
+         * scratch: the first part's header parse advances buf past the header,
+         * and receiving there would overrun scratch. */
+        buf = scratch;
         if ((received = httpd_req_recv(req, buf, MIN(remaining, SCRATCH_BUFSIZE))) <= 0)
         {
             if (received == HTTPD_SOCK_ERR_TIMEOUT)
