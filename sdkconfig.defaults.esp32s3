@@ -19,3 +19,8 @@ CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST=y
 # and preempts the mcp2515_intr task, stalling the bus-1 TX restart path.
 # Core 1 is the CAN datapath core.
 CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
+
+# Keep bus 0's interrupt running while flash writes turn the cache off. Its
+# FIFO holds about five frames (1.2 ms at 500 kbit/s); a 4 KB flash write
+# takes ~6 ms. main/can.c refuses to build without this.
+CONFIG_TWAI_ISR_CACHE_SAFE=y
