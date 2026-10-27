@@ -46,6 +46,13 @@ In `zephyr/drivers/can/can_mcp251xfd.{c,h}`, each marked `LOCAL PATCH`:
    before resetting the controller, which may still be asserting INT after an
    MCU restart; the interrupt thread then accesses the controller alongside
    initialization, which doesn't take the driver's mutex.
+7. **RX FIFO overflows counted.** Upstream enables and handles the RX FIFO's
+   `RXOVIF` only with `CONFIG_CAN_STATS`, which isn't set here, so frames
+   dropped by a full FIFO went unnoticed. The RX read now checks `RXOVIF` in
+   the `FIFOSTA` it already reads, clears it and counts it for
+   `twai_mcp251xfd_get_rx_overflow_count()`. It needs no interrupt of its
+   own: a full FIFO keeps `RXIF` set. If `CONFIG_CAN_STATS` is ever enabled,
+   upstream's handler clears the flag too and the two counts can disagree.
 
 [errata]: https://ww1.microchip.com/downloads/aemDocuments/documents/APID/ProductDocuments/Errata/MCP2518FD-Silicon-Errata-and-Data-Sheet-Clarification-DS80000789.pdf
 
