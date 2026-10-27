@@ -338,6 +338,10 @@ static void tcp_server_task(void *pvParameters)
 			setsockopt(new_sock, IPPROTO_TCP, TCP_KEEPIDLE, &keepIdle, sizeof(int));
 			setsockopt(new_sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepInterval, sizeof(int));
 			setsockopt(new_sock, IPPROTO_TCP, TCP_KEEPCNT, &keepCount, sizeof(int));
+			// GVRET is a stream of small low-latency frames; Nagle would
+			// hold the final short segment of a burst until the peer ACKs.
+			int nodelay = 1;
+			setsockopt(new_sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 			// Bound how many GVRET commands can queue on-device, so keepalive replies stay
 			// within SavvyCAN's ~10 s watchdog even when a CAN bus is saturated.
 			// Once this fills, TCP flow control makes further data wait in the
