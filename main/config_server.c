@@ -1004,6 +1004,9 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	cJSON_AddStringToObject(root, "can1_mode", device_config.can1_mode);
 	cJSON_AddStringToObject(root, "can1_en", device_config.can1_en);
 	cJSON_AddStringToObject(root, "can_fwd_mode", device_config.can_fwd_mode);
+	// What forwarding is doing now: MITM turns itself off on a shared wire
+	cJSON_AddStringToObject(root, "can_fwd_state", !config_server_get_fwd_en() ? "parallel"
+							: can_bridge_shared_wire() ? "off_shared_wire" : "mitm");
 #endif
 	cJSON_AddStringToObject(root, "port_type", device_config.port_type);
 	cJSON_AddStringToObject(root, "port", device_config.port);
