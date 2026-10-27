@@ -19,6 +19,8 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(can_mcp251xfd, CONFIG_CAN_LOG_LEVEL);
 
+static inline int mcp251xfd_init_int_reg(const struct device *dev);
+
 static void mcp251xfd_canframe_to_txobj(const struct can_frame *src, int mailbox_idx,
 					struct mcp251xfd_txobj *dst)
 {
@@ -1038,6 +1040,26 @@ static void mcp251xfd_handle_interrupts(const struct device *dev)
 		bool progress = false;
 
 		k_mutex_lock(&dev_data->mutex, K_FOREVER);
+		// LOCAL PATCH: controller_sleep() marks the device suspended while
+		// holding this mutex before entering Low Power Mode. A GPIO edge that
+		// was already queued can still run this handler; checking here keeps
+		// the read out of the sleeping controller.
+		if (dev_data->int_suspended) {
+			k_mutex_unlock(&dev_data->mutex);
+			break;
+		}
+		if (!dev_data->common.started) {
+			// LOCAL PATCH: clear the flags and disable the interrupt enables
+			// without dispatching anything. A stopped controller can still
+			// assert INT (entering Configuration mode sets MODIF); re-enabling
+			// the level interrupt with that flag set would retrigger forever.
+			// mcp251xfd_start() restores the enables.
+			uint32_t *reg = mcp251xfd_get_spi_buf_ptr(dev);
+			*reg = 0;
+			(void)mcp251xfd_write(dev, MCP251XFD_REG_INT, MCP251XFD_REG_SIZE);
+			k_mutex_unlock(&dev_data->mutex);
+			break;
+		}
 		reg_int_hw = mcp251xfd_read_crc(dev, MCP251XFD_REG_INT, sizeof(*reg_int_hw));
 
 		if (!reg_int_hw) {
@@ -1066,6 +1088,18 @@ static void mcp251xfd_handle_interrupts(const struct device *dev)
 		}
 
 		k_mutex_unlock(&dev_data->mutex);
+
+		// A stop can happen while this loop is draining a burst. Do not
+		// dispatch handlers against a stopped controller; disable its
+		// interrupt enables and let the next start restore them.
+		if (!dev_data->common.started) {
+			k_mutex_lock(&dev_data->mutex, K_FOREVER);
+			uint32_t *reg = mcp251xfd_get_spi_buf_ptr(dev);
+			*reg = 0;
+			(void)mcp251xfd_write(dev, MCP251XFD_REG_INT, MCP251XFD_REG_SIZE);
+			k_mutex_unlock(&dev_data->mutex);
+			break;
+		}
 
 		if ((reg_int & MCP251XFD_REG_INT_RXIF) != 0) {
 			ret = mcp251xfd_handle_fifo_read(dev, &dev_cfg->rx_fifo,
@@ -1166,12 +1200,19 @@ static void mcp251xfd_int_thread(const struct device *dev)
 		k_sem_take(&dev_data->int_sem, K_FOREVER);
 		mcp251xfd_handle_interrupts(dev);
 
-		/* Re-enable pin interrupts */
-		ret = gpio_pin_interrupt_configure_dt(&dev_cfg->int_gpio_dt, GPIO_INT_LEVEL_ACTIVE);
-		if (ret < 0) {
-			LOG_ERR("Couldn't enable pin interrupt [%d]", ret);
-			k_oops();
+		/* Re-enable pin interrupts unless the adapter is putting the
+		 * controller to sleep. Holding the driver mutex makes this
+		 * check+enable atomic with controller_sleep()'s set+disable. */
+		k_mutex_lock(&dev_data->mutex, K_FOREVER);
+		if (!dev_data->int_suspended) {
+			ret = gpio_pin_interrupt_configure_dt(&dev_cfg->int_gpio_dt,
+							     GPIO_INT_LEVEL_ACTIVE);
+			if (ret < 0) {
+				LOG_ERR("Couldn't enable pin interrupt [%d]", ret);
+				k_oops();
+			}
 		}
+		k_mutex_unlock(&dev_data->mutex);
 	}
 }
 
@@ -1231,6 +1272,18 @@ static int mcp251xfd_start(const struct device *dev)
 	k_mutex_lock(&dev_data->mutex, K_FOREVER);
 
 	CAN_STATS_RESET(dev);
+
+	// A stopped controller disables its interrupt enables so a pending INT
+	// cannot livelock the thread. Restore them before going back on bus.
+	ret = mcp251xfd_init_int_reg(dev);
+	if (ret < 0) {
+		LOG_ERR("Failed to enable interrupts [%d]", ret);
+		k_mutex_unlock(&dev_data->mutex);
+		if (dev_cfg->common.phy != NULL) {
+			(void)can_transceiver_disable(dev_cfg->common.phy);
+		}
+		return ret;
+	}
 
 	ret = mcp251xfd_set_mode_internal(dev, dev_data->next_mcp251xfd_mode);
 	if (ret < 0) {

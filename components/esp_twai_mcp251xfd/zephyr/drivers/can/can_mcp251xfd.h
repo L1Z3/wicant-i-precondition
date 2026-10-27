@@ -513,6 +513,12 @@ struct mcp251xfd_data {
 	uint8_t current_mcp251xfd_mode;
 	int tdco;
 
+	/* LOCAL PATCH: set before the adapter puts the controller into Low
+	 * Power Mode. The INT thread must not re-enable the GPIO pin after
+	 * this point, or a sleep entry races with a stale interrupt and reads
+	 * the INT register from a sleeping controller. */
+	bool int_suspended;
+
 	struct mcp251xfd_spi_data spi_data;
 
 };

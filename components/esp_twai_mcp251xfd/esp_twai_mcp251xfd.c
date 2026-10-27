@@ -141,8 +141,38 @@ static esp_err_t node_enable(twai_node_handle_t handle)
 {
 	mcp251xfd_node_t *node = node_of(handle);
 
+	// Keep the handler out of the controller while can_start() changes modes.
+	// A disable-without-delete leaves the pin enabled, and that mode change
+	// must not be handled as a stopped-controller interrupt.
+	k_mutex_lock(&node->data.mutex, K_FOREVER);
+	node->data.int_suspended = true;
+	esp_err_t err = esp_err_from(
+		gpio_pin_interrupt_configure_dt(&node->config.int_gpio_dt, GPIO_INT_DISABLE));
+	k_mutex_unlock(&node->data.mutex);
+	if (err != ESP_OK) {
+		return err;
+	}
+
 	node->state = TWAI_ERROR_ACTIVE;
-	return esp_err_from(can_start(&node->dev));
+	err = esp_err_from(can_start(&node->dev));
+	if (err != ESP_OK) {
+		return err;
+	}
+
+	// Enable INT only after the controller has started, so any mode-change
+	// flags are serviced against a running node rather than a suspended one.
+	k_mutex_lock(&node->data.mutex, K_FOREVER);
+	node->data.int_suspended = false;
+	esp_err_t irq_err = esp_err_from(
+		gpio_pin_interrupt_configure_dt(&node->config.int_gpio_dt, GPIO_INT_LEVEL_ACTIVE));
+	if (irq_err != ESP_OK) {
+		// Keep the thread off the controller so a failed enable/deletion can
+		// still take the node down without waiting for an interrupt.
+		node->data.int_suspended = true;
+	}
+	k_mutex_unlock(&node->data.mutex);
+
+	return irq_err;
 }
 
 // Aborts queued frames, reporting each through on_tx_done before returning.
@@ -250,12 +280,29 @@ static int controller_sleep(mcp251xfd_node_t *node)
 	// it has re-enabled INT's interrupt: it has then finished, and with INT
 	// released it won't be woken again. If it doesn't, leave the controller
 	// awake rather than have the thread wake it.
-	for (int i = 0; i < IDLE_POLLS && !gpio_pin_interrupt_enabled_dt(&node->config.int_gpio_dt);
-	     i++) {
-		k_sleep(K_MSEC(1));
+	//
+	// A node that has never started is already marked suspended, so there is
+	// no thread to wait for; the INT write above has cleared any pending flags.
+	// Otherwise wait for the thread to finish the stop's mode-change interrupt.
+	if (!node->data.int_suspended) {
+		for (int i = 0; i < IDLE_POLLS &&
+				!gpio_pin_interrupt_enabled_dt(&node->config.int_gpio_dt); i++) {
+			k_sleep(K_MSEC(1));
+		}
+		if (ret == 0 && !gpio_pin_interrupt_enabled_dt(&node->config.int_gpio_dt)) {
+			ret = -EBUSY;
+		}
 	}
-	if (ret == 0 && !gpio_pin_interrupt_enabled_dt(&node->config.int_gpio_dt)) {
-		ret = -EBUSY;
+
+	if (ret == 0) {
+		// The thread has finished. Mark it suspended while holding the same
+		// mutex the thread uses before re-enabling the pin, then disable the
+		// pin: a queued edge can no longer read INT from the sleeping part.
+		k_mutex_lock(&node->data.mutex, K_FOREVER);
+		node->data.int_suspended = true;
+		gpio_pin_interrupt_configure_dt(&node->config.int_gpio_dt,
+						GPIO_INT_DISABLE);
+		k_mutex_unlock(&node->data.mutex);
 	}
 
 	k_mutex_lock(&node->data.mutex, K_FOREVER);
@@ -478,6 +525,9 @@ static esp_err_t create(spi_host_device_t host, const twai_mcp251xfd_node_config
 		.register_cbs = register_cbs,
 	};
 	node->filters[0] = node->filters[1] = NO_FILTER;
+	// mcp251xfd_init() ends by enabling INT's interrupt, before the controller
+	// is started. Keep the handler off the controller until node_enable().
+	node->data.int_suspended = true;
 
 	// A restart leaves the controller as it was, and WiCAN's sleep ends in
 	// one: wake it from Low Power Mode for initialization.
@@ -516,11 +566,13 @@ esp_err_t twai_new_node_mcp251xfd(spi_host_device_t host, const twai_mcp251xfd_n
 	}
 	ESP_RETURN_ON_FALSE(!s_node->in_use, ESP_ERR_INVALID_STATE, TAG, "node already in use");
 	ESP_RETURN_ON_ERROR(s_node->init_error, TAG, "controller unavailable until restart");
-	// Enabled only here, not by controller_reset(): controller_sleep() takes an
-	// enabled interrupt to mean that the driver's thread is idle.
 	int ret = controller_reset(s_node);
 	if (ret == 0) {
-		ret = gpio_pin_interrupt_configure_dt(&s_node->config.int_gpio_dt, GPIO_INT_LEVEL_ACTIVE);
+		// Keep INT disabled until node_enable() has started the controller.
+		// controller_sleep() leaves both the pin and this flag latched; set
+		// the flag so node_enable() knows the pin must be re-enabled.
+		s_node->data.int_suspended = true;
+		ret = gpio_pin_interrupt_configure_dt(&s_node->config.int_gpio_dt, GPIO_INT_DISABLE);
 	}
 	ESP_RETURN_ON_FALSE(ret >= 0, esp_err_from(ret), TAG, "controller reset failed: %d", ret);
 	ESP_RETURN_ON_ERROR(configure(s_node, config), TAG, "configure failed");
