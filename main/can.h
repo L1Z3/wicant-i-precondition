@@ -25,7 +25,10 @@
 #include "hw_config.h"
 
 typedef enum {
-	CAN_BUS_0 = 0,   // on-chip TWAI controller (OBD-II pins 6/14)
+	// OBD-II pins, on the WiCAN's own plug: bus 0 is 6 (H)/14 (L). On eb-fd,
+	// bus 1 is 12 (H)/13 (L). The harness socket's numbering is mirrored; see
+	// README.md.
+	CAN_BUS_0 = 0,   // on-chip TWAI controller
 	CAN_BUS_1 = 1,   // SPI CAN: MCP2515 on proto, MCP2518FD on eb-fd
 } can_bus_t;
 
