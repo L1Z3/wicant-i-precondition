@@ -276,11 +276,16 @@ static int controller_sleep(mcp251xfd_node_t *node)
 }
 
 // Releases the node for the next twai_new_node_mcp251xfd(), which resets the
-// controller, and puts the controller to sleep until then.
+// controller, and puts the controller to sleep until then. No callback runs
+// once it returns: the driver delivers them all under its mutex.
 static esp_err_t node_delete(twai_node_handle_t handle)
 {
 	mcp251xfd_node_t *node = node_of(handle);
 
+	// Held until the callbacks are gone, so the driver's thread can't act on
+	// a controller still started meanwhile (switch it back to Normal mode,
+	// report a state).
+	k_mutex_lock(&node->data.mutex, K_FOREVER);
 	// can_stop() failed partway (an SPI failure or a mode-change timeout) and
 	// left the driver started, possibly with the controller still on the bus.
 	// Reset it so it can go to sleep, and release the node anyway.
@@ -294,6 +299,7 @@ static esp_err_t node_delete(twai_node_handle_t handle)
 		node->data.common.started = false;
 	}
 	node->callbacks = (twai_event_callbacks_t){};
+	k_mutex_unlock(&node->data.mutex);
 	node->in_use = false;
 	int ret = controller_sleep(node);
 	if (ret < 0) {
@@ -327,8 +333,10 @@ static esp_err_t register_cbs(twai_node_handle_t handle, const twai_event_callba
 	if (node->data.common.started) {
 		return ESP_ERR_INVALID_STATE;
 	}
+	k_mutex_lock(&node->data.mutex, K_FOREVER);
 	node->callbacks = *cbs;
 	node->user_data = user_data;
+	k_mutex_unlock(&node->data.mutex);
 	return ESP_OK;
 }
 
