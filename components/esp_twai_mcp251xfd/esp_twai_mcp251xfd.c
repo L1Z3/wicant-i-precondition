@@ -522,3 +522,8 @@ esp_err_t twai_new_node_mcp251xfd(spi_host_device_t host, const twai_mcp251xfd_n
 	*node_ret = &s_node->base;
 	return ESP_OK;
 }
+
+uint32_t twai_mcp251xfd_get_rx_overflow_count(void)
+{
+	return s_node ? s_node->data.rx_overflows : 0;
+}
