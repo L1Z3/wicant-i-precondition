@@ -1200,13 +1200,3 @@ bool can_any_enabled(void)
 	}
 	return (xEventGroupGetBits(s_can_event_group) & CAN_ENABLE_BIT_ANY) != 0;
 }
-
-// Drops pending frames from ALL buses (the queue is shared); fine for its
-// one caller (elm327 clearing stale frames before a request on bus 0)
-void can_flush_rx(void)
-{
-	if (can_rx_queue != NULL)
-	{
-		xQueueReset(can_rx_queue);
-	}
-}
