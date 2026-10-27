@@ -38,6 +38,7 @@
 #include "config_server.h"
 #include "gvret.h"
 #include "comm_server.h"
+#include "wifi_network.h"
 
 #define TAG 		__func__
 
@@ -707,6 +708,14 @@ static void gvret_broadcast_task(void *pvParameters)
 	while(1)
 	{
 		vTaskDelay(pdMS_TO_TICKS(1000));
+
+		// Stay quiet while Wi-Fi is down (light sleep, BLE takeover, etc.):
+		// the socket has no route and sendto() returns ENOTCONN every second.
+		if(!wifi_network_is_initialized())
+		{
+			continue;
+		}
+
 		if(!tcp_port_open())
 		{
 			int err = sendto(sock, buff, 4, 0, (struct sockaddr *)&broadcastAddr, sizeof(broadcastAddr));

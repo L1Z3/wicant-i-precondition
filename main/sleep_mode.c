@@ -349,6 +349,9 @@ static void adc_task(void *pvParameters)
     static int64_t pub_time = 0;
     static float alert_voltage = 0;
     static uint64_t alert_time;
+    // Wi-Fi/BLE/CAN are torn down once per sleep entry, not on every 2 s
+    // timer wake. The flag survives transitions into and out of WAKEUP_STATE.
+    static bool sleep_teardown_done = false;
 	uint64_t sleep_time = 0;
     alert_time = config_server_get_alert_time();
     alert_time *= (3600000000);
@@ -466,6 +469,7 @@ static void adc_task(void *pvParameters)
 					}
 					else if((esp_timer_get_time() - sleep_detect_time) > sleep_time)
 					{
+						sleep_teardown_done = false;
 						sleep_state = SLEEP_STATE;
 					}
 
@@ -523,8 +527,12 @@ static void adc_task(void *pvParameters)
 									}
 									esp_mqtt_client_disconnect(client);
 									vTaskDelay(1000 / portTICK_PERIOD_MS);
-									wifi_network_deinit();
 								}
+								// The alert brought Wi-Fi back up after the
+								// sleep teardown, whether or not the connection
+								// succeeded. Take it down again here; the
+								// once-per-sleep teardown guard will not.
+								wifi_network_deinit();
 							}
 						}
 					}
@@ -556,15 +564,23 @@ static void adc_task(void *pvParameters)
 	//    	ESP_LOGI(TAG, "value: %u",adc_val);
 			if(sleep_state == SLEEP_STATE)
 			{
-				ESP_LOGW(TAG, "sleeping");
+				// The 2 s timer wake re-enters this block; the teardown below
+				// must happen only on the first pass, or Wi-Fi and BLE are
+				// re-deinitialized every 2 s for the whole time the car is
+				// parked.
+				if(!sleep_teardown_done)
+				{
+					sleep_teardown_done = true;
+					ESP_LOGW(TAG, "sleeping");
                                 // todo (trh): add config option to leave
                                 // can busses up in sleep.
-				for(int bus = 0; bus < CAN_BUS_COUNT; bus++)
-				{
-					can_disable(bus);
+					for(int bus = 0; bus < CAN_BUS_COUNT; bus++)
+					{
+						can_disable(bus);
+					}
+					wifi_network_deinit();
+					ble_disable();
 				}
-				wifi_network_deinit();
-				ble_disable();
 				esp_sleep_enable_timer_wakeup(2*1000000);
 				esp_light_sleep_start();;
 			}
