@@ -90,8 +90,40 @@ uint8_t checksumCalc(uint8_t *buffer, int length)
     return valu;
 }
 
+// Read back how a bus really is, for the bus parameters we report. A bus
+// MITM forwarding holds is reported on even in a recovery's 250 ms gap, or
+// while can.c retries a bus that failed to come up: that's the state being
+// enforced, and SavvyCAN's flag is a setting, not a health check.
+static void gvret_read_bus(can_bus_t bus)
+{
+	bool on = can_bridge_locked() || can_is_enabled(bus);
+	bool silent = can_is_silent(bus) != 0;
+	uint32_t rate = can_speed[can_get_bitrate(bus)];
+
+	if(bus == CAN_BUS_0)
+	{
+		settings.CAN0_Enabled = on;
+		settings.CAN0ListenOnly = silent;
+		settings.CAN0Speed = rate;
+	}
+	else
+	{
+		settings.CAN1_Enabled = on;
+		settings.CAN1ListenOnly = silent;
+		settings.CAN1Speed = rate;
+	}
+}
+
 static void gvret_setup_bus(can_bus_t bus, uint32_t speed, bool enabled, bool listen_only)
 {
+	// MITM forwarding owns the buses: leave them, and report back how they
+	// really are rather than what was asked for
+	if(can_bridge_locked())
+	{
+		gvret_read_bus(bus);
+		return;
+	}
+
 	can_disable(bus);
 	ESP_LOGI(__func__, "bus %u speed: %lu", bus, speed);
 	for(uint8_t i = 0; i < sizeof(can_speed)/sizeof(uint32_t); i++)
@@ -220,6 +252,14 @@ void gvret_parse(uint8_t *buf, uint8_t len, twai_message_t *frame, QueueHandle_t
 				break;
 			case PROTO_GET_CANBUS_PARAMS:
 //				ESP_LOG_BUFFER_HEXDUMP(__func__, buf, len, ESP_LOG_INFO);
+				// Read the buses again rather than echo the last setup: a
+				// bus comes up after gvret_init(), a setup speed may not be
+				// in can_speed, an enable can fail, and MITM forwarding
+				// refuses setups
+				gvret_read_bus(CAN_BUS_0);
+#if CAN_BUS_COUNT > 1
+				gvret_read_bus(CAN_BUS_1);
+#endif
 				//immediately return data on canbus params
 				transmitBuffer[transmitBufferLength++] = 0xF1;
 				transmitBuffer[transmitBufferLength++] = 6;
