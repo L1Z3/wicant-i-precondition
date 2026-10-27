@@ -507,6 +507,10 @@ struct mcp251xfd_data {
 	can_rx_callback_t rx_cb[CONFIG_CAN_MCP251XFD_MAX_FILTERS];
 	void *cb_arg[CONFIG_CAN_MCP251XFD_MAX_FILTERS];
 
+	// LOCAL PATCH: RX FIFO overflows seen since boot, counted without
+	// CONFIG_CAN_STATS. Events, not frames: a lower bound on frames lost.
+	uint32_t rx_overflows;
+
 	const struct device *dev;
 
 	uint8_t next_mcp251xfd_mode;
