@@ -141,8 +141,8 @@ static int64_t tx_drop_log_us[CAN_BUS_COUNT];
 static volatile bool bus_err_passive[CAN_BUS_COUNT];
 // The driver's last reported state per bus, set in can_on_state_change() and
 // reset to active in can_enable() (a fresh node starts active). Forwarding
-// gates on this via can_is_active() so a warning/error-passive target bus is
-// not fed frames that would only block the RX path and burn TX slots.
+// gates on this via can_is_forwardable() to avoid feeding a bus-off bus, while
+// still letting warning/error-passive buses transmit their way back to active.
 static volatile twai_error_state_t bus_last_state[CAN_BUS_COUNT];
 // Recovery only helps a bus whose peers are there but starved. With no peer
 // at all (a head unit asleep while forwarding continues), every recovery
@@ -701,8 +701,8 @@ void can_enable(can_bus_t bus)
 	{
 		can_tx_slots_reset(bus);	// fresh node: all slots are free
 		// The new node starts in the active state; do not inherit a stale
-		// warning/error-passive flag from the previous node (recovery), or
-		// can_is_active() would gate forwarding forever.
+		// error state from the previous node (recovery), or forwarding could
+		// stay gated.
 		bus_last_state[bus] = TWAI_ERROR_ACTIVE;
 		can_transceiver_standby(bus, false);
 		err = twai_node_enable(can_node[bus]);
@@ -1083,17 +1083,26 @@ bool can_is_enabled(can_bus_t bus)
 	return can_cfg[bus].bus_state == ON_BUS;
 }
 
-// True when the bus is enabled and the driver's last reported state is
-// active. Forwarding uses this to avoid feeding a bus that is warning,
-// error-passive or bus-off; a failed frame there would only block the RX
-// path and burn TX slots.
-bool can_is_active(can_bus_t bus)
+// True when the bus is enabled and not bus-off. A warning or error-passive
+// controller can still transmit, and must be allowed to: a successful TX is
+// what lowers TEC and returns it to active. Gating all forwarding on
+// TWAI_ERROR_ACTIVE could latch the bridge off after a transient error, when
+// the final queued frame completed without bringing TEC all the way down.
+bool can_is_forwardable(can_bus_t bus)
 {
 	if (!can_is_enabled(bus))
 	{
 		return false;
 	}
-	return bus_last_state[bus] == TWAI_ERROR_ACTIVE;
+	switch (bus_last_state[bus])
+	{
+	case TWAI_ERROR_ACTIVE:
+	case TWAI_ERROR_WARNING:
+	case TWAI_ERROR_PASSIVE:
+		return true;
+	default:
+		return false;
+	}
 }
 
 // True if any bus is up--one atomic read instead of a per-bus loop

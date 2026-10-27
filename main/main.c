@@ -286,6 +286,61 @@ static void precondition_task_start(void)
 	ESP_ERROR_CHECK(esp_timer_start_once(precondition_timer, PRECONDITION_TICK_PERIOD_US));
 }
 
+// ---------------------------------------------------------------------------
+// Forward queue.
+//
+// The RX task feeds this queue and a separate task performs the actual
+// can_send(). A dead or slow target bus (MCP2518FD error-passive at startup,
+// 14 ms SPI transfers) must not block the RX task: dropping a forwarded frame
+// is preferable to dropping bus-0 traffic and the GVRET stream.
+// ---------------------------------------------------------------------------
+#define CAN_FWD_QUEUE_LEN 256
+typedef struct {
+	twai_message_t message;
+	can_bus_t bus;
+} can_fwd_item_t;
+
+static QueueHandle_t can_fwd_queue = NULL;
+static uint32_t can_fwd_dropped = 0;
+static int64_t can_fwd_drop_log_us = 0;
+
+// Dropping a forwarded frame is expected when the target bus is down or the
+// queue is full; log the total at most once a second so a saturated bus does
+// not turn the drop path into a log flood.
+static void can_fwd_count_drop(const char *why)
+{
+	can_fwd_dropped++;
+	int64_t now = esp_timer_get_time();
+	if (now - can_fwd_drop_log_us > 1000000)
+	{
+		can_fwd_drop_log_us = now;
+		ESP_LOGW(TAG, "precondition fwd: %lu frames dropped (%s)",
+				 (unsigned long)can_fwd_dropped, why);
+	}
+}
+
+static void can_fwd_task(void *pvParameters)
+{
+	(void)pvParameters;
+	can_fwd_item_t item;
+	while (1)
+	{
+		if (xQueueReceive(can_fwd_queue, &item, portMAX_DELAY) != pdTRUE)
+		{
+			continue;
+		}
+		if (!can_is_forwardable(item.bus))
+		{
+			can_fwd_count_drop("target bus not forwardable");
+			continue;
+		}
+		if (can_send(item.bus, &item.message, pdMS_TO_TICKS(2)) != ESP_OK)
+		{
+			can_fwd_count_drop("send failed");
+		}
+	}
+}
+
 static void can_rx_task(void *pvParameters)
 {
 //	static uint32_t num_msg = 0;
@@ -352,23 +407,14 @@ static void can_rx_task(void *pvParameters)
                 can_bus_t fwd_bus;
                 fwd_result_t fwd_result;
                 bool fwd_wanted;
-                TickType_t fwd_wait;
-                static int64_t fwd_fastdrop_until_us[CAN_BUS_COUNT];
                 if (fwd_bridge_en)
                 {
-                    // MITM bridge: forward all traffic to the other bus, with
-					// adaptive backpressure. This task gets preempted, then
-					// drains the RX queue in a batch that can momentarily overrun
-					// the 32-slot TX pool even though a slot frees every ~250us;
-					// waiting a couple ticks absorbs the batch instead of dropping
-					// it. But if the wait itself times out, the bus is saturated
-					// or wedged: fall back to fast-drop for 100ms so a dead bus 1
-					// can't throttle RX servicing (and bus-0 GVRET streaming).
+                    // MITM bridge: forward all traffic to the other bus. The
+                    // send is queued, never performed here, so a dead bus 1
+                    // cannot throttle RX servicing or bus-0 GVRET streaming.
                     fwd_bus = (rx_bus == CAN_BUS_0) ? CAN_BUS_1 : CAN_BUS_0;
                     fwd_result = precondition_fwd_hook(&fwd_msg, fwd_bus);
                     fwd_wanted = (fwd_result != FWD_BLOCK);
-                    fwd_wait =
-                        (esp_timer_get_time() < fwd_fastdrop_until_us[fwd_bus]) ? 0 : 2;
                 }
                 else
                 {
@@ -379,19 +425,24 @@ static void can_rx_task(void *pvParameters)
                     fwd_bus = rx_bus;
                     fwd_result = precondition_fwd_hook(&fwd_msg, fwd_bus);
                     fwd_wanted = (fwd_result == FWD_MODIFIED);
-                    fwd_wait = 1;
                 }
-                if (fwd_wanted && can_send(fwd_bus, &fwd_msg, fwd_wait) != ESP_OK)
+                if (fwd_wanted)
                 {
-                    if (fwd_bridge_en && fwd_wait != 0)
+                    if (!can_is_forwardable(fwd_bus))
                     {
-                        fwd_fastdrop_until_us[fwd_bus] = esp_timer_get_time() + 100000;
+                        can_fwd_count_drop("target bus not forwardable");
                     }
-                    static uint32_t fwd_drop_cnt = 0;
-                    if ((++fwd_drop_cnt % 256U) == 1U)
+                    else
                     {
-                        ESP_LOGW(TAG, "precondition fwd: %lu frames dropped",
-                                 (unsigned long)fwd_drop_cnt);
+                        can_fwd_item_t fwd_item = {
+                            .message = fwd_msg,
+                            .bus = fwd_bus,
+                        };
+                        if (can_fwd_queue == NULL ||
+                            xQueueSend(can_fwd_queue, &fwd_item, 0) != pdTRUE)
+                        {
+                            can_fwd_count_drop("forward queue full");
+                        }
                     }
                 }
             }
@@ -552,6 +603,25 @@ void app_main(void)
 
 	int8_t can_datarate = config_server_get_can_rate();
 	can_init();
+
+	// Start the consumers before the first can_enable() below. The
+	// 256-entry RX queue filled during boot in the can_re log (255 bus-0
+	// and 38 bus-1 frames dropped) because can_rx_task was created after
+	// the transports and Wi-Fi started.
+	can_fwd_queue = xQueueCreate(CAN_FWD_QUEUE_LEN, sizeof(can_fwd_item_t));
+	if (can_fwd_queue != NULL)
+	{
+		xTaskCreate(can_fwd_task, "can_fwd_task", 1024*3, NULL, 6, NULL);
+	}
+	else
+	{
+		ESP_LOGE(TAG, "can_fwd_queue create failed; forwarding disabled");
+	}
+
+	// Prio 7: the CAN datapath must preempt the TCP streaming tasks (prio 5)
+	// instead of timeslicing with them. Safe only because can_rx_task blocks
+	// in can_receive() when idle (see the receive loop).
+	xTaskCreate(can_rx_task, "can_rx_task", 1024*3, (void*)AF_INET, 7, NULL);
 
 	if(can_datarate != -1)
 	{
@@ -720,10 +790,6 @@ void app_main(void)
     }
 	wc_mdns_init((char*)uid, hardware_version, firmware_version);
 	precondition_task_start();
-    // Prio 7: the CAN datapath must preempt the TCP streaming tasks (prio 5)
-    // instead of timeslicing with them. Safe only because can_rx_task blocks
-    // in can_receive() when idle (see the receive loop).
-    xTaskCreate(can_rx_task, "can_rx_task", 1024*3, (void*)AF_INET, 7, NULL);
     xTaskCreate(can_tx_task, "can_tx_task", 1024*3, (void*)AF_INET, 5, NULL);
 
     // sleep_config: 1 = low-voltage sleep, 2 = car-off sleep. Both run the
