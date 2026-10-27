@@ -897,8 +897,8 @@ void can_enable(can_bus_t bus)
 	xSemaphoreGive(node_lock[bus]);
 }
 
-// Tear a bus down: stops the interrupt sources (no callbacks after this), then
-// delete frees the node.
+// Tear a bus down: stops the interrupt sources, then delete frees the node (no
+// callbacks after this).
 static void can_disable_node(can_bus_t bus)
 {
 	if (bus >= CAN_BUS_COUNT || s_can_event_group == NULL)
