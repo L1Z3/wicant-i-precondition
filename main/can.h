@@ -66,6 +66,16 @@ void can_lock_bridge(void);
 void can_park(void);
 // So clients can tell a refused change from one that took
 bool can_bridge_locked(void);
+// MITM forwarding: whether to bridge a received frame to the other bus. False
+// for a frame seen on both buses, which share a wire then, or for one of our
+// own frames coming back; such a frame gets parallel-mode handling. Call
+// only from the task that forwards, with the frame can_receive() returned last.
+bool can_bridge_check(const twai_message_t *msg, can_bus_t rx_bus);
+// Set for good, until restart, once bus 0 and bus 1 turn out to share a wire
+bool can_bridge_shared_wire(void);
+// can_send() for frames the bridge forwards; can_bridge_check() treats only
+// can_send()'s frames as our own
+esp_err_t can_bridge_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_wait);
 void can_set_silent(can_bus_t bus, uint8_t flag);
 void can_set_loopback(can_bus_t bus, uint8_t flag);
 void can_set_auto_retransmit(can_bus_t bus, uint8_t flag);
