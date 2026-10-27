@@ -560,6 +560,13 @@
                         <div id="car_on_sense_voltage">N/A&nbsp;</div>
                     </td>
                 </tr>
+                <!-- Only shown on hardware with more than one bus -->
+                <tr id="can_fwd_state_row" style="display:none">
+                    <td>CAN Forwarding:</td>
+                    <td>
+                        <div id="can_fwd_state">Unknown&nbsp;</div>
+                    </td>
+                </tr>
                 <tr id="can_ready_state_row">
                     <td>Car Power Status (CAN):</td>
                     <td>
@@ -2630,6 +2637,15 @@ function loadAutoTable(jsonData) {
 				}
 				if (obj.can_fwd_mode) {
 					document.getElementById("can_fwd_mode").value = obj.can_fwd_mode;
+				}
+				if (obj.can_fwd_state) {
+					var fwd_states = {
+						"mitm": "MITM (forwarding)",
+						"parallel": "Parallel (no forwarding)",
+						"off_shared_wire": "Off: bus 0 and bus 1 share a wire. Check the harness, or set the forwarding mode to Parallel",
+					};
+					document.getElementById("can_fwd_state").innerHTML = fwd_states[obj.can_fwd_state] || obj.can_fwd_state;
+					document.getElementById("can_fwd_state_row").style.display = "";
 				}
 			}
             // The CAN-derived READY state is shown on every board: it is the
