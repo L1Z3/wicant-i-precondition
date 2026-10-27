@@ -45,9 +45,6 @@
 
 #define TX_GPIO_NUM                 2
 #define RX_GPIO_NUM                 1
-// As per Ali, the transceiver standby mode (i.e. RS mode-select pin (pin 8))
-// doesn't work on proto. 
-// As such, CAN_STDBY_GPIO_NUM is not defined here.
 
 // Indicates whether the hardware has a second voltage divider
 // to read a second (hot-when-car-on) power pin.
@@ -91,7 +88,8 @@
 
 #else
 
-// STDBY_1 -> U2 RS and STDBY_2 -> U4 STB each have a 10 kOhm pull-up.
+// STDBY_1 -> U2 RS and STDBY_2 -> U4 STB each have a 10 kOhm pull-up
+// (pins and polarity checked on the bench).
 // Drive low for normal operation, high for standby.
 #define CAN_STDBY_GPIO_NUM          11
 #define MCP2518FD_STDBY_GPIO_NUM    12
