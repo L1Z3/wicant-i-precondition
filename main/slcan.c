@@ -48,6 +48,7 @@
 static const char serial[] = "N43010123\r";
 static const char version[] = "V2011\r";
 static const char ack[] = "\r";
+static const char bell[] = "\a";
 static const char status[] = "F00\r";
 
 static char *slcan_buffer = NULL;
@@ -249,6 +250,9 @@ char* slcan_parse_str(uint8_t *buf, uint8_t len, twai_message_t *frame, QueueHan
 	static uint32_t filter[8];
 	static uint32_t mask[8];
 	static uint8_t loopback = 0;
+	// The command asked for something MITM forwarding keeps bus 0 from
+	// doing (see can_lock_bridge): answered with BEL instead of OK
+	static uint8_t refused = 0;
 	static uint32_t buffer_index = 0;
 
 	time_now = esp_timer_get_time();
@@ -262,6 +266,7 @@ char* slcan_parse_str(uint8_t *buf, uint8_t len, twai_message_t *frame, QueueHan
 //		ext_flag = 0;
 		cmd_ret = SL_NONE;
 		msg_index = 0;
+		refused = 0;
 		buffer_index = 0;
 	}
 	for(i = 0; i < len; i++)
@@ -288,7 +293,14 @@ char* slcan_parse_str(uint8_t *buf, uint8_t len, twai_message_t *frame, QueueHan
 			      // Open loop back mode
 					can_set_silent(CAN_BUS_0, 0);
 					can_set_loopback(CAN_BUS_0, 1);
-					loopback = 1;
+					if(can_bridge_locked())
+					{
+						refused = 1;
+					}
+					else
+					{
+						loopback = 1;
+					}
 					can_enable(CAN_BUS_0);
 			    	state = SL_END;
 			    	cmd = SL_OPEN;
@@ -307,6 +319,10 @@ char* slcan_parse_str(uint8_t *buf, uint8_t len, twai_message_t *frame, QueueHan
 			    }
 			    else if (slcan_buffer[i] == 'L')
 			    {
+					if(can_bridge_locked())
+					{
+						refused = 1;
+					}
 					can_set_silent(CAN_BUS_0, 1);
 					can_set_loopback(CAN_BUS_0, 0);
 					loopback = 0;
@@ -441,6 +457,10 @@ char* slcan_parse_str(uint8_t *buf, uint8_t len, twai_message_t *frame, QueueHan
 								break;
 							}
 
+							if(can_bridge_locked() && sl_bitrate[b] != can_get_bitrate(CAN_BUS_0))
+							{
+								refused = 1;
+							}
 							can_set_bitrate(CAN_BUS_0, sl_bitrate[b]);
 							state = SL_END;
 							break;
@@ -476,6 +496,11 @@ char* slcan_parse_str(uint8_t *buf, uint8_t len, twai_message_t *frame, QueueHan
 											((((filter[4]<<4)+filter[5]) << 8) & 0x0000FF00) |
 											((((filter[2]<<4)+filter[3]) << 16) & 0x00FF0000) |
 											((((filter[0]<<4)+filter[1]) << 24) & 0xFF000000);
+								// accept-all (code 0) is what bus 0 already does
+								if(can_bridge_locked() && flt != 0)
+								{
+									refused = 1;
+								}
 								can_set_filter(CAN_BUS_0, flt);
 								//ESP_LOGI(TAG, "flt: 0xPRIxx", flt);
 								msg_index = 0;
@@ -493,6 +518,11 @@ char* slcan_parse_str(uint8_t *buf, uint8_t len, twai_message_t *frame, QueueHan
 											((((mask[4]<<4)+mask[5]) << 8) & 0x0000FF00) |
 											((((mask[2]<<4)+mask[3]) << 16) & 0x00FF0000) |
 											((((mask[0]<<4)+mask[1]) << 24) & 0xFF000000);
+								// accept-all (mask all 1s) is what bus 0 already does
+								if(can_bridge_locked() && msk != 0xFFFFFFFF)
+								{
+									refused = 1;
+								}
 								can_set_mask(CAN_BUS_0, msk);
 								//ESP_LOGI(TAG, "msk: 0xPRIxx", msk);
 								msg_index = 0;
@@ -610,11 +640,12 @@ char* slcan_parse_str(uint8_t *buf, uint8_t len, twai_message_t *frame, QueueHan
 						}
 						default:
 						{
-							slcan_response((char*)ack, 0, q);
+							slcan_response((char*)(refused ? bell : ack), 0, q);
 							break;
 //							return (char*)ack;
 						}
 					}
+					refused = 0;
 					break;
 				}
 				break;

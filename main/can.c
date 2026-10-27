@@ -158,9 +158,10 @@ static uint32_t can_busoff_count[CAN_BUS_COUNT];
 
 // MITM forwarding lock (can_lock_bridge). The head unit only reaches the rest
 // of the bus through us, so while it's set nothing a client does reaches the
-// buses: can_disable() refuses (slcan close, an ELM327 protocol change,
-// SavvyCAN bus setup, an upload), and so do the config setters, even while
-// recovery has a bus down, so a bus always comes back as it was locked. The
+// buses: can_disable() refuses (an slcan close, an upload), and so do the
+// config setters, even while recovery has a bus down, so a bus always comes
+// back as it was locked. ELM327 and SavvyCAN check can_bridge_locked() and
+// leave the buses alone; slcan answers a refused change with BEL. The
 // recovery task takes buses down through can_disable_node(), and brings back
 // any that end up down. Sleep parks the buses (can_park), which also unlocks.
 static volatile bool bridge_locked;
@@ -881,6 +882,11 @@ void can_lock_bridge(void)
 		ESP_LOGW(TAG, "MITM: bus 0 and bus 1 bitrates differ; check the CAN settings");
 	}
 #endif
+}
+
+bool can_bridge_locked(void)
+{
+	return bridge_locked;
 }
 
 // Config setters. As in the legacy driver, they are no-ops while the bus is
