@@ -75,5 +75,4 @@ uint8_t can_is_silent(can_bus_t bus);
 bool can_is_enabled(can_bus_t bus);
 bool can_any_enabled(void);
 uint8_t can_get_bitrate(can_bus_t bus);
-void can_flush_rx(void);
 #endif
