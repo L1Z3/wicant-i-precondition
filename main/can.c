@@ -114,6 +114,11 @@ static portMUX_TYPE tx_slot_mux = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint32_t rx_drop_count[CAN_BUS_COUNT];
 static uint32_t rx_drop_logged[CAN_BUS_COUNT];
 static int64_t rx_drop_log_us[CAN_BUS_COUNT];
+#if HW_HAS_MCP2518FD
+// Bus 1's controller RX FIFO overflows (events, not frames), from the driver
+static uint32_t rx_overflow_logged;
+static int64_t rx_overflow_log_us;
+#endif
 
 // TX frames dropped by can_send() (bus down, or no free slot within the
 // caller's timeout). Counted and logged in place--can_send() is task
@@ -1048,6 +1053,20 @@ esp_err_t can_receive(twai_message_t *message, can_bus_t *bus, TickType_t ticks_
 			}
 		}
 	}
+#if HW_HAS_MCP2518FD
+	uint32_t overflows = twai_mcp251xfd_get_rx_overflow_count();
+	if (overflows != rx_overflow_logged)
+	{
+		int64_t now = esp_timer_get_time();
+		if (now - rx_overflow_log_us > 1000000)
+		{
+			rx_overflow_log_us = now;
+			rx_overflow_logged = overflows;
+			ESP_LOGW(TAG, "bus %d: controller RX FIFO overflowed (frames lost), %lu events total",
+					 CAN_BUS_1, overflows);
+		}
+	}
+#endif
 
 	// The caller's timeout applies to the actual wait-for-data
 	can_rx_item_t item;
