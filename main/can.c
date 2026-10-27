@@ -152,9 +152,9 @@ static int64_t tx_drop_log_us[CAN_BUS_COUNT];
 static volatile bool bus_err_passive[CAN_BUS_COUNT];
 // Recovery only helps a bus whose peers are there but starved. With no peer
 // at all (a head unit asleep while forwarding continues), every recovery
-// stalls again, and each one costs 250 ms of downtime and a flush of the
-// shared RX queue. So each stall recovery that no acknowledged frame follows
-// doubles the bus's threshold, up to 64 s; an acknowledged frame resets it.
+// stalls again, and each one costs 250 ms of downtime. So each stall recovery
+// that no acknowledged frame follows doubles the bus's threshold, up to 64 s;
+// an acknowledged frame resets it.
 #define CAN_TX_STALL_BACKOFF_MAX 6
 static uint8_t tx_stall_backoff[CAN_BUS_COUNT];
 // A frame was acknowledged since the last stall check; set in can_on_tx_done()
@@ -868,6 +868,16 @@ void can_enable(can_bus_t bus)
 	if (err == ESP_OK)
 	{
 		can_tx_slots_reset(bus);	// fresh node: all slots are free
+		// With every bus off, can_receive() has stopped draining the shared
+		// RX queue, so what's left in it is old: drop it. With another bus
+		// on, its frames keep flowing and must not be dropped. Before the
+		// enable, so this bus's own first frames survive. The other bus's
+		// bit is read without its lock: a race only drops a few frames as
+		// the old unconditional flush did, or keeps a few ms-old ones.
+		if (!(xEventGroupGetBits(s_can_event_group) & CAN_ENABLE_BIT_ANY))
+		{
+			xQueueReset(can_rx_queue);
+		}
 		can_transceiver_standby(bus, false);
 		err = twai_node_enable(can_node[bus]);
 	}
@@ -883,12 +893,6 @@ void can_enable(can_bus_t bus)
 		xSemaphoreGive(node_lock[bus]);
 		return;
 	}
-
-	// Clear the queue on enable. The queue is shared, so this also drops
-	// any pending frames of the other bus. This can happen at boot, or at
-	// runtime during bus recovery. In-flight frames on the other bus will be
-	// lost. TODO(ejones): maybe eventually we can split into one rx queue per bus?
-	xQueueReset(can_rx_queue);
 
 	can_cfg[bus].bus_state = ON_BUS;
 	// Publish "bus up" last: unparks can_receive(), opens can_send()'s gate
