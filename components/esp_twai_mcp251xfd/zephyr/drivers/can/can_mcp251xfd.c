@@ -764,6 +764,23 @@ static int mcp251xfd_handle_fifo_read(const struct device *dev, const struct mcp
 	fifosta = sys_le32_to_cpu(regs[0]);
 	ua = sys_le32_to_cpu(regs[1]);
 
+	// LOCAL PATCH: count RX FIFO overflows. Upstream only enables and handles
+	// RXOVIF with CONFIG_CAN_STATS, so a full FIFO dropped frames unnoticed.
+	// No interrupt is needed: a full FIFO keeps RXIF set, so this runs. The
+	// write reuses the SPI buffer that regs points into, so it comes after
+	// fifosta and ua are copied out. A failed clear leaves the flag for the
+	// next pass and doesn't change what this returns.
+	if (fifo_type == MCP251XFD_FIFO_TYPE_RX && (fifosta & MCP251XFD_REG_FIFOSTA_RXOVIF)) {
+		reg_byte = mcp251xfd_get_spi_buf_ptr(dev);
+		*reg_byte = 0;
+		if (mcp251xfd_write(dev, MCP251XFD_REG_FIFOCON_TO_STA(fifo->reg_fifocon_addr),
+				    1) < 0) {
+			LOG_ERR("Failed to clear RXOVIF");
+		} else {
+			dev_data->rx_overflows++;
+		}
+	}
+
 	/* is there any data in the fifo? */
 	if (!(fifosta & MCP251XFD_REG_FIFOSTA_TFNRFNIF)) {
 		goto done;
