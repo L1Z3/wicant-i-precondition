@@ -94,6 +94,12 @@
 #define CAN_STDBY_GPIO_NUM          11
 #define MCP2518FD_STDBY_GPIO_NUM    12
 
+// OBD-II pins, on the WiCAN's own plug: bus 0 is 6 (H)/14 (L) and connects to 
+// the rest of the M-CAN; bus 1 is 12 (H)/13 (L) connects only to the head unit. 
+// The harness socket it plugs into is numbered as a mirror image (harness pin 1 
+// mates with WiCAN pin 8, 9 with 16), so the harness calls these 3/11 and 13/12.
+//  See README.md.
+
 // -- Bus 1: MCP2518FD U57 (SPI2) -> TCAN3413 U4 -- //
 // MCP2518FD resets over SPI; GPIO 8 is unused.
 // X2 is a 40 MHz crystal; PLL and SYSCLK division remain disabled.
