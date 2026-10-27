@@ -31,6 +31,7 @@
 #include <string.h>
 #include "esp_twai.h"
 #include "esp_twai_onchip.h"
+#include "hal/twai_hal.h"
 #include "can.h"
 #include "hw_config.h"
 #if HW_HAS_MCP2515 || HW_HAS_MCP2518FD
@@ -120,6 +121,11 @@ static int64_t rx_drop_log_us[CAN_BUS_COUNT];
 static uint32_t rx_overflow_logged;
 static int64_t rx_overflow_log_us;
 #endif
+// Frames bus 0's controller lost to a full RX FIFO, counted in
+// __wrap_twai_hal_read_rx_fifo() and logged like the above
+static volatile uint32_t bus0_rx_overruns;
+static uint32_t bus0_rx_overrun_logged;
+static int64_t bus0_rx_overrun_log_us;
 
 // TX frames dropped by can_send() (bus down, or no free slot within the
 // caller's timeout). Counted and logged in place--can_send() is task
@@ -246,6 +252,25 @@ static CAN_ISR_ATTR bool can_on_rx_done(twai_node_handle_t handle, const twai_rx
 		rx_drop_count[item.bus]++;
 	}
 	return (task_woken == pdTRUE);
+}
+
+// Frames that arrive while the on-chip controller's FIFO is full are kept as
+// overrun slots without data. ESP-IDF's driver reads them with
+// twai_hal_read_rx_fifo(), which releases the slot and returns false, and
+// moves on with no callback or count. CMakeLists.txt wraps that call so each
+// one is counted here. It's a lower bound: the controller marks at most about
+// 60 per overrun. If ESP-IDF renames the function or changes its signature,
+// the build fails.
+__typeof__(twai_hal_read_rx_fifo) __real_twai_hal_read_rx_fifo, __wrap_twai_hal_read_rx_fifo;
+
+CAN_ISR_ATTR bool __wrap_twai_hal_read_rx_fifo(twai_hal_context_t *hal_ctx, twai_hal_frame_t *rx_frame)
+{
+	bool ok = __real_twai_hal_read_rx_fifo(hal_ctx, rx_frame);
+	if (!ok)
+	{
+		bus0_rx_overruns++;
+	}
+	return ok;
 }
 
 // Callback when the driver finishes (or abandons) a transmitted frame:
@@ -1083,6 +1108,18 @@ esp_err_t can_receive(twai_message_t *message, can_bus_t *bus, TickType_t ticks_
 		}
 	}
 #endif
+	uint32_t overruns = bus0_rx_overruns;
+	if (overruns != bus0_rx_overrun_logged)
+	{
+		int64_t now = esp_timer_get_time();
+		if (now - bus0_rx_overrun_log_us > 1000000)
+		{
+			bus0_rx_overrun_log_us = now;
+			bus0_rx_overrun_logged = overruns;
+			ESP_LOGW(TAG, "bus %d: controller RX FIFO overflowed, %lu frames lost total",
+					 CAN_BUS_0, overruns);
+		}
+	}
 
 	// The caller's timeout applies to the actual wait-for-data
 	can_rx_item_t item;
