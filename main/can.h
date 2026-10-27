@@ -61,6 +61,8 @@ void can_lock_bridge(void);
 // Sleep: takes every bus down for good (unlocking MITM forwarding); no bus
 // comes up again until the restart that waking is
 void can_park(void);
+// So clients can tell a refused change from one that took
+bool can_bridge_locked(void);
 void can_set_silent(can_bus_t bus, uint8_t flag);
 void can_set_loopback(can_bus_t bus, uint8_t flag);
 void can_set_auto_retransmit(can_bus_t bus, uint8_t flag);
