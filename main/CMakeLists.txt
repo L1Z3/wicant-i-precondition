@@ -10,3 +10,7 @@ idf_component_register(
     PRIV_REQUIRES       # optional, list the private requirements
     EMBED_FILES "homepage_full.html"
 )
+
+# ESP-IDF's TWAI driver drops bus 0's RX FIFO overruns without a count; can.c
+# counts them by wrapping the HAL read the driver's interrupt calls.
+target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=twai_hal_read_rx_fifo")
