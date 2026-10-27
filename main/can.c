@@ -27,6 +27,7 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_attr.h"
 #include <string.h>
 #include "esp_twai.h"
 #include "esp_twai_onchip.h"
@@ -186,11 +187,26 @@ static void can_disable_node(can_bus_t bus);
 
 // Driver callbacks run in ISR context for the on-chip controller and in a
 // driver task for the SPI controllers, so they pick FreeRTOS APIs to match.
+//
+// On the S3 the on-chip controller's interrupt also runs while flash writes
+// have the cache off (CONFIG_TWAI_ISR_CACHE_SAFE): its FIFO holds about five
+// frames, 1.2 ms at 500 kbit/s, and a 4 KB flash write takes ~6 ms. The
+// callbacks then run from IRAM and may only touch internal RAM: no logging,
+// no constants in flash, nothing in PSRAM.
+#if CONFIG_TWAI_ISR_CACHE_SAFE
+#define CAN_ISR_ATTR IRAM_ATTR
+#else
+#define CAN_ISR_ATTR
+#endif
+// Flash auto-suspend keeps the cache on instead, and hides the option
+#if CONFIG_IDF_TARGET_ESP32S3 && !CONFIG_TWAI_ISR_CACHE_SAFE && !CONFIG_SPI_FLASH_AUTO_SUSPEND
+#error "CONFIG_TWAI_ISR_CACHE_SAFE is off; an older build.<variant>/sdkconfig? Delete it to pick up sdkconfig.defaults.esp32s3"
+#endif
 
 // Callback to receive frames from driver: drain the frame out
 // of the hardware, tag it with its bus, and hand it to can_receive() via the
 // shared queue--all protocol work happens later in task context
-static bool can_on_rx_done(twai_node_handle_t handle, const twai_rx_done_event_data_t *edata, void *user_ctx)
+static CAN_ISR_ATTR bool can_on_rx_done(twai_node_handle_t handle, const twai_rx_done_event_data_t *edata, void *user_ctx)
 {
 	(void)edata;
 	// Bus id was registered as the callback's user_ctx in can_enable()
@@ -235,7 +251,7 @@ static bool can_on_rx_done(twai_node_handle_t handle, const twai_rx_done_event_d
 // Callback when the driver finishes (or abandons) a transmitted frame:
 // return its backing TX slot to the pool. This is the only thing that
 // replenishes the slots a can_send() may be blocked waiting on.
-static bool can_on_tx_done(twai_node_handle_t handle, const twai_tx_done_event_data_t *edata, void *user_ctx)
+static CAN_ISR_ATTR bool can_on_tx_done(twai_node_handle_t handle, const twai_tx_done_event_data_t *edata, void *user_ctx)
 {
 	(void)handle;
 	// Bus id was registered as the callback's user_ctx in can_enable()
@@ -268,7 +284,7 @@ static bool can_on_tx_done(twai_node_handle_t handle, const twai_tx_done_event_d
 
 // Flag a bus for can_recovery_task(). Returns whether a higher-priority task
 // was woken (ISR context only).
-static bool can_request_recovery(can_bus_t bus)
+static CAN_ISR_ATTR bool can_request_recovery(can_bus_t bus)
 {
 	__atomic_fetch_or(&can_busoff_pending, BIT(bus), __ATOMIC_SEQ_CST);
 
@@ -287,7 +303,7 @@ static bool can_request_recovery(can_bus_t bus)
 	return (task_woken == pdTRUE);
 }
 
-static bool can_on_state_change(twai_node_handle_t handle, const twai_state_change_event_data_t *edata, void *user_ctx)
+static CAN_ISR_ATTR bool can_on_state_change(twai_node_handle_t handle, const twai_state_change_event_data_t *edata, void *user_ctx)
 {
 	(void)handle;
 	can_bus_t bus = (can_bus_t)(uintptr_t)user_ctx;
