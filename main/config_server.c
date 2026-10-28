@@ -464,6 +464,9 @@ static esp_err_t index_handler(httpd_req_t *req)
 #define CONFIG_MAX_LEN      (16 * 1024)
 // ~90 CAN filter rows of maximum length
 #define CANFLT_MAX_LEN      (16 * 1024)
+// ~150 custom PIDs at the page's maximum field lengths; real tables are a
+// few KB
+#define AUTOPID_MAX_LEN     (64 * 1024)
 // The saved JSON files are at most 3 levels deep (CAN filter rows)
 #define JSON_MAX_DEPTH      8
 
@@ -559,6 +562,26 @@ static cJSON *parse_body_json(const char *buf, size_t len)
         return NULL;
     }
     return cJSON_ParseWithOpts(buf, NULL, true);
+}
+
+/* load_all_pids() (autopid.c) reads every value in auto_pid.json and
+ * car_data.json as a string: a number or null there crashes it at boot, on
+ * every boot. The page only ever sends strings. */
+static bool json_leaves_are_strings(const cJSON *item)
+{
+    if (cJSON_IsObject(item) || cJSON_IsArray(item))
+    {
+        const cJSON *child;
+        cJSON_ArrayForEach(child, item)
+        {
+            if (!json_leaves_are_strings(child))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+    return cJSON_IsString(item);
 }
 
 /* Replace path with len bytes of buf: write path.tmp, then rename it over
@@ -1002,100 +1025,36 @@ static esp_err_t logo_handler(httpd_req_t *req)
 
 static esp_err_t store_auto_data_handler(httpd_req_t *req)
 {
-    if (!req)
-	{
-        return ESP_ERR_INVALID_ARG;
+    esp_err_t ret;
+    char *buf = recv_body(req, AUTOPID_MAX_LEN, &ret);
+    if (buf == NULL)
+    {
+        return ret;
     }
 
-    char *buf = NULL;
-    size_t buf_size = req->content_len;
-    esp_err_t ret = ESP_OK;
-
-    // Validate content length
-    if (buf_size <= 0 || buf_size > MAX_FILE_SIZE)
-	{
-        ESP_LOGE(TAG, "Invalid content length: %d", buf_size);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid content length");
-        return ESP_FAIL;
+    // load_all_pids() wants an object of settings and PID tables
+    cJSON *root = parse_body_json(buf, req->content_len);
+    bool valid = cJSON_IsObject(root) && json_leaves_are_strings(root);
+    cJSON_Delete(root);
+    if (!valid)
+    {
+        ESP_LOGE(TAG, "Invalid AutoPID data");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid AutoPID data");
+        free(buf);
+        return ESP_OK;
     }
 
-    // Allocate buffer with extra byte for null termination
-    buf = (char *)calloc(1, buf_size + 1);
-    if (!buf)
-	{
-        ESP_LOGE(TAG, "Memory allocation failed for size %d", buf_size + 1);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Memory allocation failed");
-        return ESP_ERR_NO_MEM;
+    bool saved = save_file_atomic(FS_MOUNT_POINT"/auto_pid.json", buf, req->content_len);
+    free(buf);
+    if (!saved)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save AutoPID data");
+        return ESP_OK;
     }
 
-    // Receive data with timeout handling
-    int received = recv_full(req, buf, buf_size);
-    if (received <= 0)
-	{
-        ESP_LOGE(TAG, "Failed to receive data: %d", received);
-        ret = ESP_FAIL;
-        goto cleanup;
-    }
-
-    // Validate received data length
-    if (received != buf_size)
-	{
-        ESP_LOGE(TAG, "Incomplete data received: %d/%d", received, buf_size);
-        ret = ESP_FAIL;
-        goto cleanup;
-    }
-
-    buf[received] = '\0';
-    
-    // Validate JSON format
-    cJSON *json = cJSON_Parse(buf);
-    if (!json)
-	{
-        ESP_LOGE(TAG, "Invalid JSON format");
-        ret = ESP_FAIL;
-        goto cleanup;
-    }
-    cJSON_Delete(json);
-
-    ESP_LOGI(TAG, "Auto Table json: %s", buf);
-
-    // Open file with error handling
-    FILE *f = fopen(FS_MOUNT_POINT"/auto_pid.json", "w");
-    if (!f)
-	{
-        ESP_LOGE(TAG, "Failed to open file for writing");
-        ret = ESP_FAIL;
-        goto cleanup;
-    }
-
-    // Write data with size verification
-    size_t written = fwrite(buf, 1, received, f);
-    if (written != received) 
-	{
-        ESP_LOGE(TAG, "File write failed: %d/%d bytes", written, received);
-        fclose(f);
-        ret = ESP_FAIL;
-        goto cleanup;
-    }
-
-    fclose(f);
-
-    // Send success response
     const char *resp_str = "Auto PID table will take effect after submit.";
     httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
-
-cleanup:
-    if (buf)
-	{
-        free(buf);
-    }
-    
-    if (ret != ESP_OK)
-	{
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to store data");
-    }
-
-    return ret;
+    return ESP_OK;
 }
 
 
