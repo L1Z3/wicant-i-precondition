@@ -64,11 +64,8 @@ esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_w
 esp_err_t can_receive(twai_message_t *message, can_bus_t *bus, TickType_t ticks_to_wait);
 uint8_t can_is_silent(can_bus_t bus);
 bool can_is_enabled(can_bus_t bus);
-bool can_is_active(can_bus_t bus);
+bool can_is_forwardable(can_bus_t bus);
 bool can_any_enabled(void);
 uint8_t can_get_bitrate(can_bus_t bus);
 void can_flush_rx(void);
-// Verbose bring-up diagnostics: call from task context only (not an ISR and
-// not while holding a node lock). Safe with buses up or down.
-void can_dump_diagnostics(const char *why);
 #endif

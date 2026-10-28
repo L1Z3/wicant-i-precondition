@@ -721,13 +721,8 @@ static void gvret_broadcast_task(void *pvParameters)
 			int err = sendto(sock, buff, 4, 0, (struct sockaddr *)&broadcastAddr, sizeof(broadcastAddr));
 			if (err < 0)
 			{
-				static int64_t last_error_us;
-				int64_t now = esp_timer_get_time();
-				if((now - last_error_us) > 60000000LL)
-				{
-					last_error_us = now;
-					ESP_LOGW(TAG, "broadcast send failed: errno %d", errno);
-				}
+				ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
+//				break;
 			}
 		}
 	}

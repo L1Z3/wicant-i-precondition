@@ -33,10 +33,6 @@ CONFIG_ESP_WIFI_11KV_SUPPORT=y
 CONFIG_FREERTOS_HZ=1000
 CONFIG_FREERTOS_ENABLE_BACKWARD_COMPATIBILITY=y
 CONFIG_LOG_COLORS=y
-# Log timestamps from the system clock, not FreeRTOS ticks. Ticks stop in
-# light sleep, which made ~5.3 h parked look like 76 min in the file log and
-# made the 60 s sleep warning appear every 545 ms.
-CONFIG_LOG_TIMESTAMP_SOURCE_SYSTEM=y
 # Default 10 slots is fully consumed by httpd alone (max_open_sockets 7 + 3
 # internal), so a browser on the config page starved the GVRET server's
 # accept() with ENFILE until the keep-alive connections idled out.

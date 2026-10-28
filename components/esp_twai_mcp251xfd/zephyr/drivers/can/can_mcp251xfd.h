@@ -513,11 +513,6 @@ struct mcp251xfd_data {
 	uint8_t current_mcp251xfd_mode;
 	int tdco;
 
-	/* LOCAL PATCH: bring-up diagnostics. Counted in the interrupt thread, */
-	/* logged from the adapter's dump.                                    */
-	uint32_t rx_overflow_count;
-	uint32_t tef_overflow_count;
-
 	/* LOCAL PATCH: set before the adapter puts the controller into Low
 	 * Power Mode. The INT thread must not re-enable the GPIO pin after
 	 * this point, or a sleep entry races with a stale interrupt and reads

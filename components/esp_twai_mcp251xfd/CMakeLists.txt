@@ -7,7 +7,7 @@ idf_component_register(
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "compat" "zephyr/include"
     REQUIRES esp_driver_twai esp_driver_spi
-    PRIV_REQUIRES esp_driver_gpio esp_rom esp_timer log log_flash
+    PRIV_REQUIRES esp_driver_gpio esp_rom log
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE
