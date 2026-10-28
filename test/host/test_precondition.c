@@ -127,14 +127,36 @@ static void press(void)   { uint8_t d[8] = {0}; d[5] = 0x10; rx_frame(0x448, d, 
 static void release(void) { uint8_t d[8] = {0}; rx_frame(0x448, d, CAN_BUS_0); }
 static void toggle(void)  { press(); fake_now += 100000; release(); }
 static void car_status(uint8_t b, can_bus_t bus) { uint8_t d[8] = {0}; d[1] = b; rx_frame(0x2AD, d, bus); }
+// Ioniq 6 carries the same status payload on the 29-bit 0x0A82AA03 (the CCU-hub
+// remap of the 11-bit 0x2AD).
+static void ioniq6_status(uint8_t b, can_bus_t bus) { uint8_t d[8] = {0}; d[1] = b; rx_frame(0x0A82AA03, d, bus); }
 static void car_power(bool ready) { uint8_t d[8] = {0}; d[0] = ready ? 0x04 : 0x00; rx_frame(0x038, d, CAN_BUS_0); }
-static void battery_temperature(int8_t min_c, int8_t max_c) {
+// Ioniq 6 carries the power status on the 29-bit 0x00C03503 (the CCU-hub remap
+// of the 11-bit 0x038). Byte 0's low nibble reads 0x04 in READY and 0x01 awake
+// but off, so this takes the raw byte rather than a bool.
+static void ioniq6_power(uint8_t byte0, can_bus_t bus) {
+    uint8_t d[8] = {0};
+    d[0] = byte0;
+    rx_frame(0x00C03503, d, bus);
+}
+// Ioniq 5/EV6 broadcast battery temperature on 0x152 and SoC on 0x2FC; Ioniq 6
+// uses 29-bit extended IDs for the same payloads, and the firmware's
+// IS_BATTERY_TEMPERATURE_FRAME / IS_BATTERY_SOC_FRAME accept either ID. The
+// *_frame helpers take the identifier so a suite can drive both (see the
+// "Ioniq 6 battery frames" suite); the two below pin the Ioniq 5/EV6 IDs.
+static void battery_temperature_frame(uint32_t frame_id, int8_t min_c, int8_t max_c, can_bus_t bus) {
     uint8_t d[8] = {(uint8_t)min_c, (uint8_t)max_c};
-    rx_frame(0x152, d, CAN_BUS_0);
+    rx_frame(frame_id, d, bus);
+}
+static void battery_temperature(int8_t min_c, int8_t max_c) {
+    battery_temperature_frame(0x152, min_c, max_c, CAN_BUS_0);
+}
+static void battery_soc_frame(uint32_t frame_id, uint8_t raw, can_bus_t bus) {
+    uint8_t d[8] = {[7] = raw};
+    rx_frame(frame_id, d, bus);
 }
 static void battery_soc(uint8_t raw) {
-    uint8_t d[8] = {[7] = raw};
-    rx_frame(0x2FC, d, CAN_BUS_0);
+    battery_soc_frame(0x2FC, raw, CAN_BUS_0);
 }
 
 // Model the two firmware workers in deterministic order: the timing task runs
@@ -524,8 +546,10 @@ static void run_battery_temperature_cutoff(void) {
 static void run_battery_soc(void) {
     precondition_init();
     precondition_soc_t soc;
+    // Raw frame, not battery_soc(), because the checks below shorten
+    // data_length_code. The firmware matches the identifier inline.
     twai_message_t frame = {
-        .identifier = BATTERY_SOC_FRAME_ID,
+        .identifier = 0x2FCU,
         .data_length_code = BATTERY_SOC_DATA_LENGTH,
         .data = {[BATTERY_SOC_INDEX] = 127},
     };
@@ -604,6 +628,159 @@ static void run_battery_soc(void) {
     expect_state("idle");
     CHECK(sent_count == base + 6);
     CHECK(popup_show_count == 3);
+}
+
+// The Ioniq 6 identifiers for the two battery frames. Both IS_*_FRAME macros in
+// precondition.c are an either/or, so each decoder has to be driven through
+// both IDs: dropping the extended half leaves every other suite green.
+static void run_ioniq6_battery_frames(void) {
+    precondition_init();
+    precondition_temperature_t temperature;
+    precondition_soc_t soc;
+    CHECK(precon_blockers == PRECONDITION_BLOCK_NONE);
+
+    // Wrong-bus samples stay ignored, exactly as for the Ioniq 5 identifiers:
+    // these frames are car-side only. Hot/low values so a missing bus filter
+    // would move the blockers (and fail the checks below).
+    battery_temperature_frame(0x05415002, 25, 28, CAN_BUS_1);
+    battery_soc_frame(0x0BC2FA02, 10, CAN_BUS_1);
+    CHECK(precon_blockers == PRECONDITION_BLOCK_NONE);
+    CHECK(!precondition_get_battery_temperature(&temperature));
+    CHECK(!precondition_get_battery_soc(&soc));
+
+    // 0x05415002 carries the same min/max pair as 0x152; cutoff inclusive.
+    battery_temperature_frame(0x05415002, 21, 24, CAN_BUS_0);
+    CHECK(precon_blockers == PRECONDITION_BLOCK_BATTERY_WARM);
+    CHECK(precondition_get_battery_temperature(&temperature));
+    CHECK(temperature.min_c == 21 && temperature.max_c == 24);
+    battery_temperature_frame(0x05415002, 20, 24, CAN_BUS_0);
+    CHECK(precon_blockers == PRECONDITION_BLOCK_NONE);
+
+    // 0x0BC2FA02 carries the half-percent SoC in D8; cutoff exclusive.
+    battery_soc_frame(0x0BC2FA02, 39, CAN_BUS_0);
+    CHECK(precon_blockers == PRECONDITION_BLOCK_BATTERY_LOW_SOC);
+    CHECK(precondition_get_battery_soc(&soc));
+    CHECK(soc.raw == 39);
+    CHECK(soc.raw * BATTERY_SOC_SCALE == 19.5f);
+    battery_soc_frame(0x0BC2FA02, 40, CAN_BUS_0);
+    CHECK(precon_blockers == PRECONDITION_BLOCK_NONE);
+
+    // Both Ioniq 5/EV6 identifiers still decode in the same process: the
+    // predicate accepts either ID rather than having switched over.
+    battery_temperature_frame(0x152, 21, 24, CAN_BUS_0);
+    battery_soc_frame(0x2FC, 39, CAN_BUS_0);
+    CHECK(precon_blockers
+          == (PRECONDITION_BLOCK_BATTERY_WARM | PRECONDITION_BLOCK_BATTERY_LOW_SOC));
+}
+
+// The Ioniq 6 form of the precondition status frame, 0x0A82AA03. It must drive
+// the state machine exactly like 0x2AD, and it is the only thing that identifies
+// an Ioniq 6 for the web UI's "auto" vehicle setting: a recognised status byte on
+// this ID -- and nothing else -- publishes EGMP_CAR_IONIQ6.
+static void run_ioniq6_status_frame(void) {
+    precondition_init();
+    expect_state("idle");
+    egmp_car_model_t model;
+
+    // No status frame yet, so nothing has decided the model.
+    CHECK(!precondition_get_car_model(&model));
+
+    sent_count = 0;
+    toggle();
+    expect_state("start-burst");
+
+    // Same ID on the head unit bus: drives neither the status nor the model.
+    ioniq6_status(0x01, CAN_BUS_1);
+    CHECK(platform.precon_status == PRECON_STATUS_UNKNOWN);
+    CHECK(!precondition_get_car_model(&model));
+
+    // An unrecognised status byte is not trusted to carry the model bit.
+    ioniq6_status(0x00, CAN_BUS_0);
+    CHECK(platform.precon_status == PRECON_STATUS_UNKNOWN);
+    CHECK(!precondition_get_car_model(&model));
+
+    // Idle is recognised: the status decodes and the model latches from this ID.
+    ioniq6_status(0x01, CAN_BUS_0);
+    CHECK(platform.precon_status == PRECON_STATUS_IDLE);
+    CHECK(precondition_get_car_model(&model));
+    CHECK(model == EGMP_CAR_IONIQ6);
+
+    for (int i = 0; i < 6; i++) tick1();
+    CHECK(sent_count == 6);
+    check_start_burst_msgs(0);
+    expect_state("wait-starting");
+
+    // The model is published once per boot, so a later EV6 0x2AD still drives
+    // the status but must not overwrite the latched Ioniq 6.
+    car_status(0x45, CAN_BUS_0);
+    CHECK(platform.precon_status == PRECON_STATUS_STARTING);
+    CHECK(precondition_get_car_model(&model));
+    CHECK(model == EGMP_CAR_IONIQ6);
+    expect_state("wait-started");
+
+    // ... and the Ioniq 6 ID carries the rest of the sequence to ACTIVE.
+    ioniq6_status(0x15, CAN_BUS_0);
+    CHECK(platform.precon_status == PRECON_STATUS_STARTED);
+    expect_state("active");
+}
+
+// The Ioniq 6 form of the power-status frame, 0x00C03503: the 11-bit 0x038 never
+// appears on that car's bus, so this is the only READY source. READY is what
+// gates a repeating mode's relaunch (managed_tick) and arms the utility-mode
+// blocker, so a missed READY edge silently stops continuous/persistent retries.
+static void run_ioniq6_power_status(void) {
+    precondition_init();
+    expect_state("idle");
+    CHECK(platform.ready_status == READY_STATUS_UNKNOWN);
+    CHECK(!car_in_ready());
+
+    // Wrong bus: a head-unit copy of the Ioniq 6 id is not the car's READY.
+    ioniq6_power(0x04, CAN_BUS_1);
+    CHECK(platform.ready_status == READY_STATUS_UNKNOWN);
+    CHECK(!car_in_ready());
+
+    // The 11-bit form still decodes (either ID is accepted)...
+    car_power(true);
+    CHECK(platform.ready_status == READY_STATUS_READY);
+    car_power(false);
+    CHECK(platform.ready_status == READY_STATUS_NOT_READY);
+
+    // ...and the Ioniq 6 id sets READY from byte 0's low nibble, then drops it
+    // again for the 0x01 an awake-but-off car reports.
+    ioniq6_power(0x04, CAN_BUS_0);
+    CHECK(platform.ready_status == READY_STATUS_READY);
+    CHECK(car_in_ready());
+    ioniq6_power(0x01, CAN_BUS_0);
+    CHECK(platform.ready_status == READY_STATUS_NOT_READY);
+    CHECK(!car_in_ready());
+    ioniq6_power(0x04, CAN_BUS_0);                 // READY again for the relaunch
+    CHECK(car_in_ready());
+
+    // READY on this ID is what relaunches a persistent session: start one, take
+    // the car off, then let the Ioniq 6 READY edge drive CAR_START_DELAY.
+    battery_temperature(7, 10);
+    toggle();
+    expect_state("start-burst");
+    for (int i = 0; i < 6; i++) tick1();
+    car_status(0x05, CAN_BUS_0);
+    car_status(0x15, CAN_BUS_0);
+    expect_state("active");
+
+    ioniq6_power(0x01, CAN_BUS_0);                 // car off
+    expect_state("managed");
+    CHECK(!car_in_ready());
+    sent_count = 0;
+    advance_us(REPEATING_MODE_RETRY_INTERVAL_US + 10000000LL);
+    CHECK(sent_count == 0);                        // no nudge while not READY
+    expect_state("managed");
+
+    ioniq6_power(0x04, CAN_BUS_0);                 // READY edge
+    expect_state("car-start-delay");
+    advance_us(PRECONDITION_CAR_START_DELAY_US - 40000);
+    expect_state("car-start-delay");
+    tick1();
+    expect_state("start-burst");
+    CHECK(requested.kind == ATTEMPT_CAR_START);
 }
 
 static void run_automatic_temperature_cutoff(void) {
@@ -1734,6 +1911,9 @@ static const suite_t suites[] = {
     {"precondition long-press once", ONCE, PRESS_LONG, run_long_press},
     {"precondition battery temperature cutoff", ONCE, PRESS_SHORT, run_battery_temperature_cutoff},
     {"precondition battery state of charge", ONCE, PRESS_SHORT, run_battery_soc},
+    {"precondition Ioniq 6 battery frames", ONCE, PRESS_SHORT, run_ioniq6_battery_frames},
+    {"precondition Ioniq 6 status frame", ONCE, PRESS_SHORT, run_ioniq6_status_frame},
+    {"precondition Ioniq 6 power status", PERSISTENT, PRESS_SHORT, run_ioniq6_power_status},
     {"precondition automatic temperature cutoff", CONTINUOUS, PRESS_SHORT, run_automatic_temperature_cutoff},
     {"precondition persistent temperature cutoff", PERSISTENT, PRESS_SHORT, run_automatic_temperature_cutoff},
     {"precondition continuous cool wait", CONTINUOUS, PRESS_SHORT, run_managed_cool_wait},
