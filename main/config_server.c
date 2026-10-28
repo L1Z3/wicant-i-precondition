@@ -428,6 +428,24 @@ int32_t config_server_get_port(void)
 	return -1;
 }
 
+/* httpd_req_recv returns only what has arrived so far: loop until all len
+ * bytes are in. Returns len, or the httpd_req_recv error (a timeout is not
+ * retried: a client silent for longer than recv_wait_timeout fails). */
+static int recv_full(httpd_req_t *req, char *buf, size_t len)
+{
+    size_t got = 0;
+    while (got < len)
+    {
+        int ret = httpd_req_recv(req, buf + got, len - got);
+        if (ret <= 0)
+        {
+            return ret;
+        }
+        got += (size_t)ret;
+    }
+    return (int)got;
+}
+
 static esp_err_t index_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
@@ -456,13 +474,13 @@ static esp_err_t store_config_handler(httpd_req_t *req)
         return ESP_ERR_NO_MEM; // Memory allocation failure
     }
 
-    int ret = httpd_req_recv(req, buf, buf_size);
+    int ret = recv_full(req, buf, buf_size);
 
     if (ret <= 0)
     {
         if (ret == HTTPD_SOCK_ERR_TIMEOUT)
         {
-            // Retry receiving if timeout occurred
+            // Timed out waiting for the rest of the body
             free(buf);
             return ESP_FAIL;
         }
@@ -511,13 +529,13 @@ static esp_err_t store_canflt_handler(httpd_req_t *req)
         return ESP_ERR_NO_MEM; // Memory allocation failure
     }
 
-    int ret = httpd_req_recv(req, buf, buf_size);
+    int ret = recv_full(req, buf, buf_size);
 
     if (ret <= 0)
     {
         if (ret == HTTPD_SOCK_ERR_TIMEOUT)
         {
-            // Retry receiving if timeout occurred
+            // Timed out waiting for the rest of the body
             free(buf);
             return ESP_FAIL;
         }
@@ -829,7 +847,7 @@ static esp_err_t store_auto_data_handler(httpd_req_t *req)
     }
 
     // Receive data with timeout handling
-    int received = httpd_req_recv(req, buf, buf_size);
+    int received = recv_full(req, buf, buf_size);
     if (received <= 0)
 	{
         ESP_LOGE(TAG, "Failed to receive data: %d", received);
