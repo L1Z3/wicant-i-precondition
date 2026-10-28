@@ -1764,7 +1764,23 @@ static esp_err_t upload_ota(httpd_req_t *req)
     assert(update_partition != NULL);
     ESP_LOGI(TAG, "Writing to partition subtype %d at offset 0x%lx",
              update_partition->subtype, update_partition->address);
-    err = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &update_handle);
+    if ((uint32_t)up.file_len > update_partition->size)
+    {
+        ESP_LOGE(TAG, "Firmware too large: %d bytes, partition %lu", up.file_len, update_partition->size);
+        httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, "Firmware too large for this board");
+        return ESP_FAIL;
+    }
+    /* Each flash erase stops the CPU's flash cache, and with it whatever
+     * isn't in IRAM, MITM forwarding included. Erasing just the image's size
+     * up front is quickest (64 KB blocks, a few seconds), which shortens the
+     * update while CAN is off. If locked MITM forwarding keeps CAN on
+     * (upload_post_handler()), erase each 4 KB sector as it is written
+     * instead: two to three times the erase time in all, but each gap in
+     * forwarding is one sector erase (typically tens of ms), spread through
+     * the upload, rather than block erases of 150 ms or more, back to back
+     * with about a tick between them. */
+    err = esp_ota_begin(update_partition, can_bridge_locked() ? OTA_WITH_SEQUENTIAL_WRITES : up.file_len,
+                        &update_handle);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "esp_ota_begin failed (%s)", esp_err_to_name(err));
