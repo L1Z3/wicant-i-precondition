@@ -1,6 +1,9 @@
 #include <stdarg.h>
 #include <stdio.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/logging/log.h>
+
+volatile bool z_gpio_int_enabled;
 
 void zephyr_log(esp_log_level_t level, const char *tag, const char *format, ...)
 {
