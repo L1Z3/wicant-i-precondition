@@ -6,7 +6,17 @@ if ! command -v nmcli >/dev/null 2>&1; then
   exit 1
 fi
 
-BIN=$(ls -t "$(dirname "${BASH_SOURCE[0]}")"/../build.proto/wican-fw_*.bin "$(dirname "${BASH_SOURCE[0]}")"/../build.eb-fd/wican-fw_*.bin "$(dirname "${BASH_SOURCE[0]}")"/../build.v300/wican-fw_*.bin 2>/dev/null | head -1 || true)
+# The variant picks the build folder, so every board in range is offered the
+# same variant's image; boards of another variant refuse it.
+VARIANT="${1:-}"
+case "$VARIANT" in
+  v300|proto|eb-fd) ;;
+  *)
+    echo "usage: ${0##*/} {v300|proto|eb-fd}" >&2
+    exit 2
+    ;;
+esac
+BIN=$(ls -t "$(dirname "${BASH_SOURCE[0]}")"/../build."$VARIANT"/wican-fw_*.bin 2>/dev/null | head -1 || true)
 OTA_URL="http://192.168.80.1/upload/ota.bin"
 PAGE_URL="http://192.168.80.1/"
 WIFI_PASS="@meatpi#"
@@ -162,10 +172,12 @@ echo "---"
 echo "=== PASS 1: FLASH ALL ==="
 flash_count=0
 flash_fail=0
+FLASHED=""
 
 while IFS= read -r ssid; do
   if flash_one "$ssid"; then
     ((flash_count += 1))
+    FLASHED+="$ssid"$'\n'
   else
     ((flash_fail += 1))
   fi
@@ -176,18 +188,19 @@ echo ""
 echo "=== Flash results: $flash_count flashed, $flash_fail failed ==="
 
 echo ""
-echo "=== PASS 2: VERIFY ALL ==="
+echo "=== PASS 2: VERIFY FLASHED ==="
 verify_count=0
 verify_fail=0
 
 while IFS= read -r ssid; do
+  [[ -n "$ssid" ]] || continue
   if verify_one "$ssid"; then
     ((verify_count += 1))
   else
     ((verify_fail += 1))
   fi
   sleep 2
-done <<< "$SSIDS"
+done <<< "$FLASHED"
 
 echo ""
 echo "=== Verify results: $verify_count verified, $verify_fail failed ==="
