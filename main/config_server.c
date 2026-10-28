@@ -2773,7 +2773,8 @@ static httpd_handle_t config_server_init(void)
 		fseek(f, 0, SEEK_SET);
 		fread(device_config_file, sizeof(char), filesize, f);
 		device_config_file[filesize] = 0;
-		fseek(f, 0, SEEK_SET);
+		// Close before parsing: LittleFS won't unlink or rename an open file
+		fclose(f);
 		ESP_LOGI(TAG, "config.json: %s", device_config_file);
 		config_server_load_cfg(device_config_file);
 		
