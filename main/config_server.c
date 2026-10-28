@@ -38,6 +38,7 @@
 #include "esp_err.h"
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include <sys/unistd.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -459,58 +460,260 @@ static esp_err_t index_handler(httpd_req_t *req)
 }
 
 
+// config.json is ~1.2 KB, under 4 KB with every field at its maximum
+#define CONFIG_MAX_LEN      (16 * 1024)
+// The saved JSON files are at most 3 levels deep (CAN filter rows)
+#define JSON_MAX_DEPTH      8
+
+/* Receive the whole body of a POST of at most max_len bytes into a
+ * NUL-terminated heap buffer. On failure the HTTP error has been sent (if the
+ * client is still there) and *ret is what the handler should return. */
+static char *recv_body(httpd_req_t *req, size_t max_len, esp_err_t *ret)
+{
+    size_t len = req->content_len;
+
+    // ESP_FAIL whenever the body is left unread: the session is closed
+    // instead of httpd draining up to content_len bytes
+    *ret = ESP_FAIL;
+    if (len == 0)
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty request");
+        *ret = ESP_OK;
+        return NULL;
+    }
+    if (len > max_len)
+    {
+        httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, "Request too large");
+        return NULL;
+    }
+
+    char *buf = malloc(len + 1);
+    if (buf == NULL)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        return NULL;
+    }
+
+    int got = recv_full(req, buf, len);
+    if (got <= 0)
+    {
+        // Any other error means the client is gone
+        if (got == HTTPD_SOCK_ERR_TIMEOUT)
+        {
+            httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "Timed out receiving request");
+        }
+        free(buf);
+        return NULL;
+    }
+    buf[len] = 0;
+    return buf;
+}
+
+/* cJSON recurses per nesting level, and the httpd stack is only 5 KB: refuse
+ * deep nesting before parsing. */
+static bool json_depth_ok(const char *s, int max_depth)
+{
+    int depth = 0;
+    bool in_str = false;
+
+    for (; *s; s++)
+    {
+        if (in_str)
+        {
+            if (*s == '\\' && s[1] != 0)
+            {
+                s++;
+            }
+            else if (*s == '"')
+            {
+                in_str = false;
+            }
+        }
+        else if (*s == '"')
+        {
+            in_str = true;
+        }
+        else if (*s == '{' || *s == '[')
+        {
+            if (++depth > max_depth)
+            {
+                return false;
+            }
+        }
+        else if ((*s == '}' || *s == ']') && --depth < 0)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Parse a received body the way it will be read back from the file: as a C
+ * string (so no NUL inside) holding nothing but the JSON. NULL if invalid. */
+static cJSON *parse_body_json(const char *buf, size_t len)
+{
+    if (strlen(buf) != len || !json_depth_ok(buf, JSON_MAX_DEPTH))
+    {
+        return NULL;
+    }
+    return cJSON_ParseWithOpts(buf, NULL, true);
+}
+
+/* Replace path with len bytes of buf: write path.tmp, then rename it over
+ * path (atomic on LittleFS), so a failed save leaves the old file in place. */
+static bool save_file_atomic(const char *path, const char *buf, size_t len)
+{
+    char tmp[64];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+
+    FILE *f = fopen(tmp, "w");
+    if (f == NULL)
+    {
+        ESP_LOGE(TAG, "Can't create %s (errno %d)", tmp, errno);
+        return false;
+    }
+    bool ok = fwrite(buf, 1, len, f) == len;
+    ok = (fclose(f) == 0) && ok;
+    if (!ok || rename(tmp, path) != 0)
+    {
+        ESP_LOGE(TAG, "Failed to save %s (errno %d)", path, errno);
+        unlink(tmp);
+        return false;
+    }
+    return true;
+}
+
+/* What config_server_load_cfg() needs from each key it copies with strcpy:
+ * a required key that is missing resets the whole config to defaults at
+ * boot, and a value that is not a string or doesn't fit its field crashes or
+ * overflows there. Keep in step with config_server_load_cfg(). */
+#define CFG_FIELD_MAX(field)    (sizeof(device_config.field) - 1)
+#define CFG_REQUIRED(field)     { #field, 0, CFG_FIELD_MAX(field), true }
+#define CFG_OPTIONAL(field)     { #field, 0, CFG_FIELD_MAX(field), false }
+
+static const struct
+{
+    const char *key;
+    size_t min_len;
+    size_t max_len;
+    bool required;
+} config_keys[] = {
+    CFG_REQUIRED(wifi_mode),
+    CFG_REQUIRED(ap_ch),
+    { "sta_ssid", 1, 32, true },
+    // 63: the page's limit, and the longest WPA passphrase
+    { "sta_pass", 8, 63, true },
+    CFG_REQUIRED(can_datarate),
+    CFG_REQUIRED(can_mode),
+    CFG_REQUIRED(port_type),
+    CFG_REQUIRED(port),
+    { "ap_pass", 8, 63, true },
+    { "protocol", 2, 64, true },
+    { "ble_pass", 4, 16, true },
+    CFG_REQUIRED(sleep_status),
+    CFG_REQUIRED(ble_status),
+    CFG_REQUIRED(sleep_volt),
+    CFG_REQUIRED(batt_alert),
+    CFG_REQUIRED(batt_alert_ssid),
+    CFG_REQUIRED(batt_alert_pass),
+    CFG_REQUIRED(batt_alert_volt),
+    CFG_REQUIRED(batt_alert_protocol),
+    CFG_REQUIRED(batt_alert_url),
+    CFG_REQUIRED(batt_alert_port),
+    CFG_REQUIRED(batt_alert_topic),
+    CFG_REQUIRED(batt_mqtt_user),
+    CFG_REQUIRED(batt_mqtt_pass),
+    CFG_REQUIRED(batt_alert_time),
+    CFG_REQUIRED(mqtt_en),
+    CFG_REQUIRED(mqtt_url),
+    CFG_REQUIRED(mqtt_port),
+    CFG_REQUIRED(mqtt_user),
+    CFG_REQUIRED(mqtt_pass),
+    CFG_REQUIRED(mqtt_elm327_log),
+    CFG_REQUIRED(precon_mode),
+    CFG_REQUIRED(precon_button),
+    CFG_OPTIONAL(precon_press),
+    CFG_REQUIRED(mqtt_tx_topic),
+    CFG_OPTIONAL(mqtt_tx_en),
+    CFG_OPTIONAL(mqtt_rx_en),
+    { "mqtt_rx_topic", 1, CFG_FIELD_MAX(mqtt_rx_topic), true },
+    { "mqtt_status_topic", 1, CFG_FIELD_MAX(mqtt_status_topic), true },
+    CFG_OPTIONAL(wakeup_volt),
+    CFG_OPTIONAL(sleep_time),
+    CFG_OPTIONAL(sta_security),
+    CFG_OPTIONAL(ap_auto_disable),
+    CFG_OPTIONAL(keep_alive),
+};
+
+/* NULL if root is a config config_server_load_cfg() will take, else the
+ * first key that is wrong. */
+static const char *config_invalid_key(const cJSON *root)
+{
+    if (!cJSON_IsObject(root))
+    {
+        return "(not an object)";
+    }
+    for (size_t i = 0; i < sizeof(config_keys) / sizeof(config_keys[0]); i++)
+    {
+        const cJSON *key = cJSON_GetObjectItem(root, config_keys[i].key);
+        if (key == NULL)
+        {
+            if (config_keys[i].required)
+            {
+                return config_keys[i].key;
+            }
+            continue;
+        }
+        if (!cJSON_IsString(key) || key->valuestring == NULL ||
+            strlen(key->valuestring) < config_keys[i].min_len ||
+            strlen(key->valuestring) > config_keys[i].max_len)
+        {
+            return config_keys[i].key;
+        }
+    }
+    return NULL;
+}
+
 static esp_err_t store_config_handler(httpd_req_t *req)
 {
-    char *buf = NULL;
-    size_t buf_size = req->content_len;
-
-    if (buf_size <= 0)
+    esp_err_t ret;
+    char *buf = recv_body(req, CONFIG_MAX_LEN, &ret);
+    if (buf == NULL)
     {
-        return ESP_FAIL; // Invalid content length
+        return ret;
     }
 
-    buf = (char *)malloc(buf_size);
-    if (!buf)
+    // A config.json that config_server_load_cfg() rejects is replaced by
+    // the defaults at boot, so never save one
+    cJSON *root = parse_body_json(buf, req->content_len);
+    const char *bad_key = root != NULL ? config_invalid_key(root) : "(invalid JSON)";
+    if (bad_key != NULL)
     {
-        return ESP_ERR_NO_MEM; // Memory allocation failure
-    }
-
-    int ret = recv_full(req, buf, buf_size);
-
-    if (ret <= 0)
-    {
-        if (ret == HTTPD_SOCK_ERR_TIMEOUT)
-        {
-            // Timed out waiting for the rest of the body
-            free(buf);
-            return ESP_FAIL;
-        }
-        // Handle read error
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Invalid configuration: %s", bad_key);
+        ESP_LOGE(TAG, "%s", msg);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
+        cJSON_Delete(root);
         free(buf);
-        return ESP_FAIL;
+        return ESP_OK;
     }
+    cJSON_Delete(root);
 
-    FILE *f = fopen(FS_MOUNT_POINT"/config.json", "w");
-    if (f)
-    {
-        // Write the received data into the file
-        fwrite(buf, 1, buf_size, f);
-        fclose(f);
-    }
-    else
-    {
-        // Handle file open error
-        free(buf);
-        return ESP_FAIL;
-    }
-
-    // Free dynamically allocated memory
+    bool saved = save_file_atomic(FS_MOUNT_POINT"/config.json", buf, req->content_len);
     free(buf);
+    if (!saved)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save configuration");
+        return ESP_OK;
+    }
 
     const char *resp_str = "Configuration saved! Rebooting...";
     httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
 
-    xTimerStart( xrestartTimer, 0 );
+    if (xTimerStart(xrestartTimer, 0) != pdPASS)
+    {
+        ESP_LOGE(TAG, "Couldn't start the restart timer");
+    }
     return ESP_OK;
 }
 
