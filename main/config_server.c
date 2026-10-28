@@ -3281,27 +3281,44 @@ int8_t config_server_get_ap_auto_disable(void)
 
 void config_server_set_ble_config(uint8_t b)
 {
-	cJSON * root;
-	root = cJSON_Parse(device_config_file);
-	if(b == 1)
+	if (b > 1)
 	{
-		cJSON_SetValuestring(cJSON_GetObjectItem(root,"ble_status"), "enable");
+		return;
 	}
-	else if(b==0)
+	// device_config_file is the config read at boot: once a save has started
+	// the restart timer, it may no longer be what's on disk.
+	if (xTimerIsTimerActive(xrestartTimer))
 	{
-		cJSON_SetValuestring(cJSON_GetObjectItem(root,"ble_status"), "disable");
+		ESP_LOGW(TAG, "Restart pending, BLE setting not saved");
+		return;
 	}
-	const char *resp_str = cJSON_Print(root);
+	const char *status = b ? "enable" : "disable";
+	if (strcmp(device_config.ble_status, status) == 0)
+	{
+		return;
+	}
+
+	cJSON *root = cJSON_Parse(device_config_file);
+	if (root == NULL || cJSON_SetValuestring(cJSON_GetObjectItem(root, "ble_status"), status) == NULL)
+	{
+		ESP_LOGE(TAG, "Failed to update ble_status");
+		cJSON_Delete(root);
+		return;
+	}
+	char *resp_str = cJSON_Print(root);
+	cJSON_Delete(root);
+	if (resp_str == NULL)
+	{
+		ESP_LOGE(TAG, "Failed to print config");
+		return;
+	}
 	ESP_LOGI(TAG, "resp_str:%s", resp_str);
-	FILE* f = fopen(FS_MOUNT_POINT"/config.json", "w");
-	if (f != NULL)
+	bool saved = save_file_atomic(FS_MOUNT_POINT"/config.json", resp_str, strlen(resp_str));
+	free(resp_str);
+	if (saved && xTimerStart(xrestartTimer, 0) != pdPASS)
 	{
-		fprintf(f, resp_str);
-		fclose(f);
+		ESP_LOGE(TAG, "Couldn't start the restart timer");
 	}
-	xTimerStart( xrestartTimer, 0 );
-	free((void *)resp_str);
-    cJSON_Delete(root);
 }
 
 int8_t config_server_precon_button(void)
