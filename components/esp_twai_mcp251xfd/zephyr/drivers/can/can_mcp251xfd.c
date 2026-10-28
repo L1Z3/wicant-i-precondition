@@ -176,6 +176,7 @@ static int mcp251xfd_fifo_write(const struct device *dev, int mailbox_idx,
 	}
 
 	/* check if fifo is full */
+	// LOCAL PATCH: the TX FIFO's not-full flag rather than TXQNIF.
 	if (!(regs[0] & MCP251XFD_REG_FIFOSTA_TFNRFNIF)) {
 		return -ENOMEM;
 	}
@@ -196,6 +197,7 @@ static int mcp251xfd_fifo_write(const struct device *dev, int mailbox_idx,
 	}
 
 	reg_byte = mcp251xfd_get_spi_buf_ptr(dev);
+	// LOCAL PATCH: TX FIFO instead of TXQ (see MCP251XFD_TX_FIFO_IDX).
 	*reg_byte = MCP251XFD_UINT32_FLAG_TO_BYTE_MASK(MCP251XFD_REG_FIFOCON_UINC |
 						       MCP251XFD_REG_FIFOCON_TXREQ);
 
@@ -792,7 +794,7 @@ static int mcp251xfd_handle_fifo_read(const struct device *dev, const struct mcp
 	// LOCAL PATCH: MCP2518FD erratum DS80000789 #6. A read of FIFOSTA.FIFOCI
 	// for an RX FIFO can return a wrong value with a matching CRC.
 	// Workaround: don't use FIFOCI: read RX one message at a time from
-	// FIFOSTA/UA, like TEF. (The interrupt loop calls back while RXIF remains set.) 
+	// FIFOSTA/UA, like TEF. (The interrupt loop calls back while RXIF remains set.)
 	// Errata:
 	// https://ww1.microchip.com/downloads/aemDocuments/documents/APID/ProductDocuments/Errata/MCP2518FD-Silicon-Errata-and-Data-Sheet-Clarification-DS80000789.pdf
 	if (fifo_type == MCP251XFD_FIFO_TYPE_RX || fifo_type == MCP251XFD_FIFO_TYPE_TEF) {
@@ -1055,6 +1057,7 @@ static void mcp251xfd_handle_interrupts(const struct device *dev)
 	bool state_pending = false;
 
 	while (1) {
+		// LOCAL PATCH: whether this pass read an RX or TEF object (see below).
 		bool progress = false;
 
 		k_mutex_lock(&dev_data->mutex, K_FOREVER);
@@ -1099,6 +1102,7 @@ static void mcp251xfd_handle_interrupts(const struct device *dev)
 			if (ret < 0) {
 				LOG_ERR("Error handling RXIF [%d]", ret);
 			} else if (ret > 0) {
+				// LOCAL PATCH: an object was read.
 				progress = true;
 			}
 		}
@@ -1109,6 +1113,7 @@ static void mcp251xfd_handle_interrupts(const struct device *dev)
 			if (ret < 0) {
 				LOG_ERR("Error handling TEFIF [%d]", ret);
 			} else if (ret > 0) {
+				// LOCAL PATCH: an object was read.
 				progress = true;
 			}
 		}
@@ -1132,6 +1137,7 @@ static void mcp251xfd_handle_interrupts(const struct device *dev)
 		 * On the MCP2527FD and MCP2518FD, we don't get a CERRIF IRQ on the transition
 		 * TX ERROR_WARNING -> TX ERROR_ACTIVE.
 		 */
+		// LOCAL PATCH: also retry a failed state read (state_pending).
 		if ((reg_int & MCP251XFD_REG_INT_CERRIF) ||
 		    dev_data->state > CAN_STATE_ERROR_ACTIVE || state_pending) {
 			ret = mcp251xfd_handle_cerrif(dev);
@@ -1173,6 +1179,9 @@ check_int_pin:
 			/* All interrupt flags handled */
 			break;
 		} else if (consecutive_calls >= MCP251XFD_MAX_INT_HANDLER_CALLS) {
+			// LOCAL PATCH: progress resets consecutive_calls, so compare
+			// and reset here instead of upstream's
+			// consecutive_calls % MCP251XFD_MAX_INT_HANDLER_CALLS == 0.
 			consecutive_calls = 0;
 			/* If there are clock problems, then MODIF cannot be cleared. */
 			/* This is detected if there are too many consecutive calls. */
@@ -1616,6 +1625,8 @@ static int mcp251xfd_init(const struct device *dev)
 		return -EINVAL;
 	}
 
+	// LOCAL PATCH: upstream enabled INT's interrupt here; it is now enabled at
+	// the end of mcp251xfd_init(), once the controller is set up.
 	k_thread_create(&dev_data->int_thread, dev_data->int_thread_stack,
 			CONFIG_CAN_MCP251XFD_INT_THREAD_STACK_SIZE,
 			(k_thread_entry_t)mcp251xfd_int_thread, (void *)dev, NULL, NULL,
