@@ -1541,8 +1541,10 @@ static int mcp251xfd_init_tscon(const struct device *dev)
 static int mcp251xfd_reset(const struct device *dev)
 {
 	const struct mcp251xfd_config *dev_cfg = dev->config;
-	uint16_t cmd = sys_cpu_to_be16(MCP251XFD_SPI_INSTRUCTION_RESET);
-	const struct spi_buf tx_buf = {.buf = &cmd, .len = sizeof(cmd),};
+	// LOCAL PATCH: padded to a word. The SPI transfer copies its buffer in
+	// 4-byte words, so a lone uint16_t would be over-read by 2 bytes.
+	uint16_t cmd[2] = {sys_cpu_to_be16(MCP251XFD_SPI_INSTRUCTION_RESET)};
+	const struct spi_buf tx_buf = {.buf = cmd, .len = sizeof(cmd[0]),};
 	const struct spi_buf_set tx = {.buffers = &tx_buf, .count = 1};
 	int ret;
 
