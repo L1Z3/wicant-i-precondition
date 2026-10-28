@@ -19,7 +19,41 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(can_mcp251xfd, CONFIG_CAN_LOG_LEVEL);
 
-static inline int mcp251xfd_init_int_reg(const struct device *dev);
+// LOCAL PATCH: bring-up diagnostics. Timings and rate-limited logs only.
+#include "esp_timer.h"
+
+static uint32_t s_log_read_reg;
+static uint32_t s_log_read_crc;
+static uint32_t s_log_write;
+static uint32_t s_log_tx_not_started;
+static uint32_t s_log_tx_busoff;
+static uint32_t s_log_tx_timeout;
+static uint32_t s_log_tx_fifo_full;
+static uint32_t s_log_tx_fifo_write;
+static uint32_t s_log_empty_fifo;
+static uint32_t s_log_ua;
+static uint32_t s_log_backoff;
+
+// First `first` events, then every `every`-th event. Not atomic: diagnostics
+// only, and the worst case is an extra log line.
+static bool mcp251xfd_diag_log(uint32_t *counter, uint32_t first, uint32_t every)
+{
+	uint32_t n = ++(*counter);
+
+	return n <= first || (every != 0U && (n % every) == 0U);
+}
+
+static const char *mcp251xfd_state_name(enum can_state state)
+{
+	switch (state) {
+	case CAN_STATE_ERROR_ACTIVE: return "active";
+	case CAN_STATE_ERROR_WARNING: return "warning";
+	case CAN_STATE_ERROR_PASSIVE: return "error-passive";
+	case CAN_STATE_BUS_OFF: return "bus-off";
+	case CAN_STATE_STOPPED: return "stopped";
+	default: return "?";
+	}
+}
 
 static void mcp251xfd_canframe_to_txobj(const struct can_frame *src, int mailbox_idx,
 					struct mcp251xfd_txobj *dst)
@@ -76,6 +110,9 @@ static void *mcp251xfd_read_reg(const struct device *dev, uint16_t addr, int len
 
 	ret = spi_transceive_dt(&dev_cfg->bus, &tx, &rx);
 	if (ret < 0) {
+		if (mcp251xfd_diag_log(&s_log_read_reg, 10, 1000)) {
+			LOG_ERR("diag: read_reg(0x%03x,%d) SPI error %d", addr, len, ret);
+		}
 		return NULL;
 	}
 
@@ -89,6 +126,8 @@ static void *mcp251xfd_read_crc(const struct device *dev, uint16_t addr, int len
 	struct mcp251xfd_spi_data *spi_data = &dev_data->spi_data;
 	int num_retries = CONFIG_CAN_MCP251XFD_READ_CRC_RETRIES + 1;
 	int ret;
+	int last_err = 0;
+	uint16_t last_crc = 0;
 
 	while (num_retries-- > 0) {
 		uint16_t crc_in, crc, spi_cmd;
@@ -120,6 +159,7 @@ static void *mcp251xfd_read_crc(const struct device *dev, uint16_t addr, int len
 
 		ret = spi_transceive_dt(&dev_cfg->bus, &tx, &rx);
 		if (ret < 0) {
+			last_err = ret;
 			continue;
 		}
 
@@ -129,8 +169,16 @@ static void *mcp251xfd_read_crc(const struct device *dev, uint16_t addr, int len
 		if (crc == 0) {
 			return &spi_data->buf[0];
 		}
+		last_crc = crc;
 	}
 
+	// A dead SPI link shows up here first: addr says which register path is
+	// failing (INT reads are per-interrupt, FIFO reads per frame).
+	if (mcp251xfd_diag_log(&s_log_read_crc, 20, 1000)) {
+		LOG_ERR("diag: read_crc(0x%03x,%d) failed after %d retries "
+			"(last crc=0x%04x, last spi err=%d)",
+			addr, len, CONFIG_CAN_MCP251XFD_READ_CRC_RETRIES + 1, last_crc, last_err);
+	}
 	return NULL;
 }
 
@@ -155,7 +203,11 @@ static int mcp251xfd_write(const struct device *dev, uint16_t addr, int len)
 	spi_cmd = sys_cpu_to_be16(MCP251XFD_SPI_INSTRUCTION_WRITE | addr);
 	memcpy(&spi_data->header[1], &spi_cmd, sizeof(spi_cmd));
 
-	return spi_write_dt(&dev_cfg->bus, &tx);
+	int ret = spi_write_dt(&dev_cfg->bus, &tx);
+	if (ret < 0 && mcp251xfd_diag_log(&s_log_write, 10, 1000)) {
+		LOG_ERR("diag: write(0x%03x,%d) SPI error %d", addr, len, ret);
+	}
+	return ret;
 }
 
 static int mcp251xfd_fifo_write(const struct device *dev, int mailbox_idx,
@@ -179,6 +231,10 @@ static int mcp251xfd_fifo_write(const struct device *dev, int mailbox_idx,
 
 	/* check if fifo is full */
 	if (!(regs[0] & MCP251XFD_REG_FIFOSTA_TFNRFNIF)) {
+		if (mcp251xfd_diag_log(&s_log_tx_fifo_full, 10, 1000)) {
+			LOG_WRN("diag: TX FIFO full (fifosta=0x%08x, ua=0x%03x, mailbox=%d, id=0x%x)",
+				regs[0], regs[1], mailbox_idx, msg->id);
+		}
 		return -ENOMEM;
 	}
 
@@ -498,10 +554,22 @@ static int mcp251xfd_send(const struct device *dev, const struct can_frame *msg,
 		msg->flags & CAN_FRAME_BRS ? "BRS" : "");
 
 	if (!dev_data->common.started) {
+		if (mcp251xfd_diag_log(&s_log_tx_not_started, 5, 1000)) {
+			LOG_WRN("diag: TX while stopped (state=%s, id=0x%x)",
+				mcp251xfd_state_name(dev_data->state), msg->id);
+		}
 		return -ENETDOWN;
 	}
 
 	if (dev_data->state == CAN_STATE_BUS_OFF) {
+		// This is the state that survives controller_reset()/start(): if it
+		// is still set here long after a recovery, the MODIF-triggered state
+		// refresh was missed and every frame is being dropped.
+		if (mcp251xfd_diag_log(&s_log_tx_busoff, 10, 1000)) {
+			LOG_WRN("diag: TX refused, driver state still bus-off "
+				"(started=%d, mailbox_usage=0x%08x, id=0x%x)",
+				dev_data->common.started, dev_data->mailbox_usage, msg->id);
+		}
 		return -ENETUNREACH;
 	}
 
@@ -515,6 +583,10 @@ static int mcp251xfd_send(const struct device *dev, const struct can_frame *msg,
 	}
 
 	if (k_sem_take(&dev_data->tx_sem, timeout) != 0) {
+		if (mcp251xfd_diag_log(&s_log_tx_timeout, 10, 1000)) {
+			LOG_WRN("diag: TX timeout waiting for a mailbox (state=%s, usage=0x%08x)",
+				mcp251xfd_state_name(dev_data->state), dev_data->mailbox_usage);
+		}
 		return -EAGAIN;
 	}
 
@@ -529,6 +601,8 @@ static int mcp251xfd_send(const struct device *dev, const struct can_frame *msg,
 	if (mailbox_idx >= MCP251XFD_TX_QUEUE_ITEMS) {
 		k_sem_give(&dev_data->tx_sem);
 		ret = -EIO;
+		LOG_ERR("diag: no free mailbox despite tx_sem (usage=0x%08x)",
+			dev_data->mailbox_usage);
 		goto done;
 	}
 
@@ -538,6 +612,12 @@ static int mcp251xfd_send(const struct device *dev, const struct can_frame *msg,
 	ret = mcp251xfd_fifo_write(dev, mailbox_idx, msg);
 
 	if (ret < 0) {
+		if (mcp251xfd_diag_log(&s_log_tx_fifo_write, 10, 1000)) {
+			LOG_ERR("diag: TX FIFO write failed for mailbox %d: %d "
+				"(state=%s, usage=0x%08x)",
+				mailbox_idx, ret, mcp251xfd_state_name(dev_data->state),
+				dev_data->mailbox_usage);
+		}
 		dev_data->mailbox_usage &= ~BIT(mailbox_idx);
 		dev_data->mailbox[mailbox_idx].cb = NULL;
 		k_sem_give(&dev_data->tx_sem);
@@ -559,6 +639,10 @@ static int mcp251xfd_add_rx_filter(const struct device *dev, can_rx_callback_t r
 	int ret;
 
 	k_mutex_lock(&dev_data->mutex, K_FOREVER);
+
+	LOG_INF("diag: add_rx_filter: id=0x%x mask=0x%x ext=%d usage=0x%08x",
+		filter->id, filter->mask, (filter->flags & CAN_FILTER_IDE) != 0,
+		dev_data->filter_usage);
 
 	for (filter_idx = 0; filter_idx < CONFIG_CAN_MCP251XFD_MAX_FILTERS ; filter_idx++) {
 		if ((BIT(filter_idx) & dev_data->filter_usage) == 0) {
@@ -619,6 +703,8 @@ static int mcp251xfd_add_rx_filter(const struct device *dev, can_rx_callback_t r
 	dev_data->filter[filter_idx] = *filter;
 	dev_data->rx_cb[filter_idx] = rx_cb;
 	dev_data->cb_arg[filter_idx] = cb_arg;
+	LOG_INF("diag: add_rx_filter: installed at index %d, FBP=%u, usage=0x%08x",
+		filter_idx, MCP251XFD_RX_FIFO_IDX, dev_data->filter_usage);
 
 done:
 	k_mutex_unlock(&dev_data->mutex);
@@ -639,6 +725,9 @@ static void mcp251xfd_remove_rx_filter(const struct device *dev, int filter_idx)
 	}
 
 	k_mutex_lock(&dev_data->mutex, K_FOREVER);
+
+	LOG_INF("diag: remove_rx_filter: index=%d usage=0x%08x", filter_idx,
+		dev_data->filter_usage);
 
 	reg_byte = mcp251xfd_get_spi_buf_ptr(dev);
 	*reg_byte = 0;
@@ -766,18 +855,71 @@ static int mcp251xfd_handle_fifo_read(const struct device *dev, const struct mcp
 	fifosta = sys_le32_to_cpu(regs[0]);
 	ua = sys_le32_to_cpu(regs[1]);
 
+	// LOCAL PATCH: diagnose RX/TEF FIFO overruns. RXOVIE/TEFOVIE are not
+	// enabled in this build (CONFIG_CAN_STATS is off), so the flags would
+	// otherwise be set once and never seen or cleared.
+	if ((fifo_type == MCP251XFD_FIFO_TYPE_RX) &&
+	    ((fifosta & MCP251XFD_REG_FIFOSTA_RXOVIF) != 0U)) {
+		dev_data->rx_overflow_count++;
+		LOG_WRN("diag: RX FIFO overflow #%u (fifosta=0x%08x, ua=0x%03x)",
+			dev_data->rx_overflow_count, fifosta, ua);
+		reg_byte = mcp251xfd_get_spi_buf_ptr(dev);
+		*reg_byte = 0;
+		int cret = mcp251xfd_write(dev, MCP251XFD_REG_FIFOSTA(MCP251XFD_RX_FIFO_IDX), 1);
+		if (cret < 0) {
+			LOG_ERR("diag: failed to clear RXOVIF: %d", cret);
+		}
+	}
+	if ((fifo_type == MCP251XFD_FIFO_TYPE_TEF) &&
+	    ((fifosta & MCP251XFD_REG_TEFSTA_TEFOVIF) != 0U)) {
+		dev_data->tef_overflow_count++;
+		LOG_WRN("diag: TEF FIFO overflow #%u (tefsta=0x%08x, ua=0x%03x)",
+			dev_data->tef_overflow_count, fifosta, ua);
+		reg_byte = mcp251xfd_get_spi_buf_ptr(dev);
+		*reg_byte = 0;
+		int cret = mcp251xfd_write(dev, MCP251XFD_REG_TEFSTA, 1);
+		if (cret < 0) {
+			LOG_ERR("diag: failed to clear TEFOVIF: %d", cret);
+		}
+	}
+
 	/* is there any data in the fifo? */
 	if (!(fifosta & MCP251XFD_REG_FIFOSTA_TFNRFNIF)) {
+		// The interrupt handler calls this only for a set RXIF/TEFIF. An
+		// empty FIFO here means the interrupt loop is making "progress" on
+		// stale flags; it resets the back-off and can spin.
+		if (mcp251xfd_diag_log(&s_log_empty_fifo, 10, 1000)) {
+			LOG_WRN("diag: %s FIFO empty although the caller expected data "
+				"(fifosta=0x%08x)",
+				fifo_type == MCP251XFD_FIFO_TYPE_RX ? "RX" : "TEF", fifosta);
+		}
 		goto done;
 	}
 
 	fifo_tail_addr = ua;
 	fifo_tail_index = (fifo_tail_addr - fifo->ram_start_addr) / fifo->item_size;
 
+	// The driver derives the read address from FIFOUA and its assumed FIFO
+	// start address. An unaligned UA (or one below the assumed start) means
+	// the RAM layout differs from what the driver reserved -- for example
+	// because the unused FIFO 0 still consumes a message slot. This is
+	// informational only: the address formula still reconstructs UA when the
+	// difference is a whole number of items, so do not fail the read.
+	if ((fifo_tail_addr < fifo->ram_start_addr) ||
+	    (((fifo_tail_addr - fifo->ram_start_addr) % fifo->item_size) != 0U)) {
+		if (mcp251xfd_diag_log(&s_log_ua, 10, 1000)) {
+			LOG_ERR("diag: %s FIFO UA/layout mismatch: ua=0x%03x start=0x%03x "
+				"item=%u capacity=%u index=%u (read address still uses UA)",
+				fifo_type == MCP251XFD_FIFO_TYPE_RX ? "RX" : "TEF",
+				ua, fifo->ram_start_addr, fifo->item_size, fifo->capacity,
+				fifo_tail_index);
+		}
+	}
+
 	// LOCAL PATCH: MCP2518FD erratum DS80000789 #6. A read of FIFOSTA.FIFOCI
 	// for an RX FIFO can return a wrong value with a matching CRC.
 	// Workaround: don't use FIFOCI: read RX one message at a time from
-	// FIFOSTA/UA, like TEF. (The interrupt loop calls back while RXIF remains set.) 
+	// FIFOSTA/UA, like TEF. (The interrupt loop calls back while RXIF remains set.)
 	// Errata:
 	// https://ww1.microchip.com/downloads/aemDocuments/documents/APID/ProductDocuments/Errata/MCP2518FD-Silicon-Errata-and-Data-Sheet-Clarification-DS80000789.pdf
 	if (fifo_type == MCP251XFD_FIFO_TYPE_RX || fifo_type == MCP251XFD_FIFO_TYPE_TEF) {
@@ -888,8 +1030,15 @@ static int mcp251xfd_handle_cerrif(const struct device *dev)
 		goto done;
 	}
 
-	LOG_INF("State %d -> %d (tx: %d, rx: %d)", dev_data->state, new_state, err_cnt.tx_err_cnt,
-		err_cnt.rx_err_cnt);
+	if ((new_state == CAN_STATE_ERROR_PASSIVE) || (new_state == CAN_STATE_BUS_OFF)) {
+		LOG_WRN("diag: state %s -> %s (TEC=%u, REC=%u, started=%d) - recovery candidate",
+			mcp251xfd_state_name(dev_data->state), mcp251xfd_state_name(new_state),
+			err_cnt.tx_err_cnt, err_cnt.rx_err_cnt, dev_data->common.started);
+	} else {
+		LOG_INF("diag: state %s -> %s (TEC=%u, REC=%u)",
+			mcp251xfd_state_name(dev_data->state), mcp251xfd_state_name(new_state),
+			err_cnt.tx_err_cnt, err_cnt.rx_err_cnt);
+	}
 
 	/* Upon entering bus-off, all the fifos are reset. */
 	dev_data->state = new_state;
@@ -1030,36 +1179,30 @@ static void mcp251xfd_handle_interrupts(const struct device *dev)
 	const struct mcp251xfd_config *dev_cfg = dev->config;
 	struct mcp251xfd_data *dev_data = dev->data;
 	uint16_t *reg_int_hw;
-	uint32_t reg_int;
+	uint32_t reg_int = 0;
 	int ret;
 	uint8_t consecutive_calls = 0;
 	// LOCAL PATCH: a state read failed after CERRIF was cleared (see below).
 	bool state_pending = false;
 
+	// LOCAL PATCH: can_stop()/controller_sleep() set started=false before the
+	// controller enters its low-power transition. A GPIO edge that was
+	// already queued can still run this handler; reading INT then races with
+	// the sleep sequence and returns a CRC error from the sleeping part.
+	if (!dev_data->common.started) {
+		return;
+	}
+
 	while (1) {
 		bool progress = false;
 
-		k_mutex_lock(&dev_data->mutex, K_FOREVER);
-		// LOCAL PATCH: controller_sleep() marks the device suspended while
-		// holding this mutex before entering Low Power Mode. A GPIO edge that
-		// was already queued can still run this handler; checking here keeps
-		// the read out of the sleeping controller.
-		if (dev_data->int_suspended) {
-			k_mutex_unlock(&dev_data->mutex);
-			break;
-		}
+		// A stop can happen while this loop is draining a burst; check
+		// again before each register read, not just at function entry.
 		if (!dev_data->common.started) {
-			// LOCAL PATCH: clear the flags and disable the interrupt enables
-			// without dispatching anything. A stopped controller can still
-			// assert INT (entering Configuration mode sets MODIF); re-enabling
-			// the level interrupt with that flag set would retrigger forever.
-			// mcp251xfd_start() restores the enables.
-			uint32_t *reg = mcp251xfd_get_spi_buf_ptr(dev);
-			*reg = 0;
-			(void)mcp251xfd_write(dev, MCP251XFD_REG_INT, MCP251XFD_REG_SIZE);
-			k_mutex_unlock(&dev_data->mutex);
 			break;
 		}
+
+		k_mutex_lock(&dev_data->mutex, K_FOREVER);
 		reg_int_hw = mcp251xfd_read_crc(dev, MCP251XFD_REG_INT, sizeof(*reg_int_hw));
 
 		if (!reg_int_hw) {
@@ -1088,18 +1231,6 @@ static void mcp251xfd_handle_interrupts(const struct device *dev)
 		}
 
 		k_mutex_unlock(&dev_data->mutex);
-
-		// A stop can happen while this loop is draining a burst. Do not
-		// dispatch handlers against a stopped controller; disable its
-		// interrupt enables and let the next start restore them.
-		if (!dev_data->common.started) {
-			k_mutex_lock(&dev_data->mutex, K_FOREVER);
-			uint32_t *reg = mcp251xfd_get_spi_buf_ptr(dev);
-			*reg = 0;
-			(void)mcp251xfd_write(dev, MCP251XFD_REG_INT, MCP251XFD_REG_SIZE);
-			k_mutex_unlock(&dev_data->mutex);
-			break;
-		}
 
 		if ((reg_int & MCP251XFD_REG_INT_RXIF) != 0) {
 			ret = mcp251xfd_handle_fifo_read(dev, &dev_cfg->rx_fifo,
@@ -1180,6 +1311,14 @@ check_int_pin:
 			/* All interrupt flags handled */
 			break;
 		} else if (consecutive_calls >= MCP251XFD_MAX_INT_HANDLER_CALLS) {
+			if (mcp251xfd_diag_log(&s_log_backoff, 10, 1000)) {
+				LOG_WRN("diag: INT still active with no progress after %u passes "
+					"(int_pin=%d, reg_int=0x%08x, state_pending=%d, "
+					"started=%d, state=%s); backing off",
+					consecutive_calls, ret, reg_int, state_pending,
+					dev_data->common.started,
+					mcp251xfd_state_name(dev_data->state));
+			}
 			consecutive_calls = 0;
 			/* If there are clock problems, then MODIF cannot be cleared. */
 			/* This is detected if there are too many consecutive calls. */
@@ -1200,7 +1339,7 @@ static void mcp251xfd_int_thread(const struct device *dev)
 		k_sem_take(&dev_data->int_sem, K_FOREVER);
 		mcp251xfd_handle_interrupts(dev);
 
-		/* Re-enable pin interrupts unless the adapter is putting the
+		/* Re-enable pin interrupts, unless the adapter is putting the
 		 * controller to sleep. Holding the driver mutex makes this
 		 * check+enable atomic with controller_sleep()'s set+disable. */
 		k_mutex_lock(&dev_data->mutex, K_FOREVER);
@@ -1255,8 +1394,16 @@ static int mcp251xfd_start(const struct device *dev)
 	int ret;
 
 	if (dev_data->common.started) {
+		LOG_WRN("diag: start ignored, already started (state=%s)",
+			mcp251xfd_state_name(dev_data->state));
 		return -EALREADY;
 	}
+
+	// The driver state is not reset by stop()/reset(): log it here so a
+	// stale bus-off flag is visible in the next recovery log.
+	LOG_INF("diag: start: state=%s started=%d next_mode=%u mailbox_usage=0x%08x",
+		mcp251xfd_state_name(dev_data->state), dev_data->common.started,
+		dev_data->next_mcp251xfd_mode, dev_data->mailbox_usage);
 
 	/* in case of a race between mcp251xfd_send() and mcp251xfd_stop() */
 	mcp251xfd_reset_tx_fifos(dev, -ENETDOWN);
@@ -1273,18 +1420,6 @@ static int mcp251xfd_start(const struct device *dev)
 
 	CAN_STATS_RESET(dev);
 
-	// A stopped controller disables its interrupt enables so a pending INT
-	// cannot livelock the thread. Restore them before going back on bus.
-	ret = mcp251xfd_init_int_reg(dev);
-	if (ret < 0) {
-		LOG_ERR("Failed to enable interrupts [%d]", ret);
-		k_mutex_unlock(&dev_data->mutex);
-		if (dev_cfg->common.phy != NULL) {
-			(void)can_transceiver_disable(dev_cfg->common.phy);
-		}
-		return ret;
-	}
-
 	ret = mcp251xfd_set_mode_internal(dev, dev_data->next_mcp251xfd_mode);
 	if (ret < 0) {
 		LOG_ERR("Failed to set the mode [%d]", ret);
@@ -1294,6 +1429,8 @@ static int mcp251xfd_start(const struct device *dev)
 		}
 	} else {
 		dev_data->common.started = true;
+		LOG_INF("diag: start: started, state=%s (mode request %u)",
+			mcp251xfd_state_name(dev_data->state), dev_data->next_mcp251xfd_mode);
 	}
 
 	k_mutex_unlock(&dev_data->mutex);
@@ -1309,8 +1446,13 @@ static int mcp251xfd_stop(const struct device *dev)
 	int ret;
 
 	if (!dev_data->common.started) {
+		LOG_WRN("diag: stop ignored, not started (state=%s, mailbox_usage=0x%08x)",
+			mcp251xfd_state_name(dev_data->state), dev_data->mailbox_usage);
 		return -EALREADY;
 	}
+
+	LOG_INF("diag: stop: state=%s mailbox_usage=0x%08x",
+		mcp251xfd_state_name(dev_data->state), dev_data->mailbox_usage);
 
 	k_mutex_lock(&dev_data->mutex, K_FOREVER);
 
@@ -1333,6 +1475,7 @@ static int mcp251xfd_stop(const struct device *dev)
 						 MCP251XFD_MODE_CHANGE_TIMEOUT_USEC,
 						 MCP251XFD_MODE_CHANGE_RETRIES, true);
 	if (ret < 0) {
+		LOG_ERR("diag: stop: abort wait failed (%d), controller left started", ret);
 		k_mutex_unlock(&dev_data->mutex);
 		return ret;
 	}
@@ -1346,6 +1489,8 @@ static int mcp251xfd_stop(const struct device *dev)
 	}
 
 	dev_data->common.started = false;
+	LOG_INF("diag: stop: stopped and in config mode (mailbox_usage=0x%08x, state=%s)",
+		dev_data->mailbox_usage, mcp251xfd_state_name(dev_data->state));
 	k_mutex_unlock(&dev_data->mutex);
 
 	if (dev_cfg->common.phy != NULL) {
@@ -1575,13 +1720,15 @@ static int mcp251xfd_reset(const struct device *dev)
 	/* device can only be reset when in configuration mode */
 	ret = mcp251xfd_set_mode_internal(dev, MCP251XFD_REG_CON_MODE_CONFIG);
 	if (ret < 0) {
+		LOG_ERR("diag: reset: request for config mode failed: %d", ret);
 		return ret;
 	}
 
-	ret = spi_write_dt(&dev_cfg->bus, &tx);
+	int spi_ret = spi_write_dt(&dev_cfg->bus, &tx);
 	/* Adding delay after init to fix occasional init issue. Delay time found experimentally. */
 	k_sleep(K_USEC(MCP251XFD_RESET_DELAY_USEC));
-	return ret;
+	LOG_INF("diag: reset: RESET command sent, spi_ret=%d", spi_ret);
+	return spi_ret;
 }
 
 static int mcp251xfd_init(const struct device *dev)
@@ -1597,6 +1744,10 @@ static int mcp251xfd_init(const struct device *dev)
 #endif
 
 	dev_data->dev = dev;
+	LOG_INF("diag: init: begin (osc=%u Hz, bitrate=%u, sample_point=%u, clko_div=%u, "
+		"pll=%d, xstby=%d)",
+		dev_cfg->osc_freq, dev_cfg->common.bitrate, dev_cfg->common.sample_point,
+		dev_cfg->clko_div, dev_cfg->pll_enable, dev_cfg->xstby_enable);
 
 	if (dev_cfg->clk_dev != NULL) {
 		uint32_t clk_id = dev_cfg->clk_id;
@@ -1653,6 +1804,15 @@ static int mcp251xfd_init(const struct device *dev)
 		return ret;
 	}
 
+	{
+		uint32_t core_clock = 0;
+
+		if (can_get_core_clock(dev, &core_clock) == 0) {
+			LOG_INF("diag: init: core clock=%u Hz (driver uses osc_freq for timing)",
+				core_clock);
+		}
+	}
+
 	ret = can_calc_timing(dev, &timing, dev_cfg->common.bitrate,
 			      dev_cfg->common.sample_point);
 	if (ret < 0) {
@@ -1660,9 +1820,9 @@ static int mcp251xfd_init(const struct device *dev)
 		return ret;
 	}
 
-	LOG_DBG("Presc: %d, BS1: %d, BS2: %d", timing.prescaler, timing.phase_seg1,
-		timing.phase_seg2);
-	LOG_DBG("Sample-point err : %d", ret);
+	LOG_INF("diag: init: prescaler=%u phase_seg1=%u phase_seg2=%u sjw=%u, "
+		"sample-point error=%d permille",
+		timing.prescaler, timing.phase_seg1, timing.phase_seg2, timing.sjw, ret);
 
 #if defined(CONFIG_CAN_FD_MODE)
 	ret = can_calc_timing_data(dev, &timing_data, dev_cfg->common.bitrate_data,
@@ -1685,6 +1845,9 @@ static int mcp251xfd_init(const struct device *dev)
 	*reg = sys_le32_to_cpu(*reg);
 
 	opmod = FIELD_GET(MCP251XFD_REG_CON_OPMOD_MASK, *reg);
+
+	LOG_INF("diag: init: CON=0x%08x OPMOD=%u (config=%u)", *reg, opmod,
+		MCP251XFD_REG_CON_MODE_CONFIG);
 
 	if (opmod != MCP251XFD_REG_CON_MODE_CONFIG) {
 		LOG_ERR("Device did not reset into configuration mode [%d]", opmod);
@@ -1741,14 +1904,22 @@ static int mcp251xfd_init(const struct device *dev)
 		return ret;
 	}
 
-	LOG_DBG("%d TX FIFOS: 1 element", MCP251XFD_TX_QUEUE_ITEMS);
-	LOG_DBG("1 RX FIFO: %d elements", MCP251XFD_RX_FIFO_ITEMS);
-	LOG_DBG("%db of %db RAM Allocated",
+	LOG_INF("diag: init: FIFOs TEF idx=0 items=%u item=%u size=%u | "
+		"TX idx=%u items=%u item=%u start=0x%03x size=%u | "
+		"RX idx=%u items=%u item=%u start=0x%03x size=%u (FIFO0 unused)",
+		MCP251XFD_TEF_FIFO_ITEMS, MCP251XFD_TEF_FIFO_ITEM_SIZE, MCP251XFD_TEF_FIFO_SIZE,
+		MCP251XFD_TX_FIFO_IDX, MCP251XFD_TX_QUEUE_ITEMS, MCP251XFD_TX_QUEUE_ITEM_SIZE,
+		MCP251XFD_TX_QUEUE_START_ADDR, MCP251XFD_TX_QUEUE_SIZE,
+		MCP251XFD_RX_FIFO_IDX, MCP251XFD_RX_FIFO_ITEMS, MCP251XFD_RX_FIFO_ITEM_SIZE,
+		MCP251XFD_RX_FIFO_START_ADDR, MCP251XFD_RX_FIFO_SIZE);
+	LOG_INF("diag: init: RAM used by TEF+TX+RX=%u of %u (the unconfigured FIFO 0 "
+		"may add one item; the RX read path derives UA relative to start)",
 		MCP251XFD_TEF_FIFO_SIZE + MCP251XFD_TX_QUEUE_SIZE + MCP251XFD_RX_FIFO_SIZE,
 		MCP251XFD_RAM_SIZE);
 
 	ret = can_set_timing(dev, &timing);
 	if (ret < 0) {
+		LOG_ERR("diag: init: can_set_timing failed: %d", ret);
 		return ret;
 	}
 
@@ -1766,6 +1937,9 @@ static int mcp251xfd_init(const struct device *dev)
 		ret = -EINVAL;
 	}
 
+	LOG_INF("diag: init: done ret=%d, INT GPIO%d interrupt %s, state=%s",
+		ret, dev_cfg->int_gpio_dt.pin, ret == 0 ? "enabled" : "NOT enabled",
+		mcp251xfd_state_name(dev_data->state));
 	return ret;
 }
 

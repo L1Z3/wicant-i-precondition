@@ -59,6 +59,7 @@
 #include "math.h"
 #include "dev_status.h"
 #include "precondition.h"
+#include "file_logs.h"
 
 #define TAG 			  __func__
 
@@ -256,11 +257,24 @@ void oneshot_adc_init(void)
 #endif
 }
 
+#define ADC_DIAG_SLOTS          8
+#define ADC_DIAG_INTERVAL_US    (30LL * 1000 * 1000)
+
 esp_err_t read_ss_adc_voltage(float *voltage_out, adc_channel_t adc_ch)
 {
     if (voltage_out == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
+
+    // The ADC task reads every 1-2 s (including while asleep). Logging every
+    // read at Info, plus five raw samples, filled the log and hid the rest
+    // of the capture; keep one sample and a summary per channel every 30 s.
+    static int64_t s_last_diag_us[ADC_DIAG_SLOTS];
+    int adc_slot = (int)adc_ch;
+    int64_t now_us = esp_timer_get_time();
+    bool log_diag = (adc_slot >= 0 && adc_slot < ADC_DIAG_SLOTS &&
+                     (s_last_diag_us[adc_slot] == 0 ||
+                      (now_us - s_last_diag_us[adc_slot]) >= ADC_DIAG_INTERVAL_US));
 
     const int NUM_SAMPLES = 8; // Similar to conv_frame_size in continuous version
     uint32_t sum_raw = 0;
@@ -303,11 +317,12 @@ esp_err_t read_ss_adc_voltage(float *voltage_out, adc_channel_t adc_ch)
             if (raw_value < min_raw) min_raw = raw_value;
             if (raw_value > max_raw) max_raw = raw_value;
             
-            // Print first few samples for debugging
-            if (valid_samples <= 5)
+            // One raw sample per diagnostic interval; the summary below
+            // carries min/max/avg for the full burst.
+            if (log_diag && valid_samples == 1)
 			{
-                ESP_LOGI(TAG, "Sample[%d]: Chan=%d, Raw=%d, Voltage=%dmV", 
-                        (int)valid_samples, adc_ch, raw_value, voltage);
+                ESP_LOGI(TAG, "Sample[1]: Chan=%d, Raw=%d, Voltage=%dmV",
+                        adc_ch, raw_value, voltage);
             }
             
             // Small delay between readings
@@ -325,10 +340,16 @@ esp_err_t read_ss_adc_voltage(float *voltage_out, adc_channel_t adc_ch)
         volt_rounded = roundf(volt_rounded * 10.0f) / 10.0f;
         *voltage_out = volt_rounded;
         
-        ESP_LOGI(TAG, "Summary: Raw=%d (min=%lu, max=%lu, avg of %lu), Voltage=%.2f V [%s]", 
-                 avg_raw, min_raw, max_raw, valid_samples, *voltage_out,
-                 cali_handle != NULL ? "CALIBRATED" : "UNCALIBRATED");
-                 
+        if (log_diag)
+        {
+            s_last_diag_us[adc_slot] = now_us;
+            ESP_LOGI(TAG, "Summary: Chan=%d, Raw=%d (min=%lu, max=%lu, avg of %lu), "
+                     "Voltage=%.2f V [%s]",
+                     adc_ch, avg_raw, (unsigned long)min_raw, (unsigned long)max_raw,
+                     (unsigned long)valid_samples, *voltage_out,
+                     cali_handle != NULL ? "CALIBRATED" : "UNCALIBRATED");
+        }
+
         return ESP_OK;
     }
     
@@ -477,7 +498,6 @@ static void adc_task(void *pvParameters)
 				}
 				case SLEEP_STATE:
 				{
-					ESP_LOGI(TAG, "Go to sleep");
 					if(awake_wanted)
 					{
 						wakeup_detect_time = esp_timer_get_time();
@@ -527,12 +547,8 @@ static void adc_task(void *pvParameters)
 									}
 									esp_mqtt_client_disconnect(client);
 									vTaskDelay(1000 / portTICK_PERIOD_MS);
+									wifi_network_deinit();
 								}
-								// The alert brought Wi-Fi back up after the
-								// sleep teardown, whether or not the connection
-								// succeeded. Take it down again here; the
-								// once-per-sleep teardown guard will not.
-								wifi_network_deinit();
 							}
 						}
 					}
@@ -545,6 +561,7 @@ static void adc_task(void *pvParameters)
 						if((esp_timer_get_time() - wakeup_detect_time) > WAKEUP_TIME_DELAY)
 						{
 							ESP_LOGI(TAG, "Wake up now...");
+							file_logs_flush();
 							esp_restart();
 
 						}
@@ -565,24 +582,37 @@ static void adc_task(void *pvParameters)
 			if(sleep_state == SLEEP_STATE)
 			{
 				// The 2 s timer wake re-enters this block; the teardown below
-				// must happen only on the first pass, or Wi-Fi and BLE are
-				// re-deinitialized every 2 s for the whole time the car is
-				// parked.
+				// must happen only on the first pass, or the log and flash
+				// are flooded (and Wi-Fi/BLE are re-deinitialized) for the
+				// whole time the car is parked.
 				if(!sleep_teardown_done)
 				{
 					sleep_teardown_done = true;
-					ESP_LOGW(TAG, "sleeping");
-                                // todo (trh): add config option to leave
-                                // can busses up in sleep.
+					ESP_LOGW(TAG, "entering light sleep: disabling CAN buses, Wi-Fi and BLE");
+					can_dump_diagnostics("pre-sleep");
 					for(int bus = 0; bus < CAN_BUS_COUNT; bus++)
 					{
+						ESP_LOGI(TAG, "sleep: can_disable(bus %d) (enabled=%d)",
+								 bus, (int)can_is_enabled((can_bus_t)bus));
 						can_disable(bus);
 					}
+					can_dump_diagnostics("post-sleep-disable");
 					wifi_network_deinit();
 					ble_disable();
 				}
+
 				esp_sleep_enable_timer_wakeup(2*1000000);
-				esp_light_sleep_start();;
+				int64_t t_sleep = esp_timer_get_time();
+				esp_light_sleep_start();
+				// A timer wake is the normal 2 s battery check; only log
+				// unexpected wake sources.
+				esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+				if (cause != ESP_SLEEP_WAKEUP_TIMER)
+				{
+					ESP_LOGI(TAG, "woke from light sleep after %lld ms, cause=%d",
+							 (long long)((esp_timer_get_time() - t_sleep) / 1000),
+							 (int)cause);
+				}
 			}
 			else vTaskDelay(pdMS_TO_TICKS(1000));
     	}

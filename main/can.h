@@ -68,4 +68,7 @@ bool can_is_forwardable(can_bus_t bus);
 bool can_any_enabled(void);
 uint8_t can_get_bitrate(can_bus_t bus);
 void can_flush_rx(void);
+// Verbose bring-up diagnostics: call from task context only (not an ISR and
+// not while holding a node lock). Safe with buses up or down.
+void can_dump_diagnostics(const char *why);
 #endif

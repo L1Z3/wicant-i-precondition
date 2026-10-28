@@ -77,6 +77,8 @@
 #include "precondition.h"
 #include "track_popup.h"
 #include "esp_timer.h"
+#include "file_logs.h"
+#include "file_logs_config.h"
 
 #define WIFI_CONNECTED_BIT			BIT0
 #define WS_CONNECTED_BIT			BIT1
@@ -160,8 +162,17 @@ const char device_config_default[] = R"json({
 "egmp_car_model":"auto",
 "precon_mode":"once",
 "precon_button":"sw_star",
-"precon_press":"short"
+"precon_press":"short",
+"log_to_file":"enable",
+"log_level":"warn"
 })json";
+
+// Total flash budget for the two log rotation files, in KB. The default
+// tracks the per-hardware cap in file_logs_config.h; log_size is absent from
+// device_config_default so the parse default applies on both variants.
+#define LOG_SIZE_DEFAULT_KB ((FILE_LOGS_MAX_FILE_SIZE * 2) / 1024)
+#define LOG_SIZE_MIN_KB     16
+#define LOG_SIZE_MAX_KB     ((HW_STORAGE_PARTITION_SIZE * 3 / 4) / 1024)
 static device_config_t device_config;
 TimerHandle_t xrestartTimer;
 
@@ -801,6 +812,210 @@ static esp_err_t logo_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// Streams the rotated log followed by the current log as one plain-text
+// response, so GET /logs returns the full history oldest-first. Pass
+// ?after=<X-Log-Cursor value from the previous response> to fetch only what
+// was logged since: the cursor is "<generation>:<file offset>:<ram offset>",
+// and every response carries X-Log-Cursor for the next call. When a cursor
+// no longer identifies a point in the stream (rotation, deletion, reboot)
+// the response restarts from the beginning and sets X-Log-Reset: 1.
+static esp_err_t logs_handler(httpd_req_t *req)
+{
+	static const char *log_paths[] = {FILE_LOGS_OLD_PATH, FILE_LOGS_CUR_PATH};
+	char chunk[1024];
+	bool have_cursor = false;
+	uint32_t c_gen = 0;
+	uint64_t c_file = 0;
+	uint64_t c_ram = 0;
+
+	// Worst-case cursor is 10+20+20 digits plus two separators
+	char query[80];
+	char after[64];
+	if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+	    httpd_query_key_value(query, "after", after, sizeof(after)) == ESP_OK)
+	{
+		unsigned long g;
+		unsigned long long f, r;
+		if (sscanf(after, "%lu:%llu:%llu", &g, &f, &r) == 3)
+		{
+			have_cursor = true;
+			c_gen = (uint32_t)g;
+			c_file = f;
+			c_ram = r;
+		}
+	}
+
+	// Don't force a littlefs write on every live-view poll. Drains in the
+	// can_re capture took 20-460 ms while the viewer polls every 2 s; those
+	// cache stalls hit the Wi-Fi/TCP path too. The 10 s background flush
+	// still bounds latency, and a 5 s floor keeps the view reasonably fresh.
+	static int64_t last_logs_flush_us;
+	int64_t now_us = esp_timer_get_time();
+	if (now_us - last_logs_flush_us >= 5000000LL)
+	{
+		last_logs_flush_us = now_us;
+		file_logs_flush();
+	}
+
+	// Defers rotation while we hold the files open: littlefs cannot
+	// rename/unlink a file with an open FD. Also pins the generation and
+	// makes the files append-only for the duration of this response.
+	if (!file_logs_read_begin())
+	{
+		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+		                    "Log files busy, try again");
+		return ESP_FAIL;
+	}
+
+	// Snapshot the stream bounds up front and never send past them, so the
+	// X-Log-Cursor header (sent before the body) stays accurate even if more
+	// data arrives while we stream
+	uint32_t gen = file_logs_generation();
+	uint64_t file_size[2];
+	uint64_t files_total = 0;
+	for (int i = 0; i < 2; i++)
+	{
+		struct stat st;
+		file_size[i] = (stat(log_paths[i], &st) == 0) ? (uint64_t)st.st_size : 0;
+		files_total += file_size[i];
+	}
+	bool ram_only = file_logs_is_ram_only();
+	uint64_t ram_total = ram_only ? file_logs_ram_total() : 0;
+
+	// A cursor from a different generation or pointing past the current end
+	// (deletion, reboot) is stale: restart the stream and tell the client
+	bool reset = have_cursor && (c_gen != gen || c_file > files_total || c_ram > ram_total);
+	if (reset || !have_cursor)
+	{
+		c_file = 0;
+		c_ram = 0;
+	}
+
+	char cursor_hdr[64];
+	snprintf(cursor_hdr, sizeof(cursor_hdr), "%lu:%llu:%llu",
+	         (unsigned long)gen, (unsigned long long)files_total,
+	         (unsigned long long)ram_total);
+	httpd_resp_set_type(req, "text/plain");
+	httpd_resp_set_hdr(req, "X-Log-Cursor", cursor_hdr);
+	if (reset)
+	{
+		httpd_resp_set_hdr(req, "X-Log-Reset", "1");
+	}
+
+	bool ok = true;
+	uint64_t base = 0;
+	for (int i = 0; ok && i < 2; i++)
+	{
+		uint64_t file_end = base + file_size[i];
+		if (c_file < file_end)
+		{
+			FILE *f = fopen(log_paths[i], "r");
+			if (f != NULL)
+			{
+				fseek(f, (long)(c_file - base), SEEK_SET);
+				uint64_t remaining = file_end - c_file;
+				while (ok && remaining > 0)
+				{
+					size_t want = remaining < sizeof(chunk) ? (size_t)remaining : sizeof(chunk);
+					size_t n = fread(chunk, 1, want, f);
+					if (n == 0)
+					{
+						break;
+					}
+					ok = httpd_resp_send_chunk(req, chunk, n) == ESP_OK;
+					remaining -= n;
+				}
+				fclose(f);
+			}
+		}
+		base = file_end;
+		if (c_file < base)
+		{
+			c_file = base;
+		}
+	}
+
+	file_logs_read_end();
+
+	// With log to file disabled nothing drains the ring, so append its
+	// contents after any files left over from when logging was enabled
+	if (ok && ram_only)
+	{
+		static const char ram_header[] = "\n==== in-RAM log (log to file disabled) ====\n";
+		if (!have_cursor && c_ram < ram_total)
+		{
+			// Separator only on full fetches; incremental readers see one
+			// continuous stream
+			ok = httpd_resp_send_chunk(req, ram_header, sizeof(ram_header) - 1) == ESP_OK;
+		}
+		while (ok && c_ram < ram_total)
+		{
+			uint64_t remaining = ram_total - c_ram;
+			size_t want = remaining < sizeof(chunk) ? (size_t)remaining : sizeof(chunk);
+			// c_ram may snap forward past evicted bytes; the loop bound
+			// stays correct since it only ever moves toward ram_total
+			size_t n = file_logs_ram_read(&c_ram, chunk, want);
+			if (n == 0)
+			{
+				break;
+			}
+			ok = httpd_resp_send_chunk(req, chunk, n) == ESP_OK;
+		}
+	}
+
+	httpd_resp_send_chunk(req, NULL, 0);
+	return ok ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t delete_logs_handler(httpd_req_t *req)
+{
+	if (!file_logs_delete())
+	{
+		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Log files busy, try again");
+		return ESP_FAIL;
+	}
+	httpd_resp_sendstr(req, "Log files deleted");
+	return ESP_OK;
+}
+
+// Emits one log line at the requested level so the web UI's live log view
+// can demonstrate itself. The tag's level is forced to Info first: the test
+// buttons must produce output even when the configured post-boot level
+// would filter that severity.
+static esp_err_t test_log_handler(httpd_req_t *req)
+{
+	static const char *test_tag = "LOG_TEST";
+	char query[32] = {0};
+	char level[8] = {0};
+
+	if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK)
+	{
+		httpd_query_key_value(query, "level", level, sizeof(level));
+	}
+
+	esp_log_level_set(test_tag, ESP_LOG_INFO);
+	if (strcmp(level, "error") == 0)
+	{
+		ESP_LOGE(test_tag, "test error message from the web UI");
+	}
+	else if (strcmp(level, "warn") == 0)
+	{
+		ESP_LOGW(test_tag, "test warning message from the web UI");
+	}
+	else if (strcmp(level, "info") == 0)
+	{
+		ESP_LOGI(test_tag, "test info message from the web UI");
+	}
+	else
+	{
+		httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "level must be info, warn or error");
+		return ESP_FAIL;
+	}
+
+	httpd_resp_sendstr(req, "Logged");
+	return ESP_OK;
+}
+
 static esp_err_t store_auto_data_handler(httpd_req_t *req)
 {
     if (!req)
@@ -1141,6 +1356,32 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 		time_t now;
 		time(&now);
 		cJSON_AddNumberToObject(root, "timestamp", (double)now);
+	}
+
+	// Log-to-file settings: effective (defaulted/clamped) values plus the
+	// storage numbers the Logging UI needs for its size limit and free-space note
+	cJSON_AddNumberToObject(root, "log_size_kb", atoi(device_config.log_size));
+	cJSON_AddNumberToObject(root, "log_size_max_kb", LOG_SIZE_MAX_KB);
+	{
+		struct stat st;
+		size_t log_used = 0;
+		if (stat(FILE_LOGS_CUR_PATH, &st) == 0)
+		{
+			log_used += st.st_size;
+		}
+		if (stat(FILE_LOGS_OLD_PATH, &st) == 0)
+		{
+			log_used += st.st_size;
+		}
+		cJSON_AddNumberToObject(root, "log_used_kb", log_used / 1024);
+	}
+	{
+		size_t fs_total = 0, fs_used = 0;
+		if (filesystem_get_usage(&fs_total, &fs_used) == ESP_OK)
+		{
+			cJSON_AddNumberToObject(root, "fs_total_kb", fs_total / 1024);
+			cJSON_AddNumberToObject(root, "fs_free_kb", (fs_total - fs_used) / 1024);
+		}
 	}
 
 	char *resp_str = cJSON_PrintUnformatted(root);
@@ -1735,6 +1976,24 @@ static const httpd_uri_t logo_uri = {
     .handler   = logo_handler,
     /* Let's pass response string in user
      * context to demonstrate it's usage */
+    .user_ctx  = NULL
+};
+static const httpd_uri_t logs_uri = {
+    .uri       = "/logs",
+    .method    = HTTP_GET,
+    .handler   = logs_handler,
+    .user_ctx  = NULL
+};
+static const httpd_uri_t delete_logs_uri = {
+    .uri       = "/delete_logs",
+    .method    = HTTP_POST,
+    .handler   = delete_logs_handler,
+    .user_ctx  = NULL
+};
+static const httpd_uri_t test_log_uri = {
+    .uri       = "/test_log",
+    .method    = HTTP_POST,
+    .handler   = test_log_handler,
     .user_ctx  = NULL
 };
 static const httpd_uri_t ws = {
@@ -2357,6 +2616,60 @@ static void config_server_load_cfg(char *cfg)
 	//*****
 
 	//*****
+	key = cJSON_GetObjectItem(root,"log_to_file");
+	if(key == 0 || !cJSON_IsString(key) ||
+	   (strcmp(key->valuestring, "enable") != 0 && strcmp(key->valuestring, "disable") != 0))
+	{
+		strcpy(device_config.log_to_file, "enable");
+	}
+	else
+	{
+		strlcpy(device_config.log_to_file, key->valuestring, sizeof(device_config.log_to_file));
+	}
+	ESP_LOGI(TAG, "device_config.log_to_file: %s", device_config.log_to_file);
+	//*****
+
+	//*****
+	key = cJSON_GetObjectItem(root,"log_level");
+	if(key == 0 || !cJSON_IsString(key) ||
+	   (strcmp(key->valuestring, "none") != 0 && strcmp(key->valuestring, "error") != 0 &&
+	    strcmp(key->valuestring, "warn") != 0 && strcmp(key->valuestring, "info") != 0))
+	{
+		strcpy(device_config.log_level, "warn");
+	}
+	else
+	{
+		strlcpy(device_config.log_level, key->valuestring, sizeof(device_config.log_level));
+	}
+	ESP_LOGI(TAG, "device_config.log_level: %s", device_config.log_level);
+	//*****
+
+	//*****
+	key = cJSON_GetObjectItem(root,"log_size");
+	{
+		uint32_t log_size_kb = 0;
+		if(key != 0 && cJSON_IsString(key))
+		{
+			log_size_kb = (uint32_t)atoi(key->valuestring);
+		}
+		if(log_size_kb == 0)
+		{
+			log_size_kb = LOG_SIZE_DEFAULT_KB;
+		}
+		if(log_size_kb < LOG_SIZE_MIN_KB)
+		{
+			log_size_kb = LOG_SIZE_MIN_KB;
+		}
+		if(log_size_kb > LOG_SIZE_MAX_KB)
+		{
+			log_size_kb = LOG_SIZE_MAX_KB;
+		}
+		snprintf(device_config.log_size, sizeof(device_config.log_size), "%lu", (unsigned long)log_size_kb);
+	}
+	ESP_LOGI(TAG, "device_config.log_size: %s KB", device_config.log_size);
+	//*****
+
+	//*****
 	key = cJSON_GetObjectItem(root,"sta_security");
 	if(key == 0)
 	{
@@ -2439,6 +2752,7 @@ config_error:
 		fprintf(f, device_config_default, (char*)device_id, (char*)device_id, (char*)device_id);
 		fclose(f);
 		vTaskDelay(3000 / portTICK_PERIOD_MS);
+		file_logs_flush();
 		esp_restart();
     }
 	cJSON_Delete(root);
@@ -2480,6 +2794,7 @@ void config_server_get_sta_ip(char* ip)
 void vrestartTimerCallback( TimerHandle_t xTimer )
 {
 //	vTaskDelay(1000 / portTICK_PERIOD_MS);
+	file_logs_flush();
 	esp_restart();
 }
 
@@ -2606,6 +2921,9 @@ static httpd_handle_t config_server_init(void)
         httpd_register_uri_handler(server, &check_status_uri);
         httpd_register_uri_handler(server, &load_config_uri);
         httpd_register_uri_handler(server, &logo_uri);
+        httpd_register_uri_handler(server, &logs_uri);
+        httpd_register_uri_handler(server, &delete_logs_uri);
+        httpd_register_uri_handler(server, &test_log_uri);
         httpd_register_uri_handler(server, &ws);
         httpd_register_uri_handler(server, &file_upload);
 		httpd_register_uri_handler(server, &system_reboot);
@@ -2647,6 +2965,9 @@ void config_server_restart(void)
         httpd_register_uri_handler(server, &check_status_uri);
         httpd_register_uri_handler(server, &load_config_uri);
         httpd_register_uri_handler(server, &logo_uri);
+        httpd_register_uri_handler(server, &logs_uri);
+        httpd_register_uri_handler(server, &delete_logs_uri);
+        httpd_register_uri_handler(server, &test_log_uri);
         httpd_register_uri_handler(server, &ws);
         httpd_register_uri_handler(server, &file_upload);
 		httpd_register_uri_handler(server, &system_reboot);
@@ -3211,4 +3532,36 @@ int8_t config_server_precon_press(void)
 		return PRESS_LONG;
 	}
 	return PRESS_SHORT;
+}
+
+int8_t config_server_get_log_to_file(void)
+{
+	return strcmp(device_config.log_to_file, "disable") != 0;
+}
+
+esp_log_level_t config_server_get_log_level(void)
+{
+	if(strcmp(device_config.log_level, "none") == 0)
+	{
+		return ESP_LOG_NONE;
+	}
+	else if(strcmp(device_config.log_level, "error") == 0)
+	{
+		return ESP_LOG_ERROR;
+	}
+	else if(strcmp(device_config.log_level, "info") == 0)
+	{
+		return ESP_LOG_INFO;
+	}
+	return ESP_LOG_WARN;
+}
+
+uint32_t config_server_get_log_size(void)
+{
+	uint32_t kb = (uint32_t)atoi(device_config.log_size);
+	if(kb == 0)
+	{
+		kb = LOG_SIZE_DEFAULT_KB;
+	}
+	return kb * 1024;
 }
