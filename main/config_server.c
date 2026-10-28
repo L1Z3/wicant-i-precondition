@@ -1279,6 +1279,124 @@ static esp_err_t ws_handler(httpd_req_t *req)
     return ret;
 }
 
+/* Uploads are multipart/form-data bodies holding the file in one part:
+ *   "--<boundary>\r\n" <part headers> "\r\n\r\n" <file> "\r\n--<boundary>--\r\n"
+ * The part headers name a filename; form fields (parts without one) may come
+ * before it. */
+#define UPLOAD_BOUNDARY_MAX 70  /* RFC 2046 */
+
+typedef struct {
+    int file_off;       /* where the file starts in scratch */
+    int file_len;
+    char end[UPLOAD_BOUNDARY_MAX + 8];  /* "\r\n--<boundary>--\r\n" */
+    int end_len;
+} upload_t;
+
+static int find_bytes(const char *buf, int len, const char *s, int s_len)
+{
+    for (int i = 0; i + s_len <= len; i++)
+    {
+        if (memcmp(buf + i, s, s_len) == 0)
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Finds the file part in the first got bytes of the body. Returns 1 when
+ * found, 0 if more of the body is needed, -1 if it isn't an upload. */
+static int upload_parse(const char *buf, int got, int content_len, upload_t *up)
+{
+    if (got >= 2 && (buf[0] != '-' || buf[1] != '-'))
+    {
+        return -1;
+    }
+    const char *eol = memchr(buf, '\n', got);
+    if (!eol)
+    {
+        return got < UPLOAD_BOUNDARY_MAX + 4 ? 0 : -1;
+    }
+    int line = eol + 1 - buf;   /* "--<boundary>\r\n" */
+    if (line < 5 || line > UPLOAD_BOUNDARY_MAX + 4 || eol[-1] != '\r')
+    {
+        return -1;
+    }
+    /* The delimiter before each later part is "\r\n" plus that line */
+    char delim[UPLOAD_BOUNDARY_MAX + 6];
+    memcpy(delim, "\r\n", 2);
+    memcpy(delim + 2, buf, line);
+
+    memcpy(up->end, delim, line);       /* "\r\n--<boundary>" */
+    memcpy(up->end + line, "--\r\n", 4);
+    up->end_len = line + 4;
+
+    int part = line;
+    while (1)
+    {
+        /* The part headers end with an empty line (none at all: right away) */
+        int hdr_end = find_bytes(buf + part - 2, got - (part - 2), "\r\n\r\n", 4);
+        if (hdr_end < 0)
+        {
+            return 0;
+        }
+        hdr_end += part - 2;
+        int body = hdr_end + 4;
+        if (find_bytes(buf + part, hdr_end - part, "filename=", 9) >= 0)
+        {
+            up->file_off = body;
+            up->file_len = content_len - body - up->end_len;
+            return up->file_len > 0 ? 1 : -1;
+        }
+        int next = find_bytes(buf + body, got - body, delim, line + 2);
+        if (next < 0)
+        {
+            return 0;
+        }
+        part = body + next + line + 2;
+    }
+}
+
+/* Receives the start of an upload into scratch until its file part's headers
+ * are in. Returns the bytes received, 0 if the body isn't an upload (or the
+ * headers don't fit in scratch), or an httpd_req_recv() error (< 0; a client
+ * that closed the connection gives HTTPD_SOCK_ERR_FAIL). */
+static int upload_recv_start(httpd_req_t *req, char *scratch, upload_t *up)
+{
+    int want = MIN(req->content_len, SCRATCH_BUFSIZE);
+    int got = 0;
+
+    while (got < want)
+    {
+        int ret = httpd_req_recv(req, scratch + got, want - got);
+        if (ret <= 0)
+        {
+            return ret < 0 ? ret : HTTPD_SOCK_ERR_FAIL;
+        }
+        got += ret;
+        ret = upload_parse(scratch, got, req->content_len, up);
+        if (ret != 0)
+        {
+            return ret > 0 ? got : 0;
+        }
+    }
+    return 0;
+}
+
+/* Checks that the body ends with the closing boundary right after the file:
+ * tail holds those of its bytes that came in with the file's start. */
+static bool upload_recv_end(httpd_req_t *req, const upload_t *up, const char *tail, int tail_len)
+{
+    char end[sizeof(up->end)];
+
+    if (tail_len > 0)
+    {
+        memcpy(end, tail, tail_len);
+    }
+    return recv_full(req, end + tail_len, up->end_len - tail_len) == up->end_len - tail_len &&
+           memcmp(end, up->end, up->end_len) == 0;
+}
+
 /* Copies an image's board variant, the field after "wican-fw_" (CMakeLists.txt
  * names images wican-fw_<variant>_<version>), into out. Images from before the
  * proto variant was renamed say "custom". Returns false for any other name. */
@@ -1350,12 +1468,23 @@ static esp_err_t upload_ota(httpd_req_t *req)
 
     /* Retrieve the pointer to scratch buffer for temporary storage */
     char *scratch = ((struct file_server_data *)req->user_ctx)->scratch;
-    char *buf = scratch;
-    int received = 0;
+    upload_t up;
 
-    /* Content length of the request gives
-     * the size of the file being uploaded */
-    int remaining = req->content_len;
+    /* Before touching the OTA partition, which esp_ota_begin() erases */
+    int got = upload_recv_start(req, scratch, &up);
+    if (got <= 0)
+    {
+        ESP_LOGE(TAG, "File reception failed (%d)", got);
+        if (got == 0)
+        {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Malformed upload");
+        }
+        else
+        {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive file");
+        }
+        return ESP_FAIL;
+    }
 
     ///
     esp_err_t err;
@@ -1388,57 +1517,13 @@ static esp_err_t upload_ota(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-	char *ret = 0;
-	char *boundary_start = 0;
-	char *boundary_end = 0;
-	uint8_t count = 0;
+    /* The file's start came in with the part headers; receive the rest at
+     * the start of scratch, part by part */
+    char *buf = scratch + up.file_off;
+    int received = MIN(got - up.file_off, up.file_len);
 
-    while (remaining > 0)
+    while (1)
     {
-//        ESP_LOGI(TAG, "Remaining size : %d", remaining);
-        /* Receive the file part by part into a buffer, always at the start of
-         * scratch: the first part's header parse advances buf past the header,
-         * and receiving there would overrun scratch. */
-        buf = scratch;
-        if ((received = httpd_req_recv(req, buf, MIN(remaining, SCRATCH_BUFSIZE))) <= 0)
-        {
-            if (received == HTTPD_SOCK_ERR_TIMEOUT)
-            {
-                /* Retry if timeout occurred */
-                continue;
-            }
-
-
-            ESP_LOGE(TAG, "File reception failed!");
-            esp_ota_abort(update_handle);
-            /* Respond with 500 Internal Server Error */
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive file");
-            return ESP_FAIL;
-        }
-
-        if(boundary_start == 0)
-        {
-        	boundary_start = buf;
-        	ret = memchr(boundary_start, '\n', 200);
-        	boundary_end = ret + 1;
-        	remaining -= ((boundary_end - boundary_start) + 1 + 2 + 1);//ignore boundary at end of file
-        	//TODO: Better way to do this ??
-        	while(1)
-        	{
-        		if(((ret[0] == 'T') && (ret[1] == 'y') && (ret[2] == 'p') && (ret[3] == 'e') &&
-        		        			(ret[4] == ':')))
-        		{
-        			break;
-        		}
-        		ret++;
-        	}
-    		ret = memchr(ret, '\n', 200);
-    		buf = ret + 3;
-    		remaining -= (buf - boundary_start);
-    		ESP_LOGI(TAG, "Real Remaining size : %d", remaining);
-    		
-    		received -= (buf - boundary_start);
-        }
         total_size += received;
         /* Write buffer content to file on storage */
         if (received > 0 && (ESP_OK != esp_ota_write( update_handle, (const void *)buf, received)))
@@ -1449,28 +1534,41 @@ static esp_err_t upload_ota(httpd_req_t *req)
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to write file to storage");
             return ESP_FAIL;
         }
-
-        if(count < 3)
+        if (total_size >= up.file_len)
         {
-        	count++;
+            break;
         }
-        /* Keep track of remaining size of
-         * the file left to be uploaded */
-        remaining -= received;
         vTaskDelay(5 / portTICK_PERIOD_MS);
+
+        buf = scratch;
+        if ((received = httpd_req_recv(req, buf, MIN(up.file_len - total_size, SCRATCH_BUFSIZE))) <= 0)
+        {
+            if (received == HTTPD_SOCK_ERR_TIMEOUT)
+            {
+                /* Retry if timeout occurred */
+                received = 0;
+                continue;
+            }
+
+            ESP_LOGE(TAG, "File reception failed!");
+            esp_ota_abort(update_handle);
+            /* Respond with 500 Internal Server Error */
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive file");
+            return ESP_FAIL;
+        }
     }
 
     /* Close file upon upload completion */
     ESP_LOGI(TAG, "File reception complete: %lu", total_size);
 
-    if ((received = httpd_req_recv(req, scratch, SCRATCH_BUFSIZE)) <= 0)
+    int tail = got - up.file_off - up.file_len;
+    if (!upload_recv_end(req, &up, tail > 0 ? scratch + up.file_off + up.file_len : NULL, MAX(tail, 0)))
     {
-        ESP_LOGE(TAG, "File reception failed!");
+        ESP_LOGE(TAG, "Upload doesn't end with its closing boundary");
         esp_ota_abort(update_handle);
-        /* Respond with 500 Internal Server Error */
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive file");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Malformed upload");
         return ESP_FAIL;
-     }
+    }
 
     err = esp_ota_end(update_handle);
     if (err != ESP_OK)
@@ -1617,17 +1715,23 @@ static esp_err_t upload_car_data_handler(httpd_req_t *req)
 
     /* Retrieve the pointer to scratch buffer for temporary storage */
     char *scratch = ((struct file_server_data *)req->user_ctx)->scratch;
-    char *buf = scratch;
-    int received = 0;
+    upload_t up;
 
-    /* Content length of the request gives
-     * the size of the file being uploaded */
-    int remaining = req->content_len;
-	char *ret = 0;
-	char *boundary_start = 0;
-	char *boundary_end = 0;
-	uint8_t count = 0;
-
+    /* Before opening the file, which truncates it */
+    int got = upload_recv_start(req, scratch, &up);
+    if (got <= 0)
+    {
+        ESP_LOGE(TAG, "File reception failed (%d)", got);
+        if (got == 0)
+        {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Malformed upload");
+        }
+        else
+        {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive file");
+        }
+        return ESP_FAIL;
+    }
 
 	FILE *fd = fopen(filepath, "w");
     if (fd == NULL)
@@ -1636,53 +1740,14 @@ static esp_err_t upload_car_data_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to create file");
         return ESP_FAIL;
     }
-	// remaining
-    while (remaining > 0)
+
+    /* The file's start came in with the part headers; receive the rest at
+     * the start of scratch, part by part */
+    char *buf = scratch + up.file_off;
+    int received = MIN(got - up.file_off, up.file_len);
+
+    while (1)
     {
-//        ESP_LOGI(TAG, "Remaining size : %d", remaining);
-        /* Receive the file part by part into a buffer, always at the start of
-         * scratch: the first part's header parse advances buf past the header,
-         * and receiving there would overrun scratch. */
-        buf = scratch;
-        if ((received = httpd_req_recv(req, buf, MIN(remaining, SCRATCH_BUFSIZE))) <= 0)
-        {
-            if (received == HTTPD_SOCK_ERR_TIMEOUT)
-            {
-                /* Retry if timeout occurred */
-                continue;
-            }
-
-
-            ESP_LOGE(TAG, "File reception failed!");
-            fclose(fd);
-            unlink(filepath);
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive file");
-            return ESP_FAIL;
-        }
-
-        if(boundary_start == 0)
-        {
-        	boundary_start = buf;
-        	ret = memchr(boundary_start, '\n', 200);
-        	boundary_end = ret + 1;
-        	remaining -= ((boundary_end - boundary_start) + 1 + 2 + 1);//ignore boundary at end of file
-        	//TODO: Better way to do this ??
-        	while(1)
-        	{
-        		if(((ret[0] == 'T') && (ret[1] == 'y') && (ret[2] == 'p') && (ret[3] == 'e') &&
-        		        			(ret[4] == ':')))
-        		{
-        			break;
-        		}
-        		ret++;
-        	}
-    		ret = memchr(ret, '\n', 200);
-    		buf = ret + 3;
-    		remaining -= (buf - boundary_start);
-    		ESP_LOGI(TAG, "Real Remaining size : %d", remaining);
-    		
-    		received -= (buf - boundary_start);
-        }
         total_size += received;
         /* Write buffer content to file on storage */
         if (received > 0)
@@ -1696,17 +1761,39 @@ static esp_err_t upload_car_data_handler(httpd_req_t *req)
                 return ESP_FAIL;
             }
         }
-
-        if(count < 3)
+        if (total_size >= up.file_len)
         {
-        	count++;
+            break;
         }
-        /* Keep track of remaining size of
-         * the file left to be uploaded */
-        remaining -= received;
         vTaskDelay(5 / portTICK_PERIOD_MS);
+
+        buf = scratch;
+        if ((received = httpd_req_recv(req, buf, MIN(up.file_len - total_size, SCRATCH_BUFSIZE))) <= 0)
+        {
+            if (received == HTTPD_SOCK_ERR_TIMEOUT)
+            {
+                /* Retry if timeout occurred */
+                received = 0;
+                continue;
+            }
+
+            ESP_LOGE(TAG, "File reception failed!");
+            fclose(fd);
+            unlink(filepath);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive file");
+            return ESP_FAIL;
+        }
     }
 
+    int tail = got - up.file_off - up.file_len;
+    if (!upload_recv_end(req, &up, tail > 0 ? scratch + up.file_off + up.file_len : NULL, MAX(tail, 0)))
+    {
+        ESP_LOGE(TAG, "Upload doesn't end with its closing boundary");
+        fclose(fd);
+        unlink(filepath);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Malformed upload");
+        return ESP_FAIL;
+    }
 
     fclose(fd);
 
