@@ -843,6 +843,9 @@ static int mcp251xfd_handle_fifo_read(const struct device *dev, const struct mcp
 			goto done;
 		}
 	}
+	// LOCAL PATCH: 1 when an object was read and released, so the interrupt
+	// loop can tell that from an empty FIFO (0).
+	ret = ui_inc > 0;
 
 done:
 	k_mutex_unlock(&dev_data->mutex);
@@ -1095,7 +1098,7 @@ static void mcp251xfd_handle_interrupts(const struct device *dev)
 							 MCP251XFD_FIFO_TYPE_RX);
 			if (ret < 0) {
 				LOG_ERR("Error handling RXIF [%d]", ret);
-			} else {
+			} else if (ret > 0) {
 				progress = true;
 			}
 		}
@@ -1105,7 +1108,7 @@ static void mcp251xfd_handle_interrupts(const struct device *dev)
 							 MCP251XFD_FIFO_TYPE_TEF);
 			if (ret < 0) {
 				LOG_ERR("Error handling TEFIF [%d]", ret);
-			} else {
+			} else if (ret > 0) {
 				progress = true;
 			}
 		}
@@ -1154,7 +1157,8 @@ static void mcp251xfd_handle_interrupts(const struct device *dev)
 
 check_int_pin:
 		/* Break from loop if INT pin is inactive */
-		// LOCAL PATCH: count only passes that moved no RX or TEF object.
+		// LOCAL PATCH: count only passes that moved no RX or TEF object
+		// (handle_fifo_read() returned 1 for neither).
 		// Upstream counts every pass, and with one object per pass (erratum
 		// #6 above) any burst of ten frames paused servicing.
 		consecutive_calls = progress ? 0 : consecutive_calls + 1;
