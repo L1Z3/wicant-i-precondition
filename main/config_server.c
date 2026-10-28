@@ -585,10 +585,11 @@ static bool save_file_atomic(const char *path, const char *buf, size_t len)
     return true;
 }
 
-/* What config_server_load_cfg() needs from each key it copies with strcpy:
- * a required key that is missing resets the whole config to defaults at
- * boot, and a value that is not a string or doesn't fit its field crashes or
- * overflows there. Keep in step with config_server_load_cfg(). */
+/* The rules for each key config_server_load_cfg() copies with CFG_GET(),
+ * also applied when the page saves the config: at boot, a required key that
+ * is missing or breaks its rule resets the whole config to defaults, an
+ * optional one falls back to its own default. Keep in step with
+ * config_server_load_cfg(). */
 #define CFG_FIELD_MAX(field)    (sizeof(device_config.field) - 1)
 #define CFG_REQUIRED(field)     { #field, 0, CFG_FIELD_MAX(field), true }
 #define CFG_OPTIONAL(field)     { #field, 0, CFG_FIELD_MAX(field), false }
@@ -675,6 +676,53 @@ static const char *config_invalid_key(const cJSON *root)
     }
     return NULL;
 }
+
+/* Copy root's value for key into dst (size bytes) if it is a string that
+ * keeps key's rule in config_keys[] and fits dst; otherwise leave dst alone
+ * and return false. Never truncates. */
+static bool cfg_get(const cJSON *root, const char *key, char *dst, size_t size)
+{
+    size_t min_len = 0;
+    size_t max_len = size - 1;
+    bool required = false;
+    for (size_t i = 0; i < sizeof(config_keys) / sizeof(config_keys[0]); i++)
+    {
+        if (strcmp(config_keys[i].key, key) == 0)
+        {
+            min_len = config_keys[i].min_len;
+            max_len = config_keys[i].max_len;
+            required = config_keys[i].required;
+            break;
+        }
+    }
+
+    const cJSON *item = cJSON_GetObjectItem(root, key);
+    if (item == NULL)
+    {
+        if (required)
+        {
+            ESP_LOGE(TAG, "config.json: %s missing", key);
+        }
+        return false;
+    }
+    if (!cJSON_IsString(item) || item->valuestring == NULL)
+    {
+        ESP_LOGE(TAG, "config.json: %s is not a string", key);
+        return false;
+    }
+    size_t len = strlen(item->valuestring);
+    if (len < min_len || len > max_len || len >= size)
+    {
+        ESP_LOGE(TAG, "config.json: %s length %u not in %u..%u", key,
+                 (unsigned)len, (unsigned)min_len, (unsigned)max_len);
+        return false;
+    }
+    memcpy(dst, item->valuestring, len + 1);
+    return true;
+}
+
+#define CFG_GET(root, field) \
+    cfg_get(root, #field, device_config.field, sizeof(device_config.field))
 
 static esp_err_t store_config_handler(httpd_req_t *req)
 {
@@ -2235,328 +2283,226 @@ static void config_server_load_cfg(char *cfg)
 	root   = cJSON_Parse(cfg);
     struct stat st;
 
-	key = cJSON_GetObjectItem(root,"wifi_mode");
-	if(key == 0)
+	if(!CFG_GET(root, wifi_mode))
 	{
 		goto config_error;
 	}
-	strcpy(device_config.wifi_mode, key->valuestring);
 	ESP_LOGI(TAG, "device_config.wifi_mode: %s", device_config.wifi_mode);
 
-	key = cJSON_GetObjectItem(root,"ap_ch");
-	if(key == 0)
+	if(!CFG_GET(root, ap_ch))
 	{
 		goto config_error;
 	}
-	strcpy(device_config.ap_ch, key->valuestring);
 	ESP_LOGI(TAG, "device_config.ap_ch: %s", device_config.ap_ch);
 
-	key = cJSON_GetObjectItem(root,"sta_ssid");
-	if(key == 0)
+	if(!CFG_GET(root, sta_ssid))
 	{
 		goto config_error;
 	}
-	if(strlen(key->valuestring) == 0 || strlen(key->valuestring) > 32)
-	{
-		goto config_error;
-	}
-	strcpy(device_config.sta_ssid, key->valuestring);
 	ESP_LOGI(TAG, "device_config.sta_ssid: %s", device_config.sta_ssid);
 
-	key = cJSON_GetObjectItem(root,"sta_pass");
-	if(key == 0)
+	if(!CFG_GET(root, sta_pass))
 	{
 		goto config_error;
 	}
-	if(strlen(key->valuestring) < 8 || strlen(key->valuestring) > 64)
-	{
-		goto config_error;
-	}
-	strcpy(device_config.sta_pass, key->valuestring);
 	ESP_LOGI(TAG, "device_config.sta_pass: %s", device_config.sta_pass);
 
-	key = cJSON_GetObjectItem(root,"can_datarate");
-	if(key == 0)
+	if(!CFG_GET(root, can_datarate))
 	{
 		goto config_error;
 	}
-	strcpy(device_config.can_datarate, key->valuestring);
 	ESP_LOGI(TAG, "device_config.can_datarate: %s", device_config.can_datarate);
 
-	key = cJSON_GetObjectItem(root,"can_mode");
-	if(key == 0)
+	if(!CFG_GET(root, can_mode))
 	{
 		goto config_error;
 	}
-	strcpy(device_config.can_mode, key->valuestring);
 	ESP_LOGI(TAG, "device_config.can_mode: %s", device_config.can_mode);
 
-	key = cJSON_GetObjectItem(root,"port_type");
-	if(key == 0)
+	if(!CFG_GET(root, port_type))
 	{
 		goto config_error;
 	}
-	strcpy(device_config.port_type, key->valuestring);
 	ESP_LOGI(TAG, "device_config.port_type: %s", device_config.port_type);
 
-	key = cJSON_GetObjectItem(root,"port");
-	if(key == 0)
+	if(!CFG_GET(root, port))
 	{
 		goto config_error;
 	}
-	strcpy(device_config.port, key->valuestring);
 	ESP_LOGI(TAG, "device_config.port: %s", device_config.port);
 
 
-	key = cJSON_GetObjectItem(root,"ap_pass");
-	if(key == 0)
+	if(!CFG_GET(root, ap_pass))
 	{
 		goto config_error;
 	}
-	if(strlen(key->valuestring) < 8 || strlen(key->valuestring) > 64)
-	{
-		goto config_error;
-	}
-	strcpy(device_config.ap_pass, key->valuestring);
 	ESP_LOGE(TAG, "device_config.ap_pass: %s", device_config.ap_pass);
 
-	key = cJSON_GetObjectItem(root,"protocol");
-	if(key == 0)
+	if(!CFG_GET(root, protocol))
 	{
 		goto config_error;
 	}
-	if(strlen(key->valuestring) < 2 || strlen(key->valuestring) > 64)
-	{
-		goto config_error;
-	}
-	strcpy(device_config.protocol, key->valuestring);
 	ESP_LOGE(TAG, "device_config.protocol: %s", device_config.protocol);
 
-	key = cJSON_GetObjectItem(root,"ble_pass");
-	if(key == 0)
+	if(!CFG_GET(root, ble_pass))
 	{
 		goto config_error;
 	}
-	if(strlen(key->valuestring) < 4 || strlen(key->valuestring) > 16)
-	{
-		goto config_error;
-	}
-	strcpy(device_config.ble_pass, key->valuestring);
 	ESP_LOGE(TAG, "device_config.ble_pass: %s", device_config.ble_pass);
 
-	key = cJSON_GetObjectItem(root,"sleep_status");
-	if(key == 0)
+	if(!CFG_GET(root, sleep_status))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.sleep_status, key->valuestring);
 	ESP_LOGE(TAG, "device_config.sleep_status: %s", device_config.sleep_status);
 
-	key = cJSON_GetObjectItem(root,"ble_status");
-	if(key == 0)
+	if(!CFG_GET(root, ble_status))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.ble_status, key->valuestring);
 	ESP_LOGE(TAG, "device_config.ble_status: %s", device_config.ble_status);
 
-	key = cJSON_GetObjectItem(root,"sleep_volt");
-	if(key == 0)
+	if(!CFG_GET(root, sleep_volt))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.sleep_volt, key->valuestring);
 	ESP_LOGE(TAG, "device_config.sleep_volt: %s", device_config.sleep_volt);
 
 	//*****
-	key = cJSON_GetObjectItem(root,"batt_alert");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.batt_alert)))
+	if(!CFG_GET(root, batt_alert))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.batt_alert, key->valuestring);
 	ESP_LOGE(TAG, "device_config.batt_alert: %s", device_config.batt_alert);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"batt_alert_ssid");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.batt_alert_ssid)))
+	if(!CFG_GET(root, batt_alert_ssid))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.batt_alert_ssid, key->valuestring);
 	ESP_LOGE(TAG, "device_config.batt_alert_ssid: %s", device_config.batt_alert_ssid);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"batt_alert_pass");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.batt_alert_pass)))
+	if(!CFG_GET(root, batt_alert_pass))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.batt_alert_pass, key->valuestring);
 	ESP_LOGE(TAG, "device_config.batt_alert_pass: %s", device_config.batt_alert_pass);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"batt_alert_volt");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.batt_alert_volt)))
+	if(!CFG_GET(root, batt_alert_volt))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.batt_alert_volt, key->valuestring);
 	ESP_LOGE(TAG, "device_config.batt_alert_volt: %s", device_config.batt_alert_volt);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"batt_alert_protocol");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.batt_alert_protocol)))
+	if(!CFG_GET(root, batt_alert_protocol))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.batt_alert_protocol, key->valuestring);
 	ESP_LOGE(TAG, "device_config.batt_alert_protocol: %s", device_config.batt_alert_protocol);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"batt_alert_url");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.batt_alert_url)))
+	if(!CFG_GET(root, batt_alert_url))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.batt_alert_url, key->valuestring);
 	ESP_LOGE(TAG, "device_config.batt_alert_url: %s", device_config.batt_alert_url);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"batt_alert_port");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.batt_alert_port)))
+	if(!CFG_GET(root, batt_alert_port))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.batt_alert_port, key->valuestring);
 	ESP_LOGE(TAG, "device_config.batt_alert_port: %s", device_config.batt_alert_port);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"batt_alert_topic");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.batt_alert_topic)))
+	if(!CFG_GET(root, batt_alert_topic))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.batt_alert_topic, key->valuestring);
 	ESP_LOGE(TAG, "device_config.batt_alert_topic: %s", device_config.batt_alert_topic);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"batt_mqtt_user");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.batt_mqtt_user)))
+	if(!CFG_GET(root, batt_mqtt_user))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.batt_mqtt_user, key->valuestring);
 	ESP_LOGE(TAG, "device_config.batt_mqtt_user: %s", device_config.batt_mqtt_user);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"batt_mqtt_pass");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.batt_mqtt_pass)))
+	if(!CFG_GET(root, batt_mqtt_pass))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.batt_mqtt_pass, key->valuestring);
 	ESP_LOGE(TAG, "device_config.batt_mqtt_pass: %s", device_config.batt_mqtt_pass);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"batt_alert_time");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.batt_alert_time)))
+	if(!CFG_GET(root, batt_alert_time))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.batt_alert_time, key->valuestring);
 	ESP_LOGE(TAG, "device_config.batt_alert_time: %s", device_config.batt_alert_time);
 	//*****
 
 
 
 	//*****
-	key = cJSON_GetObjectItem(root,"mqtt_en");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.mqtt_en)))
+	if(!CFG_GET(root, mqtt_en))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.mqtt_en, key->valuestring);
 	ESP_LOGE(TAG, "device_config.mqtt_en: %s", device_config.mqtt_en);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"mqtt_url");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.mqtt_url)))
+	if(!CFG_GET(root, mqtt_url))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.mqtt_url, key->valuestring);
 	ESP_LOGE(TAG, "device_config.mqtt_url: %s", device_config.mqtt_url);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"mqtt_port");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.mqtt_port)))
+	if(!CFG_GET(root, mqtt_port))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.mqtt_port, key->valuestring);
 	ESP_LOGE(TAG, "device_config.mqtt_port: %s", device_config.mqtt_port);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"mqtt_user");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.mqtt_user)))
+	if(!CFG_GET(root, mqtt_user))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.mqtt_user, key->valuestring);
 	ESP_LOGE(TAG, "device_config.mqtt_user: %s", device_config.mqtt_user);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"mqtt_pass");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.mqtt_pass)))
+	if(!CFG_GET(root, mqtt_pass))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.mqtt_pass, key->valuestring);
 	ESP_LOGE(TAG, "device_config.mqtt_pass: %s", device_config.mqtt_pass);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"mqtt_elm327_log");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.mqtt_elm327_log)))
+	if(!CFG_GET(root, mqtt_elm327_log))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.mqtt_elm327_log, key->valuestring);
 	ESP_LOGE(TAG, "device_config.mqtt_elm327_log: %s", device_config.mqtt_elm327_log);
 	//*****
 
@@ -2565,146 +2511,95 @@ static void config_server_load_cfg(char *cfg)
     strcpy(device_config.battery_temp_unit,
            cJSON_IsString(key) && strcmp(key->valuestring, "f") == 0 ? "f" : "c");
 
-	key = cJSON_GetObjectItem(root,"precon_mode");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.precon_mode)))
+	if(!CFG_GET(root, precon_mode))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.precon_mode, key->valuestring);
 	ESP_LOGE(TAG, "device_config.precon_mode: %s", device_config.precon_mode);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"precon_button");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.precon_button)))
+	if(!CFG_GET(root, precon_button))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.precon_button, key->valuestring);
 	ESP_LOGE(TAG, "device_config.precon_button: %s", device_config.precon_button);
 	//*****
 
 	//*****
 	// key added after initial release; missing means a config saved by older
 	// firmware, so fall back to the default rather than rejecting the config
-	key = cJSON_GetObjectItem(root,"precon_press");
-	if(key == 0)
+	if(!CFG_GET(root, precon_press))
 	{
 		strcpy(device_config.precon_press, "short");
-	}
-	else if(strlen(key->valuestring) > sizeof(device_config.precon_press))
-	{
-		goto config_error;
-	}
-	else
-	{
-		strcpy(device_config.precon_press, key->valuestring);
 	}
 	ESP_LOGE(TAG, "device_config.precon_press: %s", device_config.precon_press);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"mqtt_tx_topic");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.mqtt_tx_topic)))
+	if(!CFG_GET(root, mqtt_tx_topic))
 	{
 		goto config_error;
 	}
-	if(strlen(key->valuestring) == 0)
+	if(strlen(device_config.mqtt_tx_topic) == 0)
 	{
-		sprintf(device_config.mqtt_tx_topic, "wican/%s/can/tx", device_id);
+		snprintf(device_config.mqtt_tx_topic, sizeof(device_config.mqtt_tx_topic), "wican/%s/can/tx", device_id);
 	}
-	else
-	{
-		strcpy(device_config.mqtt_tx_topic, key->valuestring);
-	}
-	
+
 	ESP_LOGE(TAG, "device_config.mqtt_tx_topic: %s", device_config.mqtt_tx_topic);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"mqtt_tx_en");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.mqtt_tx_en)))
+	if(!CFG_GET(root, mqtt_tx_en))
 	{
 		strcpy(device_config.mqtt_tx_en,"disable");
 	}
-	else
-	{
-		strcpy(device_config.mqtt_tx_en, key->valuestring);
-	}
-	
+
 	ESP_LOGE(TAG, "device_config.mqtt_tx_en: %s", device_config.mqtt_tx_en);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"mqtt_rx_en");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.mqtt_rx_en)))
+	if(!CFG_GET(root, mqtt_rx_en))
 	{
 		strcpy(device_config.mqtt_rx_en,"disable");
-	}
-	else
-	{
-		strcpy(device_config.mqtt_rx_en, key->valuestring);
 	}
 
 	ESP_LOGE(TAG, "device_config.mqtt_rx_en: %s", device_config.mqtt_rx_en);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"mqtt_rx_topic");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.mqtt_rx_topic)) || strlen(key->valuestring) == 0)
+	if(!CFG_GET(root, mqtt_rx_topic))
 	{
 		goto config_error;
 	}
-	strcpy(device_config.mqtt_rx_topic, key->valuestring);
 
-	
+
 	ESP_LOGE(TAG, "device_config.mqtt_rx_topic: %s", device_config.mqtt_rx_topic);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"mqtt_status_topic");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.mqtt_status_topic)) || strlen(key->valuestring) == 0)
+	if(!CFG_GET(root, mqtt_status_topic))
 	{
 		goto config_error;
 	}
-	strcpy(device_config.mqtt_status_topic, key->valuestring);
 
-	
+
 	ESP_LOGE(TAG, "device_config.mqtt_status_topic: %s", device_config.mqtt_status_topic);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"wakeup_volt");
-	if(key == 0)
+	if(!CFG_GET(root, wakeup_volt))
 	{
 		strcpy(device_config.wakeup_volt, "13.5");
-	}
-	else
-	{
-		strcpy(device_config.wakeup_volt, key->valuestring);
 	}
 
 	ESP_LOGE(TAG, "device_config.wakeup_volt: %s", device_config.wakeup_volt);
 	//*****
-	
+
 	//*****
-	key = cJSON_GetObjectItem(root,"sleep_time");
-	if(key == 0)
+	if(!CFG_GET(root, sleep_time))
 	{
 		strcpy(device_config.sleep_time, "2");
-	}
-	else
-	{
-		uint32_t sleep_time = atoi(device_config.sleep_time);
-
-		if(sleep_time > 30 && sleep_time < 1)
-		{
-			strcpy(device_config.sleep_time, "2");
-		}
-
-		strcpy(device_config.sleep_time, key->valuestring);
 	}
 
 	ESP_LOGE(TAG, "device_config.sleep_time: %s", device_config.sleep_time);
@@ -2764,49 +2659,27 @@ static void config_server_load_cfg(char *cfg)
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"sta_security");
-	if(key == 0)
+	if(!CFG_GET(root, sta_security))
 	{
 		strcpy(device_config.sta_security, "wpa3");
-	}
-	else
-	{
-		strcpy(device_config.sta_security, key->valuestring);
 	}
 
 	ESP_LOGE(TAG, "device_config.sta_security: %s", device_config.wakeup_volt);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"ap_auto_disable");
-	if(key == 0)
+	if(!CFG_GET(root, ap_auto_disable))
 	{
 		strcpy(device_config.ap_auto_disable, "disable");
 	}
-	else
-	{
-		strcpy(device_config.ap_auto_disable, key->valuestring);
-	}
 
 	ESP_LOGE(TAG, "device_config.ap_auto_disable: %s", device_config.ap_auto_disable);
-	//*****	
+	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"keep_alive");
-	if(key == 0)
+	if(!CFG_GET(root, keep_alive))
 	{
 		strcpy(device_config.keep_alive, "30");
-	}
-	else
-	{
-		uint32_t keep_alive = atoi(device_config.keep_alive);
-
-		if(keep_alive > 120 && keep_alive < 1)
-		{
-			strcpy(device_config.keep_alive, "30");
-		}
-
-		strcpy(device_config.keep_alive, key->valuestring);
 	}
 
 	ESP_LOGE(TAG, "device_config.keep_alive: %s", device_config.keep_alive);
