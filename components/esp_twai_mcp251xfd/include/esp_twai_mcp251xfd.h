@@ -22,7 +22,7 @@ typedef struct {
     } flags;
 } twai_mcp251xfd_node_config_t;
 
-// Classical CAN TWAI node on an MCP2517FD/MCP2518FD, using Zephyr's driver.
+// Classical CAN TWAI node on an MCP2518FD, using Zephyr's driver.
 //
 // The caller initializes the SPI bus without DMA and installs the GPIO ISR
 // service. The node reserves the SPI bus for itself.
