@@ -2277,11 +2277,12 @@ static const httpd_uri_t scan_available_pids_uri = {
     .handler   = scan_available_pids_handler,
     .user_ctx  = NULL
 };
-static void config_server_load_cfg(char *cfg)
+/* Load device_config from the JSON in cfg. false if cfg is not a config to
+ * run on (device_config is then partly filled and must be reloaded). */
+static bool config_server_load_cfg(char *cfg)
 {
 	cJSON * root, *key = 0;
 	root   = cJSON_Parse(cfg);
-    struct stat st;
 
 	if(!CFG_GET(root, wifi_mode))
 	{
@@ -2703,25 +2704,86 @@ static void config_server_load_cfg(char *cfg)
 	//*****
 
 	cJSON_Delete(root);
-	return;
+	return true;
 
 
 config_error:
-    // Check if destination file exists before renaming
-
-    if (stat(FS_MOUNT_POINT"/config.json", &st) == 0)
-    {
-    	ESP_LOGE(TAG, "config.json file error, restoring default");
-        // Delete it if it exists
-        unlink(FS_MOUNT_POINT"/config.json");
-		FILE* f = fopen(FS_MOUNT_POINT"/config.json", "w");
-		// sprintf(device_config_default, device_id, device_id);
-		fprintf(f, device_config_default, (char*)device_id, (char*)device_id, (char*)device_id);
-		fclose(f);
-		vTaskDelay(3000 / portTICK_PERIOD_MS);
-		esp_restart();
-    }
 	cJSON_Delete(root);
+	return false;
+}
+
+/* device_config_default for this device, malloc'd; NULL if out of memory */
+static char *config_default_json(void)
+{
+	int len = snprintf(NULL, 0, device_config_default, device_id, device_id, device_id);
+	char *buf = len < 0 ? NULL : malloc(len + 1);
+	if (buf != NULL)
+	{
+		snprintf(buf, len + 1, device_config_default, device_id, device_id, device_id);
+	}
+	return buf;
+}
+
+/* Set when device_config_file holds defaults that are not what's on disk,
+ * so config_server_set_ble_config() must not save it over config.json. */
+static bool device_config_file_unsaved = false;
+
+/* Run on the default config, and save it as config.json if save is set.
+ * Never restarts: if the default can't be saved, this boot still gets it,
+ * where restarting would only fail again on every boot. */
+static void config_server_load_default(bool save)
+{
+	char *def = config_default_json();
+	if (def == NULL)
+	{
+		ESP_LOGE(TAG, "No memory for the default config");
+		esp_restart();
+	}
+	if (save && !save_file_atomic(FS_MOUNT_POINT"/config.json", def, strlen(def)))
+	{
+		ESP_LOGE(TAG, "Couldn't save the default config, running on it anyway");
+		save = false;
+	}
+	device_config_file_unsaved = !save;
+	free(device_config_file);
+	device_config_file = def;
+	if (!config_server_load_cfg(device_config_file))
+	{
+		ESP_LOGE(TAG, "Default config rejected");
+	}
+}
+
+/* The whole file at path as a malloc'd C string; NULL if it can't be read. */
+static char *read_file(const char *path)
+{
+	FILE *f = fopen(path, "r");
+	if (f == NULL)
+	{
+		return NULL;
+	}
+	char *buf = NULL;
+	long size = -1;
+	if (fseek(f, 0, SEEK_END) == 0)
+	{
+		size = ftell(f);
+	}
+	if (size >= 0 && fseek(f, 0, SEEK_SET) == 0)
+	{
+		buf = malloc(size + 1);
+	}
+	if (buf != NULL && fread(buf, 1, size, f) == (size_t)size)
+	{
+		buf[size] = 0;
+		ESP_LOGI(TAG, "%s: %ld bytes", path, size);
+	}
+	else
+	{
+		ESP_LOGE(TAG, "Can't read %s (size %ld, errno %d)", path, size, errno);
+		free(buf);
+		buf = NULL;
+	}
+	fclose(f);
+	return buf;
 }
 
 void config_server_wifi_connected(bool flag)
@@ -2805,46 +2867,29 @@ static httpd_handle_t config_server_init(void)
     {
 		filesystem_init();
 
-		// Use POSIX and C standard library functions to work with files.
-		// First create a file.
-		ESP_LOGI(TAG, "Opening file");
-		FILE* f = fopen(FS_MOUNT_POINT"/config.json", "r");
-		if (f == NULL)
+		device_config_file = read_file(FS_MOUNT_POINT"/config.json");
+		if (device_config_file == NULL)
 		{
-			ESP_LOGI(TAG, "Config file does not exist, load default");
-			f = fopen(FS_MOUNT_POINT"/config.json", "w");
-//			fwrite(device_config_default , 1 , sizeof(device_config_default) , f );
-			fprintf(f, device_config_default, (char*)device_id, (char*)device_id, (char*)device_id);
-			fclose(f);
-			f = fopen(FS_MOUNT_POINT"/config.json", "r");
+			// Only replace a config.json that isn't there: one that is there
+			// but couldn't be read may still be good
+			struct stat st;
+			bool missing = stat(FS_MOUNT_POINT"/config.json", &st) != 0;
+			ESP_LOGW(TAG, "%s, load default", missing ? "Config file does not exist" : "Can't read config file");
+			config_server_load_default(missing);
 		}
-		fseek(f, 0, SEEK_END);
-		int filesize = ftell(f);
-		fseek(f, 0, SEEK_SET);
-
-		device_config_file = malloc(filesize+1);
-		ESP_LOGI(__func__, "File size: %d", filesize);
-		fseek(f, 0, SEEK_SET);
-		fread(device_config_file, sizeof(char), filesize, f);
-		device_config_file[filesize] = 0;
-		// Close before parsing: LittleFS won't unlink or rename an open file
-		fclose(f);
-		ESP_LOGI(TAG, "config.json: %s", device_config_file);
-		config_server_load_cfg(device_config_file);
-		
-		FILE* f1 = fopen(FS_MOUNT_POINT"/mqtt_canfilt.json", "r");
-		if (f1 != NULL)
+		else
 		{
-			fseek(f1, 0, SEEK_END);
-			filesize = ftell(f1);
-			fseek(f1, 0, SEEK_SET);
-			mqtt_canflt_file = malloc(filesize+1);
-			ESP_LOGI(__func__, "mqtt_canflt_file File size: %d", filesize);
-			fseek(f1, 0, SEEK_SET);
-			fread(mqtt_canflt_file, sizeof(char), filesize, f1);
-			mqtt_canflt_file[filesize] = 0;
-			fseek(f1, 0, SEEK_SET);
-			fclose(f1);
+			ESP_LOGI(TAG, "config.json: %s", device_config_file);
+			if (!config_server_load_cfg(device_config_file))
+			{
+				ESP_LOGE(TAG, "config.json file error, restoring default");
+				config_server_load_default(true);
+			}
+		}
+
+		mqtt_canflt_file = read_file(FS_MOUNT_POINT"/mqtt_canfilt.json");
+		if (mqtt_canflt_file != NULL)
+		{
 			ESP_LOGI(TAG, "mqtt_canfilt.json: %s", mqtt_canflt_file);
 		}
 
@@ -3364,6 +3409,13 @@ void config_server_set_ble_config(uint8_t b)
 	if (xTimerIsTimerActive(xrestartTimer))
 	{
 		ESP_LOGW(TAG, "Restart pending, BLE setting not saved");
+		return;
+	}
+	// Saving the defaults this boot runs on would replace a config.json
+	// that couldn't be read but may still be good
+	if (device_config_file_unsaved)
+	{
+		ESP_LOGW(TAG, "Running on unsaved defaults, BLE setting not saved");
 		return;
 	}
 	const char *status = b ? "enable" : "disable";
