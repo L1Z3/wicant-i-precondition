@@ -467,7 +467,15 @@ static esp_err_t index_handler(httpd_req_t *req)
 // ~150 custom PIDs at the page's maximum field lengths; real tables are a
 // few KB
 #define AUTOPID_MAX_LEN     (64 * 1024)
-// The saved JSON files are at most 3 levels deep (CAN filter rows)
+// The page saves one car (<10 KB), but older pages uploaded whole vehicle
+// profile files (115 KB today) of up to 200 KB, which a backup restore posts
+// again. The C3 has neither the heap to parse one that big nor the storage.
+#if CONFIG_IDF_TARGET_ESP32C3
+#define CAR_DATA_MAX_LEN    (32 * 1024)
+#else
+#define CAR_DATA_MAX_LEN    (200 * 1024)
+#endif
+// The saved JSON files are at most 7 levels deep (car data parameters)
 #define JSON_MAX_DEPTH      8
 
 /* Receive the whole body of a POST of at most max_len bytes into a
@@ -1106,45 +1114,43 @@ static esp_err_t store_auto_data_handler(httpd_req_t *req)
 }
 
 
+/* Saves len bytes of buf (NUL-terminated, the whole body received) as
+ * car_data.json if load_all_pids() and the page can use it, and answers the
+ * request: ok_msg if saved. */
+static void save_car_data(httpd_req_t *req, const char *buf, size_t len, const char *ok_msg)
+{
+    // Both read the first car of a cars array
+    cJSON *root = parse_body_json(buf, len);
+    bool valid = cJSON_IsObject(root) && cJSON_IsArray(cJSON_GetObjectItem(root, "cars")) &&
+                 json_leaves_are_strings(root);
+    cJSON_Delete(root);
+    if (!valid)
+    {
+        ESP_LOGE(TAG, "Invalid car data");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid car data");
+        return;
+    }
+
+    if (!save_file_atomic(FS_MOUNT_POINT"/car_data.json", buf, len))
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save car data");
+        return;
+    }
+    ESP_LOGI(TAG, "car_data.json saved (%u bytes)", (unsigned)len);
+    httpd_resp_send(req, ok_msg, HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t store_car_data_handler(httpd_req_t *req)
 {
-    int total_len = req->content_len;
-    int received = 0;
-	const char *filepath = FS_MOUNT_POINT"/car_data.json";
-
-    FILE *file = fopen(filepath, "w");
-    if (!file)
+    esp_err_t ret;
+    char *buf = recv_body(req, CAR_DATA_MAX_LEN, &ret);
+    if (buf == NULL)
     {
-        ESP_LOGE(TAG, "Failed to open file for writing");
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to open file for writing");
-        return ESP_FAIL;
+        return ret;
     }
 
-    static char buffer[16];
-    while (received < total_len)
-    {
-        int ret = httpd_req_recv(req, buffer, sizeof(buffer));
-        if (ret <= 0)
-        {
-            ESP_LOGE(TAG, "Failed to receive JSON data");
-            fclose(file);
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive JSON data");
-            return ESP_FAIL;
-        }
-        if (fwrite(buffer, 1, ret, file) != ret)
-        {
-            ESP_LOGE(TAG, "Failed to write data to file");
-            fclose(file);
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to write data to file");
-            return ESP_FAIL;
-        }
-        received += ret;
-    }
-
-    fclose(file);
-    ESP_LOGI(TAG, "JSON data successfully stored");
-
-    httpd_resp_send(req, "Data stored successfully", HTTPD_RESP_USE_STRLEN);
+    save_car_data(req, buf, req->content_len, "Data stored successfully");
+    free(buf);
     return ESP_OK;
 }
 
