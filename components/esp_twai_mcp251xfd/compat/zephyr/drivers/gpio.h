@@ -72,7 +72,8 @@ static inline int gpio_add_callback_dt(const struct gpio_dt_spec *spec, struct g
 }
 
 // Whether the INT pin's interrupt is enabled; see gpio_pin_interrupt_enabled_dt().
-static volatile bool z_gpio_int_enabled;
+// Defined in zephyr_compat.c.
+extern volatile bool z_gpio_int_enabled;
 
 // Called from the ISR (disable), and from the driver thread and controller
 // setup (enable).
