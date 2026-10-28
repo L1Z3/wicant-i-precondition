@@ -19,6 +19,7 @@
  */
 
 #include <string.h>
+#include <errno.h>
 #include <sys/param.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -44,6 +45,11 @@
 #define KEEPALIVE_IDLE              5
 #define KEEPALIVE_INTERVAL          5
 #define KEEPALIVE_COUNT             3
+
+// A client that stops reading must not pin the TX task forever. TCP can
+// backpressure for a while, but a closed or unresponsive peer has to be
+// reaped so the next connection starts from a clean session.
+#define TCP_SEND_TIMEOUT_MS         5000
 
 #define PORT_CLOSED_BIT			BIT0
 #define PORT_OPEN_BIT			BIT1
@@ -186,6 +192,62 @@ wait_skt_tx:
 	}
 }
 
+// Send a whole buffer, but bound the total time spent waiting for the peer to
+// make room. SO_SNDTIMEO makes lwIP return EWOULDBLOCK instead of sleeping when
+// the send buffer is full, so wait for writability here while the deadline has
+// time left. A dead or closed peer is then reaped rather than pinning the task.
+static int tcp_send_all(int fd, const uint8_t *buf, int len)
+{
+	int sent = 0;
+	int64_t deadline = esp_timer_get_time() + (int64_t)TCP_SEND_TIMEOUT_MS * 1000;
+
+	while (sent < len)
+	{
+		int written = send(fd, buf + sent, len - sent, 0);
+		if (written > 0)
+		{
+			sent += written;
+			continue;
+		}
+		if (written == 0)
+		{
+			errno = EIO;
+			return -1;
+		}
+		if (errno != EAGAIN && errno != EWOULDBLOCK)
+		{
+			return -1;
+		}
+
+		int64_t remaining_us = deadline - esp_timer_get_time();
+		if (remaining_us <= 0)
+		{
+			return 1;
+		}
+
+		struct timeval tv;
+		tv.tv_sec = remaining_us / 1000000;
+		tv.tv_usec = remaining_us % 1000000;
+		fd_set write_fds;
+		FD_ZERO(&write_fds);
+		FD_SET(fd, &write_fds);
+		int selected = select(fd + 1, NULL, &write_fds, NULL, &tv);
+		if (selected > 0)
+		{
+			continue;
+		}
+		if (selected == 0)
+		{
+			return 1;
+		}
+		if (errno != EINTR)
+		{
+			return -1;
+		}
+	}
+	return 0;
+}
+
 static void tcp_server_tx_task(void *pvParameters)
 {
 //	int addr_family = (int)pvParameters;
@@ -225,25 +287,27 @@ static void tcp_server_tx_task(void *pvParameters)
 			// producer's queue absorbs bus traffic before frames drop at the
 			// producer. Log stalls to correlate with drops.
 			int64_t send_start = esp_timer_get_time();
-			int to_write = bytes_used;
-			while (to_write > 0)
+			int send_result = tcp_send_all(sock, coalesce_buf, bytes_used);
+			int64_t send_us = esp_timer_get_time() - send_start;
+			if (send_result != 0)
 			{
-				int written = send(sock, coalesce_buf + (bytes_used - to_write), to_write, 0);
-				if (written < 0)
+				if (send_result > 0)
+				{
+					ESP_LOGW(TAG, "send() timed out after %d ms, %u msgs queued; dropping client",
+					         TCP_SEND_TIMEOUT_MS, (unsigned)uxQueueMessagesWaiting(*xTX_Queue));
+				}
+				else
 				{
 					ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
-					// Flag the session dead and kick the rx task out of recv() via
-					// shutdown; only the rx task raises PORT_CLOSED, so the server
-					// task can use that bit as proof nobody is blocked on this fd.
-					xEventGroupClearBits( xSocketEventGroup, PORT_OPEN_BIT );
-					gpio_set_level(conn_led, LED_OFF);
-					shutdown(sock, SHUT_RDWR);
-					break;
 				}
-				to_write -= written;
+				// Flag the session dead and kick the rx task out of recv() via
+				// shutdown; only the rx task raises PORT_CLOSED, so the server
+				// task can use that bit as proof nobody is blocked on this fd.
+				xEventGroupClearBits( xSocketEventGroup, PORT_OPEN_BIT );
+				gpio_set_level(conn_led, LED_OFF);
+				shutdown(sock, SHUT_RDWR);
 			}
-			int64_t send_us = esp_timer_get_time() - send_start;
-			if (send_us > 20000)
+			else if (send_us > 20000)
 			{
 				ESP_LOGW(TAG, "send() stalled %lld us, %u msgs queued behind it",
 				         send_us, (unsigned)uxQueueMessagesWaiting(*xTX_Queue));
@@ -348,6 +412,16 @@ static void tcp_server_task(void *pvParameters)
 			// sender's own send buffer instead of piling up here; nothing is dropped.
 			int rcvBuf = 2048;
 			setsockopt(new_sock, SOL_SOCKET, SO_RCVBUF, &rcvBuf, sizeof(int));
+			// A non-zero SO_SNDTIMEO makes lwIP's send path return EWOULDBLOCK
+			// instead of blocking forever on a peer that has stopped reading.
+			// tcp_send_all() then waits for writability up to the same deadline.
+			struct timeval send_timeout;
+			send_timeout.tv_sec = TCP_SEND_TIMEOUT_MS / 1000;
+			send_timeout.tv_usec = (TCP_SEND_TIMEOUT_MS % 1000) * 1000;
+			if (setsockopt(new_sock, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout)) != 0)
+			{
+				ESP_LOGW(TAG, "Unable to set send timeout: errno %d", errno);
+			}
 			// Convert ip address to string; keep the source port too, so a
 			// connection can be matched to a process on the client machine.
 			if (source_addr.ss_family == PF_INET)
