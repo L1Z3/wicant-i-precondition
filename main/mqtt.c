@@ -86,15 +86,21 @@ static uint8_t mqtt_elm327_log = 0;
 static SemaphoreHandle_t xmqtt_semaphore;
 
 
+// The CAN filter page's limits (homepage_full.html, addCANFLTRow). The
+// row limit also keeps every index in mqtt_canflt_find_id()'s int8_t.
+#define CANFLT_NAME_MAX     16
+#define CANFLT_EXPR_MAX     64
+#define CANFLT_MAX_ROWS     100
+
 typedef struct 
 {
     uint32_t can_id;
-    char name[16];
+    char name[CANFLT_NAME_MAX + 1];
 	int32_t pid;
     int32_t pidi;
     uint32_t start_bit;
     uint32_t bit_length;
-    char expression[32];
+    char expression[CANFLT_EXPR_MAX + 1];
     uint32_t cycle;
 	int64_t logtime;
 } CANFilter;
@@ -409,7 +415,8 @@ static void mqtt_task(void *pvParameters)
                         uint64_t start_bit = 64 - mqtt_canflt_values[found_index].start_bit - mqtt_canflt_values[found_index].bit_length;
                         uint64_t bit_length = mqtt_canflt_values[found_index].bit_length;
 
-                        uint64_t mask = ((1ULL << bit_length) - 1ULL) << start_bit;
+                        // 1ULL << 64 is undefined: a 64-bit field is all of can_data
+                        uint64_t mask = (bit_length >= 64 ? ~0ULL : (1ULL << bit_length) - 1ULL) << start_bit;
 
                         value = (can_data & mask) >> start_bit;
 
@@ -493,6 +500,87 @@ static void mqtt_task(void *pvParameters)
 	}
 }
 
+static bool canflt_number_in(const cJSON *item, double min, double max)
+{
+    return cJSON_IsNumber(item) && item->valuedouble >= min && item->valuedouble <= max;
+}
+
+static bool canflt_string_in(const cJSON *item, size_t max_len)
+{
+    return cJSON_IsString(item) && item->valuestring != NULL &&
+           strlen(item->valuestring) >= 1 && strlen(item->valuestring) <= max_len;
+}
+
+/* Fill flt from one can_flt row. NULL if it is a filter mqtt_task can run,
+ * else what is wrong with it (flt is then partly filled). Same limits as
+ * the page: a name or expression that doesn't fit is not cut short, as a
+ * cut expression would compute something else. */
+static const char *mqtt_canflt_parse(const cJSON *item, CANFilter *flt)
+{
+    if (!cJSON_IsObject(item))
+    {
+        return "not an object";
+    }
+    const cJSON *can_id = cJSON_GetObjectItem(item, "CANID");
+    const cJSON *name = cJSON_GetObjectItem(item, "Name");
+    const cJSON *pid = cJSON_GetObjectItem(item, "PID");
+    const cJSON *pidi = cJSON_GetObjectItem(item, "PIDIndex");
+    const cJSON *start_bit = cJSON_GetObjectItem(item, "StartBit");
+    const cJSON *bit_length = cJSON_GetObjectItem(item, "BitLength");
+    const cJSON *expression = cJSON_GetObjectItem(item, "Expression");
+    const cJSON *cycle = cJSON_GetObjectItem(item, "Cycle");
+
+    if (!canflt_number_in(can_id, 0, 536870912))
+    {
+        return "bad CANID";
+    }
+    if (!canflt_string_in(name, CANFLT_NAME_MAX))
+    {
+        return "Name missing or too long";
+    }
+    if (!canflt_number_in(pid, -1, 255))
+    {
+        return "bad PID";
+    }
+    // PIDIndex picks the data byte compared with PID, so it only matters
+    // (and must be a byte of the frame) when there is a PID
+    flt->pidi = 2;  // the default when it is missing
+    if (pidi != NULL && pid->valuedouble != -1)
+    {
+        if (!canflt_number_in(pidi, 0, 7))
+        {
+            return "bad PIDIndex";
+        }
+        flt->pidi = (int32_t)pidi->valuedouble;
+    }
+    if (!canflt_number_in(start_bit, 0, 63) || !canflt_number_in(bit_length, 1, 64) ||
+        start_bit->valuedouble + bit_length->valuedouble > 64)
+    {
+        return "bad StartBit or BitLength";
+    }
+    if (!canflt_string_in(expression, CANFLT_EXPR_MAX))
+    {
+        return "Expression missing or too long";
+    }
+    // mqtt_task waits cycle * 1000 us, in 32 bits
+    if (!canflt_number_in(cycle, 0, UINT32_MAX / 1000))
+    {
+        return "bad Cycle";
+    }
+
+    flt->can_id = (uint32_t)can_id->valuedouble;
+    strlcpy(flt->name, name->valuestring, sizeof(flt->name));
+    flt->pid = (int32_t)pid->valuedouble;
+    flt->start_bit = (uint32_t)start_bit->valuedouble;
+    flt->bit_length = (uint32_t)bit_length->valuedouble;
+    strlcpy(flt->expression, expression->valuestring, sizeof(flt->expression));
+    flt->cycle = (uint32_t)cycle->valuedouble;
+    flt->logtime = 0;
+    return NULL;
+}
+
+/* Load the MQTT CAN filters from mqtt_canfilt.json. A row that is not a
+ * valid filter is skipped (and logged); the others still load. */
 static void mqtt_load_filter(void)
 {
     char *canflt_json = config_server_get_mqtt_canflt();
@@ -515,8 +603,19 @@ static void mqtt_load_filter(void)
         return;
     }
 
-    mqtt_canflt_size = cJSON_GetArraySize(can_flt);
-    mqtt_canflt_values = (CANFilter *)malloc(mqtt_canflt_size * sizeof(CANFilter));
+    uint32_t rows = cJSON_GetArraySize(can_flt);
+    if (rows > CANFLT_MAX_ROWS)
+    {
+        ESP_LOGE(TAG, "%lu CAN filter rows, only the first %d are used", rows, CANFLT_MAX_ROWS);
+        rows = CANFLT_MAX_ROWS;
+    }
+    if (rows == 0)
+    {
+        cJSON_Delete(root);
+        return;
+    }
+
+    mqtt_canflt_values = (CANFilter *)malloc(rows * sizeof(CANFilter));
 
     if (mqtt_canflt_values == NULL) 
     {
@@ -526,62 +625,38 @@ static void mqtt_load_filter(void)
         return;
     }
 
-    for (uint32_t i = 0; i < mqtt_canflt_size; i++) 
+    uint32_t i = 0;
+    uint32_t loaded = 0;
+    const cJSON *item;
+    cJSON_ArrayForEach(item, can_flt)
     {
-        cJSON *item = cJSON_GetArrayItem(can_flt, i);
-        if (!cJSON_IsObject(item)) 
+        if (i == rows)
         {
-            free(mqtt_canflt_values);
-            cJSON_Delete(root);
-            ESP_LOGE(TAG, "Failed to get json array can_flt");
-            mqtt_canflt_size = 0;
-            return;
+            break;
         }
-
-        // Extract values from the JSON object and populate the CANFilter structure
-        cJSON *can_id = cJSON_GetObjectItem(item, "CANID");
-        cJSON *name = cJSON_GetObjectItem(item, "Name");
-        cJSON *pid = cJSON_GetObjectItem(item, "PID");  // Added 'PID' field
-        cJSON *pidi = cJSON_GetObjectItem(item, "PIDIndex");  // Added 'PID' field
-        cJSON *start_bit = cJSON_GetObjectItem(item, "StartBit");
-        cJSON *bit_length = cJSON_GetObjectItem(item, "BitLength");
-        cJSON *expression = cJSON_GetObjectItem(item, "Expression");
-        cJSON *cycle = cJSON_GetObjectItem(item, "Cycle");
-
-        //if pidi is null set it to default 2
-        if(pidi == NULL)
+        CANFilter *flt = &mqtt_canflt_values[loaded];
+        const char *err = mqtt_canflt_parse(item, flt);
+        if (err != NULL)
         {
-            pidi = cJSON_CreateNumber(2);
+            ESP_LOGE(TAG, "CAN filter row %lu skipped: %s", i, err);
         }
-
-        if (cJSON_IsNumber(can_id) && cJSON_IsString(name) && cJSON_IsNumber(pid) && cJSON_IsNumber(pidi) &&
-            cJSON_IsNumber(start_bit) && cJSON_IsNumber(bit_length) && cJSON_IsString(expression) && cJSON_IsNumber(cycle)) 
+        else
         {
-            mqtt_canflt_values[i].can_id = (uint32_t)can_id->valuedouble;
-            strncpy(mqtt_canflt_values[i].name, name->valuestring, sizeof(mqtt_canflt_values[i].name));
-            mqtt_canflt_values[i].pid = (int32_t)pid->valuedouble;  // Set 'pid' field
-            mqtt_canflt_values[i].pidi = (int32_t)pidi->valuedouble;
-            mqtt_canflt_values[i].start_bit = (uint32_t)start_bit->valuedouble;
-            mqtt_canflt_values[i].bit_length = (uint32_t)bit_length->valuedouble;
-            strncpy(mqtt_canflt_values[i].expression, expression->valuestring, sizeof(mqtt_canflt_values[i].expression));
-            mqtt_canflt_values[i].cycle = (uint32_t)cycle->valuedouble;
-            mqtt_canflt_values[i].logtime = 0;
-
             ESP_LOGI(TAG, "Loaded CAN Filter %lu: CAN ID=%lu, PID=%ld, PIDIndex=%ld, Name=%s, Start Bit=%lu, Bit Length=%lu, Expression=%s, Cycle=%lu",
-                     i, mqtt_canflt_values[i].can_id, mqtt_canflt_values[i].pid, mqtt_canflt_values[i].pidi, mqtt_canflt_values[i].name,
-                     mqtt_canflt_values[i].start_bit, mqtt_canflt_values[i].bit_length,
-                     mqtt_canflt_values[i].expression, mqtt_canflt_values[i].cycle);
+                     loaded, flt->can_id, flt->pid, flt->pidi, flt->name,
+                     flt->start_bit, flt->bit_length,
+                     flt->expression, flt->cycle);
+            loaded++;
         }
-        else 
-        {
-            free(mqtt_canflt_values);
-            cJSON_Delete(root);
-            ESP_LOGE(TAG, "cJSON_IsNumber(can_id)");
-            mqtt_canflt_size = 0;
-            return;
-        }
+        i++;
     }
 
+    mqtt_canflt_size = loaded;
+    if (loaded == 0)
+    {
+        free(mqtt_canflt_values);
+        mqtt_canflt_values = NULL;
+    }
     cJSON_Delete(root);
 }
 
