@@ -35,6 +35,7 @@
 #include "comm_server.h"
 #include "lwip/sockets.h"
 #include "driver/twai.h"
+#include "driver/temperature_sensor.h"
 #include "types.h"
 #include "config_server.h"
 #include "realdash.h"
@@ -78,6 +79,11 @@
 #else
 #define LOG_TS_NAME "none"
 #endif
+
+// The ESP32-S3 temperature sensor is a die/package proxy, not ambient. Log it
+// slowly so it can be correlated with resets or CAN faults without adding load.
+#define TEMP_PROXY_TAG 		"temp_proxy"
+#define TEMP_PROXY_PERIOD_MS	60000
 
 #define GPIO_OUTPUT_PIN_SEL  ((1ULL<<CONNECTED_LED_GPIO_NUM) | (1ULL<<ACTIVE_LED_GPIO_NUM) | (1ULL<<PWR_LED_GPIO_NUM))
 
@@ -585,6 +591,39 @@ static const char *reset_reason_name(esp_reset_reason_t reason)
 	}
 }
 
+static void temperature_proxy_task(void *arg)
+{
+	temperature_sensor_handle_t sensor = (temperature_sensor_handle_t)arg;
+
+	while (1)
+	{
+		// Re-enable per sample: the sensor is not retained across light sleep
+		// unless the driver is configured with allow_pd, and one sample a
+		// minute does not justify keeping it powered.
+		esp_err_t err = temperature_sensor_enable(sensor);
+		if (err == ESP_OK || err == ESP_ERR_INVALID_STATE)
+		{
+			float celsius = 0;
+			err = temperature_sensor_get_celsius(sensor, &celsius);
+			if (err == ESP_OK)
+			{
+				ESP_LOGI(TEMP_PROXY_TAG, "die temperature: %.1f C", celsius);
+			}
+			else
+			{
+				ESP_LOGW(TEMP_PROXY_TAG, "read failed: %s", esp_err_to_name(err));
+			}
+			temperature_sensor_disable(sensor);
+		}
+		else
+		{
+			ESP_LOGW(TEMP_PROXY_TAG, "enable failed: %s", esp_err_to_name(err));
+		}
+
+		vTaskDelay(pdMS_TO_TICKS(TEMP_PROXY_PERIOD_MS));
+	}
+}
+
 void app_main(void)
 {
 	// Hook esp_log before anything else logs; lines are buffered in RAM
@@ -979,6 +1018,7 @@ void app_main(void)
 			"can_mcp251xfd",
 			"mcp251xfd_spi",
 			"file_logs",
+			"temp_proxy",
 			"can_recovery_task",
 			"can_enable",
 			"can_disable",
@@ -990,6 +1030,26 @@ void app_main(void)
 		{
 			esp_log_level_set(diag_tags[i], ESP_LOG_INFO);
 		}
+	}
+
+	// A die-temperature trace is useful when chasing resets under load, but it
+	// is not an ambient measurement. The task reads once a minute and does not
+	// touch the CAN paths. The temp_proxy tag is included in diag_tags above,
+	// so it follows the configured post-boot log level.
+	temperature_sensor_config_t temp_cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 80);
+	temperature_sensor_handle_t temp_sensor = NULL;
+	esp_err_t temp_err = temperature_sensor_install(&temp_cfg, &temp_sensor);
+	if (temp_err == ESP_OK)
+	{
+		if (xTaskCreate(temperature_proxy_task, "temp_proxy", 2048, temp_sensor, 1, NULL) != pdPASS)
+		{
+			ESP_LOGE(TAG, "temperature proxy task create failed");
+			temperature_sensor_uninstall(temp_sensor);
+		}
+	}
+	else
+	{
+		ESP_LOGW(TAG, "temperature sensor unavailable: %s", esp_err_to_name(temp_err));
 	}
 	// esp_log_level_set("autopid_parser", ESP_LOG_ERROR);
 	// esp_log_level_set("autopid_task", ESP_LOG_ERROR);
