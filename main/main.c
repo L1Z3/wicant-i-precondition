@@ -607,7 +607,7 @@ static void temperature_proxy_task(void *arg)
 			err = temperature_sensor_get_celsius(sensor, &celsius);
 			if (err == ESP_OK)
 			{
-				ESP_LOGI(TEMP_PROXY_TAG, "die temperature: %.1f C", celsius);
+				ESP_LOGI(TEMP_PROXY_TAG, "die %.1f C", celsius);
 			}
 			else
 			{
@@ -1041,7 +1041,7 @@ void app_main(void)
 	esp_err_t temp_err = temperature_sensor_install(&temp_cfg, &temp_sensor);
 	if (temp_err == ESP_OK)
 	{
-		if (xTaskCreate(temperature_proxy_task, "temp_proxy", 2048, temp_sensor, 1, NULL) != pdPASS)
+		if (xTaskCreate(temperature_proxy_task, "temp_proxy", 4096, temp_sensor, 1, NULL) != pdPASS)
 		{
 			ESP_LOGE(TAG, "temperature proxy task create failed");
 			temperature_sensor_uninstall(temp_sensor);
