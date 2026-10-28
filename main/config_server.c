@@ -590,6 +590,87 @@ static bool json_leaves_are_strings(const cJSON *item)
     return cJSON_IsString(item);
 }
 
+/* An array of objects, or NULL (the key is optional). */
+static bool json_object_array_or_null(const cJSON *item)
+{
+    if (item == NULL)
+    {
+        return true;
+    }
+    if (!cJSON_IsArray(item))
+    {
+        return false;
+    }
+    const cJSON *child;
+    cJSON_ArrayForEach(child, item)
+    {
+        if (!cJSON_IsObject(child))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Arrays of objects, or NULL, whose objects all have a string key. */
+static bool json_objects_have_string(const cJSON *array, const char *key)
+{
+    if (!json_object_array_or_null(array))
+    {
+        return false;
+    }
+    const cJSON *child;
+    cJSON_ArrayForEach(child, array)
+    {
+        if (!cJSON_IsString(cJSON_GetObjectItem(child, key)))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The shape load_all_pids() (autopid.c) uses from auto_pid.json. It skips
+ * entries it can't use, but refusing them here tells the user. */
+static bool auto_pid_usable(const cJSON *root)
+{
+    return cJSON_IsObject(root) && json_leaves_are_strings(root) &&
+           json_objects_have_string(cJSON_GetObjectItem(root, "pids"), "Name") &&
+           json_objects_have_string(cJSON_GetObjectItem(root, "std_pids"), "Name");
+}
+
+/* The same for car_data.json: a cars array of objects, each PID with at
+ * least one parameter, every parameter named. */
+static bool car_data_usable(const cJSON *root)
+{
+    const cJSON *cars = cJSON_GetObjectItem(root, "cars");
+    if (!cJSON_IsObject(root) || !json_leaves_are_strings(root) ||
+        !cJSON_IsArray(cars) || !json_object_array_or_null(cars))
+    {
+        return false;
+    }
+    const cJSON *car;
+    cJSON_ArrayForEach(car, cars)
+    {
+        const cJSON *pids = cJSON_GetObjectItem(car, "pids");
+        if (!json_object_array_or_null(pids))
+        {
+            return false;
+        }
+        const cJSON *pid;
+        cJSON_ArrayForEach(pid, pids)
+        {
+            const cJSON *params = cJSON_GetObjectItem(pid, "parameters");
+            if (!cJSON_IsArray(params) || cJSON_GetArraySize(params) == 0 ||
+                !json_objects_have_string(params, "name"))
+            {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 /* Replace path with len bytes of buf: write path.tmp, then rename it over
  * path (atomic on LittleFS), so a failed save leaves the old file in place. */
 static bool save_file_atomic(const char *path, const char *buf, size_t len)
@@ -1038,9 +1119,8 @@ static esp_err_t store_auto_data_handler(httpd_req_t *req)
         return ret;
     }
 
-    // load_all_pids() wants an object of settings and PID tables
     cJSON *root = parse_body_json(buf, req->content_len);
-    bool valid = cJSON_IsObject(root) && json_leaves_are_strings(root);
+    bool valid = auto_pid_usable(root);
     cJSON_Delete(root);
     if (!valid)
     {
@@ -1069,10 +1149,8 @@ static esp_err_t store_auto_data_handler(httpd_req_t *req)
  * request: ok_msg if saved. */
 static void save_car_data(httpd_req_t *req, const char *buf, size_t len, const char *ok_msg)
 {
-    // Both read the first car of a cars array
     cJSON *root = parse_body_json(buf, len);
-    bool valid = cJSON_IsObject(root) && cJSON_IsArray(cJSON_GetObjectItem(root, "cars")) &&
-                 json_leaves_are_strings(root);
+    bool valid = car_data_usable(root);
     cJSON_Delete(root);
     if (!valid)
     {
