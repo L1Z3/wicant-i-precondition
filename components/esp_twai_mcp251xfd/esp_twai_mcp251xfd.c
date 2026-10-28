@@ -300,12 +300,15 @@ static esp_err_t node_delete(twai_node_handle_t handle)
 	}
 	node->callbacks = (twai_event_callbacks_t){};
 	k_mutex_unlock(&node->data.mutex);
-	node->in_use = false;
 	int ret = controller_sleep(node);
 	if (ret < 0) {
 		// The node is still released; the next creation resets the controller.
 		ESP_LOGW(TAG, "controller sleep failed: %d", ret);
 	}
+	// Released only now, so a creation can't set the controller up and have
+	// it put to sleep here. Create and delete aren't otherwise safe against
+	// each other: callers serialize them (can.c's node_lock).
+	node->in_use = false;
 	return ESP_OK;
 }
 
