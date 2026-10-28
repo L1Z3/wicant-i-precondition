@@ -462,6 +462,8 @@ static esp_err_t index_handler(httpd_req_t *req)
 
 // config.json is ~1.2 KB, under 4 KB with every field at its maximum
 #define CONFIG_MAX_LEN      (16 * 1024)
+// ~90 CAN filter rows of maximum length
+#define CANFLT_MAX_LEN      (16 * 1024)
 // The saved JSON files are at most 3 levels deep (CAN filter rows)
 #define JSON_MAX_DEPTH      8
 
@@ -719,68 +721,43 @@ static esp_err_t store_config_handler(httpd_req_t *req)
 
 static esp_err_t store_canflt_handler(httpd_req_t *req)
 {
-    char *buf = NULL;
-    size_t buf_size = req->content_len;
-
-    if (buf_size <= 0)
+    esp_err_t ret;
+    char *buf = recv_body(req, CANFLT_MAX_LEN, &ret);
+    if (buf == NULL)
     {
-        return ESP_FAIL; // Invalid content length
+        return ret;
     }
 
-    buf = (char *)malloc(buf_size);
-    if (!buf)
+    // The page parses /load_canflt as JSON and mqtt_load_filter() wants a
+    // can_flt array of row objects
+    cJSON *root = parse_body_json(buf, req->content_len);
+    const cJSON *rows = cJSON_GetObjectItem(root, "can_flt");
+    bool valid = cJSON_IsObject(root) && cJSON_IsArray(rows);
+    const cJSON *row;
+    cJSON_ArrayForEach(row, rows)
     {
-        return ESP_ERR_NO_MEM; // Memory allocation failure
+        valid = valid && cJSON_IsObject(row);
     }
-
-    int ret = recv_full(req, buf, buf_size);
-
-    if (ret <= 0)
+    cJSON_Delete(root);
+    if (!valid)
     {
-        if (ret == HTTPD_SOCK_ERR_TIMEOUT)
-        {
-            // Timed out waiting for the rest of the body
-            free(buf);
-            return ESP_FAIL;
-        }
-        // Handle read error
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid CAN filter");
         free(buf);
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
-    FILE *f = fopen(FS_MOUNT_POINT"/mqtt_canfilt.json", "w");
-    if (f)
+    if (!save_file_atomic(FS_MOUNT_POINT"/mqtt_canfilt.json", buf, req->content_len))
     {
-        // Write the received data into the file
-        fwrite(buf, 1, buf_size, f);
-        fclose(f);
-    }
-    else
-    {
-        // Handle file open error
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save CAN filter");
         free(buf);
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
-    // Free dynamically allocated memory
-    free(buf);
+    // What was saved is what /load_canflt serves now
+    free(mqtt_canflt_file);
+    mqtt_canflt_file = buf;
+    ESP_LOGI(TAG, "mqtt_canfilt.json: %s", mqtt_canflt_file);
 
-	free(mqtt_canflt_file);
-	mqtt_canflt_file = NULL;
-	FILE* f1 = fopen(FS_MOUNT_POINT"/mqtt_canfilt.json", "r");
-	if (f1 != NULL)
-	{
-		fseek(f1, 0, SEEK_END);
-		int32_t filesize = ftell(f1);
-		fseek(f1, 0, SEEK_SET);
-		mqtt_canflt_file = malloc(filesize+1);
-		ESP_LOGI(__func__, "mqtt_canflt_file File size: %ld", filesize);
-		fseek(f1, 0, SEEK_SET);
-		fread(mqtt_canflt_file, sizeof(char), filesize, f1);
-		mqtt_canflt_file[filesize] = 0;
-		fseek(f1, 0, SEEK_SET);
-		ESP_LOGI(TAG, "mqtt_canfilt.json: %s", mqtt_canflt_file);
-	}
     const char *resp_str = "CAN filter saved! Filter will take effect after submit.";
     httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
 
