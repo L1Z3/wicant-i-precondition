@@ -433,7 +433,9 @@ static esp_err_t create(spi_host_device_t host, const twai_mcp251xfd_node_config
 	};
 	esp_err_t err = spi_bus_add_device(host, &spi_config, &node->spi);
 	// The bus is dedicated to this controller: reserve it once instead of
-	// arbitrating on every short transfer.
+	// arbitrating on every short transfer. This also holds the bus's power-
+	// management lock for good, which spi_transfer_ll() relies on (see
+	// compat/zephyr/drivers/spi.h).
 	if (err == ESP_OK) {
 		err = spi_device_acquire_bus(node->spi, portMAX_DELAY);
 		if (err != ESP_OK) {

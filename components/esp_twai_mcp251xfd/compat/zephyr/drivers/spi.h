@@ -35,6 +35,15 @@ static inline bool spi_is_ready_dt(const struct spi_dt_spec *spec)
 // (full duplex, no command/address/dummy phases), so after the driver's first
 // transfers only the length and data change. Transfers must fit the
 // peripheral's 64-byte buffer.
+//
+// The adapter acquires the bus for good (spi_device_acquire_bus()), which
+// also holds the bus's ESP_PM_APB_FREQ_MAX power-management lock whenever
+// CONFIG_PM_ENABLE is set (it isn't in this firmware). That lock is what
+// keeps this path safe under power management: the clock divider set up for
+// the device assumes the APB clock doesn't change. It also keeps APB at
+// 80 MHz and prevents automatic light sleep from the first node creation
+// until restart, as the node is never freed; an explicit
+// esp_light_sleep_start() ignores it. Don't release the bus to save power.
 static inline void spi_transfer_ll(spi_dev_t *hw, const void *tx, void *rx, size_t len)
 {
 	size_t bits = len * 8;
