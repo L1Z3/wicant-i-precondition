@@ -1,7 +1,11 @@
 // TWAI node adapter for the vendored Zephyr MCP251xFD driver (see README.md).
 // The driver source is compiled into this file so its static functions can be
 // instantiated directly, without Zephyr's devicetree.
+#pragma GCC diagnostic push
+// The driver casts its thread function to Zephyr's three-argument entry type.
+#pragma GCC diagnostic ignored "-Wcast-function-type"
 #include "zephyr/drivers/can/can_mcp251xfd.c"
+#pragma GCC diagnostic pop
 
 #include <string.h>
 #include "esp_check.h"
