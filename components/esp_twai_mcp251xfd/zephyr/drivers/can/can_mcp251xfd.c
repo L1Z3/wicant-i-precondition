@@ -1072,7 +1072,13 @@ static void mcp251xfd_handle_interrupts(const struct device *dev)
 		/* these interrupt flags need to be explicitly cleared */
 		if (reg_int & MCP251XFD_REG_INT_IF_CLEARABLE_MASK) {
 
-			*reg_int_hw &= ~MCP251XFD_REG_INT_IF_CLEARABLE_MASK;
+			// LOCAL PATCH: clear only the flags read above. The clearable
+			// flags are cleared by writing 0, and a 1 leaves every bit here
+			// unchanged, so write 1 everywhere else. Upstream wrote
+			// 0 to every clearable flag, also clearing any set since the read,
+			// which this pass never handles (a CERRIF while the state is
+			// error-active, say). Linux does the same.
+			*reg_int_hw = (uint16_t)~(reg_int & MCP251XFD_REG_INT_IF_CLEARABLE_MASK);
 
 			*reg_int_hw = sys_cpu_to_le16(*reg_int_hw);
 
