@@ -295,6 +295,7 @@ static void precondition_task_start(void)
 // is preferable to dropping bus-0 traffic and the GVRET stream.
 // ---------------------------------------------------------------------------
 #define CAN_FWD_QUEUE_LEN 256
+#define CAN_FWD_DROP_LOG_INTERVAL_US (60LL * 1000 * 1000)
 typedef struct {
 	twai_message_t message;
 	can_bus_t bus;
@@ -305,13 +306,13 @@ static uint32_t can_fwd_dropped = 0;
 static int64_t can_fwd_drop_log_us = 0;
 
 // Dropping a forwarded frame is expected when the target bus is down or the
-// queue is full; log the total at most once a second so a saturated bus does
+// queue is full; log the total at most once a minute so a saturated bus does
 // not turn the drop path into a log flood.
 static void can_fwd_count_drop(const char *why)
 {
 	can_fwd_dropped++;
 	int64_t now = esp_timer_get_time();
-	if (now - can_fwd_drop_log_us > 1000000)
+	if (now - can_fwd_drop_log_us > CAN_FWD_DROP_LOG_INTERVAL_US)
 	{
 		can_fwd_drop_log_us = now;
 		ESP_LOGW(TAG, "precondition fwd: %lu frames dropped (%s)",
