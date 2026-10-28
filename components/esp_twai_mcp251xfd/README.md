@@ -58,6 +58,13 @@ In `zephyr/drivers/can/can_mcp251xfd.{c,h}`, each marked `LOCAL PATCH`:
    `twai_mcp251xfd_get_rx_overflow_count()`. It needs no interrupt of its
    own: a full FIFO keeps `RXIF` set. If `CONFIG_CAN_STATS` is ever enabled,
    upstream's handler clears the flag too and the two counts can disagree.
+8. **Only the interrupt flags read are cleared.** Upstream writes 0 to every
+   clearable `CiINT` flag after reading them, also clearing any set since the
+   read, which that pass never handles: a lost `CERRIF` could leave the
+   driver reporting error-active with the controller bus-off. The write now
+   clears only the flags the pass read, as Linux's driver does.
+9. **RESET command padded to a word.** The SPI transfer copies its buffer in
+   4-byte words, so the 2-byte command was over-read by 2 bytes.
 
 [errata]: https://ww1.microchip.com/downloads/aemDocuments/documents/APID/ProductDocuments/Errata/MCP2518FD-Silicon-Errata-and-Data-Sheet-Clarification-DS80000789.pdf
 
