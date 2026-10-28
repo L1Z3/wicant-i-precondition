@@ -1,8 +1,10 @@
 # esp_twai_mcp251xfd
 
-A TWAI node (the `esp_driver_twai` interface) for an MCP2517FD/MCP2518FD on
-SPI, built on Zephyr's MCP251xFD driver. Classical CAN only. WiCAN uses it for
-bus 1 on `eb-fd`.
+A TWAI node (the `esp_driver_twai` interface) for an MCP2518FD on SPI, built
+on Zephyr's MCP251xFD driver. Classical CAN only. WiCAN uses it for bus 1 on
+`eb-fd`. The MCP2517FD shares the register map but has no Low Power Mode, so
+`twai_node_delete()` would leave it in Sleep mode; it is untested, and its
+errata (DS80000792) haven't been reviewed.
 
 ## Layout
 
@@ -41,7 +43,10 @@ In `zephyr/drivers/can/can_mcp251xfd.{c,h}`, each marked `LOCAL PATCH`:
    then, so the state change would otherwise be lost.
 5. **Bounded abort wait in `stop()`.** Upstream polls for `ABAT` to clear
    without a limit, hanging the caller if the controller never clears it.
-   The wait now times out after 200 ms and fails the stop.
+   The wait now times out and fails the stop. It uses the driver's
+   mode-change timeout, nominally 200 ms (101 reads with 2 ms sleeps between
+   them), but each sleep is 3 ticks at the 1 kHz tick, so it can take up to
+   about 300 ms, as the mode-change waits can.
 6. **INT's interrupt enabled after controller setup.** Upstream enables it
    before resetting the controller, which may still be asserting INT after an
    MCU restart; the interrupt thread then accesses the controller alongside
