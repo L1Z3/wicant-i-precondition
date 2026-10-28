@@ -211,3 +211,9 @@ int8_t config_server_precon_button(void);
 bool config_server_temperature_fahrenheit(void);
 int8_t config_server_precon_mode(void);
 int8_t config_server_precon_press(void);
+
+// The saved JSON files are at most 7 levels deep (car data parameters)
+#define JSON_MAX_DEPTH      8
+// Whether the NUL-terminated JSON text s nests at most max_depth deep. cJSON
+// recurses once per level, so check before parsing on a small stack.
+bool json_depth_ok(const char *s, int max_depth);
