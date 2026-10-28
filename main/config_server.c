@@ -709,13 +709,14 @@ static esp_err_t store_config_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
-    const char *resp_str = "Configuration saved! Rebooting...";
-    httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
-
+    // Before replying: a running timer tells config_server_set_ble_config()
+    // that config.json no longer matches the config read at boot.
     if (xTimerStart(xrestartTimer, 0) != pdPASS)
     {
         ESP_LOGE(TAG, "Couldn't start the restart timer");
     }
+    const char *resp_str = "Configuration saved! Rebooting...";
+    httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
