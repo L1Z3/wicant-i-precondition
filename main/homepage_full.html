@@ -3636,12 +3636,14 @@ function loadAutoTable(jsonData) {
 			alert("cycle must be between 100 and 10000");
 			return;
 		}
-		if(name.length < 1 || name.length > 16) {
-			alert("Name must be between 1 and 16 characters in length.");
+		// Bytes as stored, not UTF-16 units: the firmware skips longer rows
+		var utf8Length = (s) => new TextEncoder().encode(s).length;
+		if(name.length < 1 || utf8Length(name) > 16) {
+			alert("Name must be between 1 and 16 characters (bytes) in length.");
 			return;
 		}
-		if(expression.length < 1 || expression.length > 64) {
-			alert("Expression must be between 1 and 64 characters in length.");
+		if(expression.length < 1 || utf8Length(expression) > 64) {
+			alert("Expression must be between 1 and 64 characters (bytes) in length.");
 			return;
 		}
 		if(isNaN(pid) || pid < -1 || pid > 255) {
