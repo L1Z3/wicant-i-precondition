@@ -430,14 +430,32 @@ int32_t config_server_get_port(void)
 	return -1;
 }
 
+/* A client sending a byte now and then would otherwise hold the server's one
+ * task (all of the web UI and, during an OTA, BLE and CAN off) for as long as
+ * it likes: receiving a body of len bytes gives up after 30 s plus 1 s per
+ * 16 KB. A 1.7 MB OTA, ~10 s over the AP, may take ~140 s. */
+#define RECV_GRACE_US   (30 * 1000000LL)
+#define RECV_MIN_RATE   (16 * 1024)
+
+static int64_t recv_deadline(size_t len)
+{
+    return esp_timer_get_time() + RECV_GRACE_US + (int64_t)len * 1000000 / RECV_MIN_RATE;
+}
+
 /* httpd_req_recv returns only what has arrived so far: loop until all len
  * bytes are in. Returns len, or the httpd_req_recv error (a timeout is not
- * retried: a client silent for longer than recv_wait_timeout fails). */
+ * retried: a client silent for longer than recv_wait_timeout fails, and so
+ * does one too slow for recv_deadline()). */
 static int recv_full(httpd_req_t *req, char *buf, size_t len)
 {
+    int64_t deadline = recv_deadline(len);
     size_t got = 0;
     while (got < len)
     {
+        if (esp_timer_get_time() > deadline)
+        {
+            return HTTPD_SOCK_ERR_TIMEOUT;
+        }
         int ret = httpd_req_recv(req, buf + got, len - got);
         if (ret <= 0)
         {
@@ -1037,18 +1055,12 @@ static esp_err_t track_popup_handler(httpd_req_t *req)
     }
 
     char text[TRACK_POPUP_MAX_TEXT_UTF8_BYTES + 1U];
-    size_t received = 0U;
-    while (received < req->content_len)
+    size_t received = req->content_len;
+    if (recv_full(req, text, received) <= 0)
     {
-        int chunk_size = httpd_req_recv(req, text + received,
-                                        req->content_len - received);
-        if (chunk_size <= 0)
-        {
-            httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT,
-                                "Failed to receive track popup text");
-            return ESP_FAIL;
-        }
-        received += (size_t)chunk_size;
+        httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT,
+                            "Failed to receive track popup text");
+        return ESP_FAIL;
     }
 
     // track_popup_show accepts a NUL-terminated string, so reject embedded NUL
@@ -1484,6 +1496,7 @@ typedef struct {
     int file_len;
     char end[UPLOAD_BOUNDARY_MAX + 8];  /* "\r\n--<boundary>--\r\n" */
     int end_len;
+    int64_t deadline;   /* recv_deadline() of the whole body */
 } upload_t;
 
 static int find_bytes(const char *buf, int len, const char *s, int s_len)
@@ -1553,16 +1566,21 @@ static int upload_parse(const char *buf, int got, int content_len, upload_t *up)
 
 /* Each httpd_req_recv() waits recv_wait_timeout (5 s) for data; an upload
  * gives up after this many in a row (30 s) rather than hold the server's one
- * task (and with it all of the web UI) and, during an OTA, keep BLE and CAN off. */
+ * task (and with it all of the web UI) and, during an OTA, keep BLE and CAN off.
+ * It also gives up once past up->deadline. */
 #define UPLOAD_RECV_TIMEOUTS 6
 
-static int upload_recv(httpd_req_t *req, char *buf, size_t len)
+static int upload_recv(httpd_req_t *req, const upload_t *up, char *buf, size_t len)
 {
     int ret;
     int timeouts = 0;
 
     do
     {
+        if (esp_timer_get_time() > up->deadline)
+        {
+            return HTTPD_SOCK_ERR_TIMEOUT;
+        }
         ret = httpd_req_recv(req, buf, len);
     } while (ret == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts < UPLOAD_RECV_TIMEOUTS);
     return ret;
@@ -1574,7 +1592,7 @@ static void upload_recv_failed(httpd_req_t *req, int err)
     ESP_LOGE(TAG, "File reception failed (%d)", err);
     if (err == HTTPD_SOCK_ERR_TIMEOUT)
     {
-        httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "Upload stalled");
+        httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "Upload timed out");
     }
     else
     {
@@ -1591,9 +1609,10 @@ static int upload_recv_start(httpd_req_t *req, char *scratch, upload_t *up)
     int want = MIN(req->content_len, SCRATCH_BUFSIZE);
     int got = 0;
 
+    up->deadline = recv_deadline(req->content_len);
     while (got < want)
     {
-        int ret = upload_recv(req, scratch + got, want - got);
+        int ret = upload_recv(req, up, scratch + got, want - got);
         if (ret <= 0)
         {
             return ret < 0 ? ret : HTTPD_SOCK_ERR_FAIL;
@@ -1623,7 +1642,7 @@ static int upload_recv_end(httpd_req_t *req, const upload_t *up, const char *tai
     }
     while (got < up->end_len)
     {
-        int ret = upload_recv(req, end + got, up->end_len - got);
+        int ret = upload_recv(req, up, end + got, up->end_len - got);
         if (ret <= 0)
         {
             return ret < 0 ? ret : HTTPD_SOCK_ERR_FAIL;
@@ -1777,7 +1796,7 @@ static esp_err_t upload_ota(httpd_req_t *req)
         vTaskDelay(5 / portTICK_PERIOD_MS);
 
         buf = scratch;
-        if ((received = upload_recv(req, buf, MIN(up.file_len - total_size, SCRATCH_BUFSIZE))) <= 0)
+        if ((received = upload_recv(req, &up, buf, MIN(up.file_len - total_size, SCRATCH_BUFSIZE))) <= 0)
         {
             esp_ota_abort(update_handle);
             upload_recv_failed(req, received);
@@ -1962,7 +1981,7 @@ static esp_err_t upload_car_data_handler(httpd_req_t *req)
 
     while (received < up.file_len)
     {
-        int ret = upload_recv(req, buf + received, up.file_len - received);
+        int ret = upload_recv(req, &up, buf + received, up.file_len - received);
         if (ret <= 0)
         {
             free(buf);
