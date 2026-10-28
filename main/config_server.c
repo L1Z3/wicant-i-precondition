@@ -177,8 +177,8 @@ TimerHandle_t xrestartTimer;
 /* Scratch buffer size */
 #define SCRATCH_BUFSIZE  4096
 
-#define MAX_FILE_SIZE   (2000*1024) // 200 KB
-#define MAX_FILE_SIZE_STR "200KB"
+#define MAX_FILE_SIZE   (2000*1024) // 2000 KB
+#define MAX_FILE_SIZE_STR "2000KB"
 
 struct file_server_data {
     /* Base path of file storage */
