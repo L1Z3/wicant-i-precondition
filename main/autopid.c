@@ -1821,452 +1821,440 @@ static void autopid_task(void *pvParameters)
 }
 
 
-cJSON* parse_json_file(FILE* f) {
-    fseek(f, 0, SEEK_END);
-    long fsize = ftell(f);
-    fseek(f, 0, SEEK_SET);
+// Larger than anything the web page saves (config_server caps car data at
+// 200 KB); a bigger file is ignored rather than read into RAM.
+#define AUTOPID_FILE_MAX    (256 * 1024)
 
-    char* buffer = malloc(fsize + 1);
-    fread(buffer, fsize, 1, f);
-    buffer[fsize] = 0;
-
-    cJSON* root = cJSON_Parse(buffer);
-    free(buffer);
-    
+// NULL if the file is missing, empty, too large or not JSON.
+static cJSON* parse_json_file(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (!f) {
+        return NULL;
+    }
+    cJSON* root = NULL;
+    long fsize = -1;
+    if (fseek(f, 0, SEEK_END) == 0) {
+        fsize = ftell(f);
+    }
+    if (fsize > 0 && fsize <= AUTOPID_FILE_MAX && fseek(f, 0, SEEK_SET) == 0) {
+        char* buffer = malloc(fsize + 1);
+        if (buffer && fread(buffer, 1, fsize, f) == (size_t)fsize) {
+            buffer[fsize] = 0;
+            // This runs on the main task's small stack
+            if (json_depth_ok(buffer, JSON_MAX_DEPTH)) {
+                root = cJSON_Parse(buffer);
+            }
+        }
+        free(buffer);
+    }
+    fclose(f);
+    if (!root) {
+        ESP_LOGW(TAG, "%s: missing or unreadable (size %ld)", path, fsize);
+    }
     return root;
 }
 
-all_pids_t* load_all_pids(void){
-    int total_pids = 0;
-    int car_data_pids = 0;
-    int auto_pids = 0;
-    
-    // Count car_data.json pids
-    FILE* f = fopen(FS_MOUNT_POINT"/car_data.json", "r");
-    if (f) {
-        cJSON* root = parse_json_file(f);
-        if (root) {
-            cJSON* cars = cJSON_GetObjectItem(root, "cars");
-            cJSON* car = cJSON_GetArrayItem(cars, 0);
-            cJSON* pids = cJSON_GetObjectItem(car, "pids");
-            car_data_pids = cJSON_GetArraySize(pids);
-            cJSON_Delete(root);
-        }
-        fclose(f);
-    }
-    
-    // Count auto_pid.json pids
-    f = fopen(FS_MOUNT_POINT"/auto_pid.json", "r");
-    if (f) {
-        cJSON* root = parse_json_file(f);
-        if (root) {
-            cJSON* pids = cJSON_GetObjectItem(root, "pids");
-            cJSON* std_pids = cJSON_GetObjectItem(root, "std_pids");
-            auto_pids = cJSON_GetArraySize(pids) + cJSON_GetArraySize(std_pids);
-            cJSON_Delete(root);
-        }
-        fclose(f);
-    }
+// The value of obj[key] if it is a string, else NULL. The files can come from
+// older firmware or other upload paths, so no value's type is assumed.
+static const char* json_str(const cJSON* obj, const char* key) {
+    const cJSON* item = cJSON_GetObjectItem(obj, key);
+    return cJSON_IsString(item) ? item->valuestring : NULL;
+}
 
-    total_pids = car_data_pids + auto_pids;
-    
-    all_pids_t* all_pids = (all_pids_t*)calloc(1, sizeof(all_pids_t));
-    if (!all_pids) return NULL;
-    
-    all_pids->pids = (pid_data2_t*)calloc(total_pids, sizeof(pid_data2_t));
-    if (!all_pids->pids) {
-        free(all_pids);
+// A copy of obj[key] if it is a string, else of fallback (NULL stays NULL).
+static char* json_strdup(const cJSON* obj, const char* key, const char* fallback) {
+    const char* str = json_str(obj, key);
+    if (!str) {
+        str = fallback;
+    }
+    return str ? strdup(str) : NULL;
+}
+
+static int json_array_size(const cJSON* array) {
+    return cJSON_IsArray(array) ? cJSON_GetArraySize(array) : 0;
+}
+
+// A copy of str with ';' turned into '\r', or NULL for NULL or "".
+static char* init_cmds(const char* str) {
+    if (!str || !*str) {
         return NULL;
     }
+    char* init = strdup(str);
+    if (!init) {
+        ESP_LOGE(TAG, "Failed to allocate memory for init");
+        return NULL;
+    }
+    for (char* c = init; *c; c++) {
+        if (*c == ';') {
+            *c = '\r';
+        }
+    }
+    return init;
+}
+
+static destination_type_t destination_type(const char* type) {
+    if (!type) {
+        return DEST_DEFAULT;
+    }
+    return strcmp(type, "MQTT_Topic") == 0 ? DEST_MQTT_TOPIC :
+           strcmp(type, "MQTT_WallBox") == 0 ? DEST_MQTT_WALLBOX : DEST_DEFAULT;
+}
+
+static sensor_type_t sensor_type(const char* type) {
+    return type && strcmp(type, "binary") == 0 ? BINARY_SENSOR : SENSOR;
+}
+
+static float json_limit(const cJSON* obj, const char* key) {
+    const char* str = json_str(obj, key);
+    return str && strlen(str) > 0 ? atof(str) : FLT_MAX;
+}
+
+static bool json_is(const cJSON* obj, const char* key, const char* value) {
+    const char* str = json_str(obj, key);
+    return str && strcmp(str, value) == 0;
+}
+
+// Frees what load_all_pids() allocated for pid and clears it.
+static void free_pid(pid_data2_t* pid) {
+    for (uint32_t i = 0; pid->parameters && i < pid->parameters_count; i++) {
+        parameter_t* param = &pid->parameters[i];
+        free(param->name);
+        free(param->expression);
+        free(param->unit);
+        free(param->class);
+        free(param->destination);
+    }
+    free(pid->parameters);
+    free(pid->cmd);
+    free(pid->init);
+    free(pid->rxheader);
+    memset(pid, 0, sizeof(*pid));
+}
+
+// Loads auto_pid.json and car_data.json. A PID that can't be used (no name,
+// a car PID without parameters, out of memory) is skipped with a log, so every
+// loaded PID has at least one parameter, the first one named.
+all_pids_t* load_all_pids(void){
+    // Each file is parsed once, so the count below matches what is loaded.
+    cJSON* auto_root = parse_json_file(FS_MOUNT_POINT"/auto_pid.json");
+    cJSON* car_root = parse_json_file(FS_MOUNT_POINT"/car_data.json");
+    cJSON* custom_pids = cJSON_GetObjectItem(auto_root, "pids");
+    cJSON* std_pids = cJSON_GetObjectItem(auto_root, "std_pids");
+    cJSON* car = cJSON_GetArrayItem(cJSON_GetObjectItem(car_root, "cars"), 0);
+    if (!cJSON_IsObject(car)) {
+        car = NULL;
+    }
+    cJSON* car_pids = cJSON_GetObjectItem(car, "pids");
+
+    int total_pids = json_array_size(custom_pids) + json_array_size(std_pids) + json_array_size(car_pids);
+    
+    all_pids_t* all_pids = (all_pids_t*)calloc(1, sizeof(all_pids_t));
+    if (all_pids) {
+        all_pids->pids = (pid_data2_t*)calloc(total_pids, sizeof(pid_data2_t));
+    }
+    if (!all_pids || !all_pids->pids) {
+        free(all_pids);
+        cJSON_Delete(auto_root);
+        cJSON_Delete(car_root);
+        return NULL;
+    }
+    all_pids->cycle = 10000;
     
     int pid_index = 0;
     
     // Load auto_pid.json pids
-    f = fopen(FS_MOUNT_POINT"/auto_pid.json", "r");
-    if (f) {
-        cJSON* root = parse_json_file(f);
-        if (root) {
-            cJSON* init_item = cJSON_GetObjectItem(root, "initialisation");
-            cJSON* grouping_item = cJSON_GetObjectItem(root, "grouping");
-            cJSON* autopid_polling_item = cJSON_GetObjectItem(root, "autopid_polling");
-            cJSON* webhook_data_mode_item = cJSON_GetObjectItem(root, "webhook_data_mode");
-            cJSON* car_model_item = cJSON_GetObjectItem(root, "car_model");
-            cJSON* ecu_protocol_item = cJSON_GetObjectItem(root, "ecu_protocol");
-            cJSON* ha_discovery_item = cJSON_GetObjectItem(root, "ha_discovery");
-            cJSON* cycle_item = cJSON_GetObjectItem(root, "cycle");
-            cJSON* standard_pids_item = cJSON_GetObjectItem(root, "standard_pids");
-            cJSON* specific_pids_item = cJSON_GetObjectItem(root, "car_specific");
-            cJSON* group_destination_item = cJSON_GetObjectItem(root, "destination");
-            cJSON* group_dest_type_item = cJSON_GetObjectItem(root, "group_dest_type");
+    if (auto_root) {
+        cJSON* root = auto_root;
+        const char* str;
 
-            if (init_item && init_item->valuestring) {
-                all_pids->custom_init = strdup(init_item->valuestring);
-                if (all_pids->custom_init) {
-                    // Replace semicolons with carriage returns
-                    for (size_t j = 0; j < strlen(all_pids->custom_init); j++) {
-                        if (all_pids->custom_init[j] == ';') {
-                            all_pids->custom_init[j] = '\r';
-                        }
-                    }
-                }
-            } else {
-                all_pids->custom_init = NULL;
-            }
-
-            all_pids->grouping = (grouping_item && grouping_item->valuestring && strlen(grouping_item->valuestring) > 1) ? strdup(grouping_item->valuestring) : strdup("disable");
-            all_pids->autopid_polling = (autopid_polling_item && autopid_polling_item->valuestring && strlen(autopid_polling_item->valuestring) > 1) ? strdup(autopid_polling_item->valuestring) : strdup("enable");
-            all_pids->webhook_data_mode = (webhook_data_mode_item && webhook_data_mode_item->valuestring && strlen(webhook_data_mode_item->valuestring) > 0) ? strdup(webhook_data_mode_item->valuestring) : strdup("full");
-            all_pids->vehicle_model = car_model_item ? strdup(car_model_item->valuestring) : NULL;
-            all_pids->std_ecu_protocol = ecu_protocol_item ? strdup(ecu_protocol_item->valuestring) : NULL;
-            all_pids->ha_discovery_en = ha_discovery_item ? (strcmp(ha_discovery_item->valuestring, "enable") == 0) : false;
-            all_pids->cycle = cycle_item ? atoi(cycle_item->valuestring) : 10000;
-            all_pids->pid_std_en = standard_pids_item ? (strcmp(standard_pids_item->valuestring, "enable") == 0) : false;
-            all_pids->pid_specific_en = specific_pids_item ? (strcmp(specific_pids_item->valuestring, "enable") == 0) : false;
-            all_pids->group_destination = group_destination_item ? strdup(group_destination_item->valuestring) : NULL;
-            all_pids->group_destination_type = group_dest_type_item && group_dest_type_item->valuestring ?
-                            (strcmp(group_dest_type_item->valuestring, "MQTT_Topic") == 0 ? DEST_MQTT_TOPIC :
-                            DEST_DEFAULT) : DEST_DEFAULT;
+        all_pids->custom_init = init_cmds(json_str(root, "initialisation"));
+        str = json_str(root, "grouping");
+        all_pids->grouping = (str && strlen(str) > 1) ? strdup(str) : NULL;
+        str = json_str(root, "autopid_polling");
+        all_pids->autopid_polling = (str && strlen(str) > 1) ? strdup(str) : NULL;
+        str = json_str(root, "webhook_data_mode");
+        all_pids->webhook_data_mode = (str && strlen(str) > 0) ? strdup(str) : NULL;
+        all_pids->vehicle_model = json_strdup(root, "car_model", NULL);
+        all_pids->std_ecu_protocol = json_strdup(root, "ecu_protocol", NULL);
+        all_pids->ha_discovery_en = json_is(root, "ha_discovery", "enable");
+        str = json_str(root, "cycle");
+        all_pids->cycle = str ? atoi(str) : 10000;
+        all_pids->pid_std_en = json_is(root, "standard_pids", "enable");
+        all_pids->pid_specific_en = json_is(root, "car_specific", "enable");
+        all_pids->group_destination = json_strdup(root, "destination", NULL);
+        all_pids->group_destination_type = destination_type(json_str(root, "group_dest_type"));
             
-            // Load custom pids
-            cJSON* pids = cJSON_GetObjectItem(root, "pids");
-            if (pids) {
-                cJSON* pid;
-                cJSON_ArrayForEach(pid, pids) {
-                    pid_data2_t* curr_pid = &all_pids->pids[pid_index];
-                    
-                    cJSON* name_item = cJSON_GetObjectItem(pid, "Name");
-                    cJSON* init_item = cJSON_GetObjectItem(pid, "Init");
-                    cJSON* pid_item = cJSON_GetObjectItem(pid, "PID");
-                    cJSON* expr_item = cJSON_GetObjectItem(pid, "Expression");
-                    cJSON* period_item = cJSON_GetObjectItem(pid, "Period");
-                    cJSON* type_item = cJSON_GetObjectItem(pid, "Type");
-                    cJSON* send_to_item = cJSON_GetObjectItem(pid, "Send_to");
-                    cJSON* sensor_type_item = cJSON_GetObjectItem(pid, "sensor_type");
-                    cJSON* unit_item = cJSON_GetObjectItem(pid, "unit"); 
-                    cJSON* class_item = cJSON_GetObjectItem(pid, "class");
-                    cJSON* rxheader_item = cJSON_GetObjectItem(pid, "header");
-                    cJSON* min_value_item = cJSON_GetObjectItem(pid, "MinValue");
-                    cJSON* max_value_item = cJSON_GetObjectItem(pid, "MaxValue");
+        // Load custom pids
+        if (json_array_size(custom_pids) > 0) {
+            all_pids->pid_custom_en = true;
+            cJSON* pid;
+            cJSON_ArrayForEach(pid, custom_pids) {
+                if (pid_index >= total_pids) {
+                    break;
+                }
+                const char* name = json_str(pid, "Name");
+                if (!name) {
+                    ESP_LOGW(TAG, "auto_pid.json: custom PID without a name skipped");
+                    continue;
+                }
+                pid_data2_t* curr_pid = &all_pids->pids[pid_index];
+                curr_pid->parameters = (parameter_t*)calloc(1, sizeof(parameter_t));
+                if (!curr_pid->parameters) {
+                    ESP_LOGE(TAG, "Failed to allocate memory for parameters");
+                    continue;
+                }
+                curr_pid->parameters_count = 1;
 
-                    if(cJSON_GetArraySize(pids) > 0)
-                    {
-                        all_pids->pid_custom_en = true;
-                    }
-                    
-                    curr_pid->cmd = pid_item ? (char*)malloc(strlen(pid_item->valuestring) + 2) : NULL;
-                    if (curr_pid->cmd && pid_item && strlen(pid_item->valuestring) > 1)
-                    {
-                        strcpy(curr_pid->cmd, pid_item->valuestring);
+                // A PID of one character or none isn't sent
+                const char* cmd = json_str(pid, "PID");
+                if (cmd && strlen(cmd) > 1) {
+                    curr_pid->cmd = (char*)malloc(strlen(cmd) + 2);
+                    if (curr_pid->cmd) {
+                        strcpy(curr_pid->cmd, cmd);
                         strcat(curr_pid->cmd, "\r");
-                    }                    
-
-                    curr_pid->init = NULL;
-                    if (init_item && init_item->valuestring) {
-                        size_t init_len = strlen(init_item->valuestring);
-                        
-                        if (init_len > 0) {
-                            curr_pid->init = (char*)malloc(init_len + 2);
-                            if (curr_pid->init) {
-                                strncpy(curr_pid->init, init_item->valuestring, init_len);
-                                curr_pid->init[init_len] = '\0';
-                                
-                                // Replace semicolons with carriage returns
-                                for (size_t j = 0; j < init_len; j++) {
-                                    if (curr_pid->init[j] == ';') {
-                                        curr_pid->init[j] = '\r';
-                                    }
-                                }
-                            } else {
-                                ESP_LOGE(TAG, "Failed to allocate memory for init");
-                            }
-                        }
                     }
-
-                    curr_pid->period = period_item ? atoi(period_item->valuestring) : 10000;
-                    curr_pid->rxheader = rxheader_item ? strdup(rxheader_item->valuestring) : NULL;
-                    curr_pid->pid_type = PID_CUSTOM;
-
-                    curr_pid->parameters_count = 1;
-                    curr_pid->parameters = (parameter_t*)calloc(1, sizeof(parameter_t));
-                    if (curr_pid->parameters) {
-                        curr_pid->parameters->name = name_item ? strdup(name_item->valuestring) : NULL;
-                        curr_pid->parameters->expression = expr_item ? strdup(expr_item->valuestring) : NULL;
-                        curr_pid->parameters->period = period_item ? atoi(period_item->valuestring) : 0;
-                        curr_pid->parameters->destination = send_to_item ? strdup(send_to_item->valuestring) : NULL;
-                        curr_pid->parameters->timer = 0;
-                        curr_pid->parameters->value = FLT_MAX;
-                        curr_pid->parameters->min = (min_value_item && strlen(min_value_item->valuestring) > 0) ? atof(min_value_item->valuestring) : FLT_MAX;
-                        curr_pid->parameters->max = (max_value_item && strlen(max_value_item->valuestring) > 0) ? atof(max_value_item->valuestring) : FLT_MAX;
-                        curr_pid->parameters->destination_type = type_item && type_item->valuestring ? 
-                            (strcmp(type_item->valuestring, "MQTT_Topic") == 0 ? DEST_MQTT_TOPIC :
-                            strcmp(type_item->valuestring, "MQTT_WallBox") == 0 ? DEST_MQTT_WALLBOX :
-                            DEST_DEFAULT) : DEST_DEFAULT;
-                        curr_pid->parameters->sensor_type = sensor_type_item ? 
-                            (strcmp(sensor_type_item->valuestring, "binary") == 0 ? BINARY_SENSOR : SENSOR) : SENSOR;
-                        curr_pid->parameters->unit = unit_item && unit_item->valuestring ? 
-                            strdup(unit_item->valuestring) : strdup("none");
-                        curr_pid->parameters->class = class_item && class_item->valuestring ? 
-                            strdup(class_item->valuestring) : strdup("none");
-                    }
-                    
-                    pid_index++;
                 }
-            }
-            
-            // Load standard pids
-            cJSON* std_pids = cJSON_GetObjectItem(root, "std_pids");
-            if (std_pids) {
-                cJSON* pid;
-                cJSON_ArrayForEach(pid, std_pids) {
-                    pid_data2_t* curr_pid = &all_pids->pids[pid_index];
-                    curr_pid->pid_type = PID_STD;
+                curr_pid->init = init_cmds(json_str(pid, "Init"));
 
-                    char std_init_buf[64];
-                    int is_protocol_68 = 1;
-                    int is_protocol_79 = 0;
-                    const char *sh_value = "";
+                str = json_str(pid, "Period");
+                curr_pid->period = str ? atoi(str) : 10000;
+                curr_pid->rxheader = json_strdup(pid, "header", NULL);
+                curr_pid->pid_type = PID_CUSTOM;
 
-                    curr_pid->parameters_count = 1;
-                    curr_pid->parameters = (parameter_t*)calloc(1, sizeof(parameter_t));
-                    if (curr_pid->parameters) {
-                        cJSON* name_item = cJSON_GetObjectItem(pid, "Name");
-                        cJSON* period_item = cJSON_GetObjectItem(pid, "Period");
-                        cJSON* type_item = cJSON_GetObjectItem(pid, "Type");
-                        cJSON* send_to_item = cJSON_GetObjectItem(pid, "Send_to");
-                        cJSON* sensor_type_item = cJSON_GetObjectItem(pid, "sensor_type");
-                        cJSON* rxheader_item = cJSON_GetObjectItem(pid, "ReceiveHeader");
-
-                        curr_pid->parameters->name = name_item ? strdup(name_item->valuestring) : NULL;
-                        curr_pid->parameters->period = period_item ? atoi(period_item->valuestring) : 10000;
-                        curr_pid->parameters->destination = send_to_item ? strdup(send_to_item->valuestring) : NULL;
-                        curr_pid->parameters->destination_type = type_item && type_item->valuestring ? 
-                            (strcmp(type_item->valuestring, "MQTT_Topic") == 0 ? DEST_MQTT_TOPIC :
-                            strcmp(type_item->valuestring, "MQTT_WallBox") == 0 ? DEST_MQTT_WALLBOX :
-                            DEST_DEFAULT) : DEST_DEFAULT;
-                        curr_pid->parameters->timer = 0;
-                        curr_pid->parameters->value = FLT_MAX;
-                        curr_pid->parameters->sensor_type = sensor_type_item ? 
-                            (strcmp(sensor_type_item->valuestring, "binary") == 0 ? BINARY_SENSOR : SENSOR) : SENSOR;
-                            
-                        curr_pid->rxheader = rxheader_item ? strdup(rxheader_item->valuestring) : NULL;
-
-                        if (all_pids->std_ecu_protocol)
-                        {
-                            // Check protocol type once
-                            is_protocol_68 = (strcmp(all_pids->std_ecu_protocol, "6") == 0 || 
-                                                strcmp(all_pids->std_ecu_protocol, "8") == 0);
-                            is_protocol_79 = (strcmp(all_pids->std_ecu_protocol, "7") == 0 || 
-                                                strcmp(all_pids->std_ecu_protocol, "9") == 0);
-                        }
-                        
-                        if (is_protocol_68) 
-                        {
-                            sh_value = "7DF";
-                        }
-                        else if (is_protocol_79)
-                        {
-                            sh_value = "18DB33F1";
-                        }
-
-                        if(curr_pid->rxheader != NULL && strlen(curr_pid->rxheader) > 0)
-                        {
-                            ESP_LOGI(TAG, "Setting up STD init buffer with protocol: %s, SH value: %s, RX header: %s", all_pids->std_ecu_protocol, sh_value, curr_pid->rxheader);
-                            snprintf(std_init_buf, sizeof(std_init_buf), "ATSP%s\rATSH%s\rATCRA%s\r",
-                                                        all_pids->std_ecu_protocol, sh_value, curr_pid->rxheader);
-                        }
-                        else
-                        {
-                            ESP_LOGI(TAG, "Setting up STD init buffer with protocol: %s, SH value: %s", all_pids->std_ecu_protocol, sh_value);
-                            snprintf(std_init_buf, sizeof(std_init_buf), "ATSP%s\rATSH%s\rATCRA\r",
-                                                        all_pids->std_ecu_protocol, sh_value);                        
-                        }
-                        all_pids->standard_init = strdup(std_init_buf);
-
-                        if(curr_pid->parameters->name != NULL && strlen(curr_pid->parameters->name) > 0)
-                        {
-                            const std_pid_t* pid_info = get_pid_from_string(curr_pid->parameters->name);
-                            if(pid_info)
-                            {
-                                ESP_LOGI(TAG, "PID Info for %s:", curr_pid->parameters->name);
-                                ESP_LOGI(TAG, "  Base name: %s", pid_info->base_name);
-                                ESP_LOGI(TAG, "  Num params: %d", pid_info->num_params);
-                                ESP_LOGI(TAG, "  Parameter details:");
-                                for(int i = 0; i < pid_info->num_params; i++)
-                                {
-                                    ESP_LOGI(TAG, "    [%d] Name: %s, Unit: %s", i, pid_info->params[i].name, pid_info->params[i].unit);
-                                    if(strcmp(pid_info->params[i].name, strchr(curr_pid->parameters->name, '-') + 1) == 0)
-                                    {
-                                        curr_pid->parameters->class = strdup(pid_info->params[i].class);
-                                        curr_pid->parameters->unit = strdup(pid_info->params[i].unit);
-                                        char pid_hex[3];
-                                        strncpy(pid_hex, curr_pid->parameters->name, 2);
-                                        pid_hex[2] = '\0';
-
-                                        curr_pid->cmd = malloc(8); // "01XX1\r\0" needs 8 bytes
-                                        if(curr_pid->cmd) {
-                                            sprintf(curr_pid->cmd, "01%s\r", pid_hex);
-                                        }
-                                    }
-                                }
-                            }
-                            else
-                            {
-                                ESP_LOGW(TAG, "No PID info found for %s", curr_pid->parameters->name);
-                            }
-                        }
-                    }
-                    
-                    pid_index++;
+                parameter_t* param = curr_pid->parameters;
+                param->name = strdup(name);
+                if (!param->name) {
+                    ESP_LOGE(TAG, "Failed to allocate memory for name");
+                    free_pid(curr_pid);
+                    continue;
                 }
+                param->expression = json_strdup(pid, "Expression", NULL);
+                param->period = str ? atoi(str) : 0;
+                param->destination = json_strdup(pid, "Send_to", NULL);
+                param->timer = 0;
+                param->value = FLT_MAX;
+                param->min = json_limit(pid, "MinValue");
+                param->max = json_limit(pid, "MaxValue");
+                param->destination_type = destination_type(json_str(pid, "Type"));
+                param->sensor_type = sensor_type(json_str(pid, "sensor_type"));
+                param->unit = json_strdup(pid, "unit", "none");
+                param->class = json_strdup(pid, "class", "none");
+                
+                pid_index++;
             }
-            
-            cJSON_Delete(root);
         }
+            
+        // Load standard pids
+        if (json_array_size(std_pids) > 0) {
+            cJSON* pid;
+            cJSON_ArrayForEach(pid, std_pids) {
+                if (pid_index >= total_pids) {
+                    break;
+                }
+                const char* name = json_str(pid, "Name");
+                if (!name) {
+                    ESP_LOGW(TAG, "auto_pid.json: standard PID without a name skipped");
+                    continue;
+                }
+                pid_data2_t* curr_pid = &all_pids->pids[pid_index];
+                curr_pid->parameters = (parameter_t*)calloc(1, sizeof(parameter_t));
+                if (!curr_pid->parameters) {
+                    ESP_LOGE(TAG, "Failed to allocate memory for parameters");
+                    continue;
+                }
+                curr_pid->parameters_count = 1;
+                curr_pid->pid_type = PID_STD;
 
-        fclose(f);
-    }
-    
-    f = fopen(FS_MOUNT_POINT"/car_data.json", "r");
-    if (f) {
-        cJSON* root = parse_json_file(f);
-        if (root) {
-            cJSON* cars = cJSON_GetObjectItem(root, "cars");
-            if (cars) {
-                cJSON* car = cJSON_GetArrayItem(cars, 0);
-                if (car) {
-                    cJSON* init_item = cJSON_GetObjectItem(car, "init");
-                    if (init_item && init_item->valuestring) {
-                        all_pids->specific_init = strdup(init_item->valuestring);
-                        if (all_pids->specific_init) {
-                            for (size_t j = 0; j < strlen(all_pids->specific_init); j++) {
-                                if (all_pids->specific_init[j] == ';') {
-                                    all_pids->specific_init[j] = '\r';
-                                }
-                            }
-                        }
-                    } else {
-                        all_pids->specific_init = NULL;
-                    }
+                char std_init_buf[64];
+                int is_protocol_68 = 1;
+                int is_protocol_79 = 0;
+                const char *sh_value = "";
+
+                parameter_t* param = curr_pid->parameters;
+                param->name = strdup(name);
+                if (!param->name) {
+                    ESP_LOGE(TAG, "Failed to allocate memory for name");
+                    free_pid(curr_pid);
+                    continue;
+                }
+                str = json_str(pid, "Period");
+                param->period = str ? atoi(str) : 10000;
+                param->destination = json_strdup(pid, "Send_to", NULL);
+                param->destination_type = destination_type(json_str(pid, "Type"));
+                param->timer = 0;
+                param->value = FLT_MAX;
+                param->sensor_type = sensor_type(json_str(pid, "sensor_type"));
                     
-                    cJSON* pids = cJSON_GetObjectItem(car, "pids");
+                curr_pid->rxheader = json_strdup(pid, "ReceiveHeader", NULL);
 
-                    if (pids) 
+                if (all_pids->std_ecu_protocol)
+                {
+                    // Check protocol type once
+                    is_protocol_68 = (strcmp(all_pids->std_ecu_protocol, "6") == 0 || 
+                                        strcmp(all_pids->std_ecu_protocol, "8") == 0);
+                    is_protocol_79 = (strcmp(all_pids->std_ecu_protocol, "7") == 0 || 
+                                        strcmp(all_pids->std_ecu_protocol, "9") == 0);
+                }
+                
+                if (is_protocol_68) 
+                {
+                    sh_value = "7DF";
+                }
+                else if (is_protocol_79)
+                {
+                    sh_value = "18DB33F1";
+                }
+
+                if(curr_pid->rxheader != NULL && strlen(curr_pid->rxheader) > 0)
+                {
+                    ESP_LOGI(TAG, "Setting up STD init buffer with protocol: %s, SH value: %s, RX header: %s", all_pids->std_ecu_protocol, sh_value, curr_pid->rxheader);
+                    snprintf(std_init_buf, sizeof(std_init_buf), "ATSP%s\rATSH%s\rATCRA%s\r",
+                                                all_pids->std_ecu_protocol, sh_value, curr_pid->rxheader);
+                }
+                else
+                {
+                    ESP_LOGI(TAG, "Setting up STD init buffer with protocol: %s, SH value: %s", all_pids->std_ecu_protocol, sh_value);
+                    snprintf(std_init_buf, sizeof(std_init_buf), "ATSP%s\rATSH%s\rATCRA\r",
+                                                all_pids->std_ecu_protocol, sh_value);                        
+                }
+                free(all_pids->standard_init);
+                all_pids->standard_init = strdup(std_init_buf);
+
+                if(strlen(param->name) > 0)
+                {
+                    const std_pid_t* pid_info = get_pid_from_string(param->name);
+                    // The parameter is named after the dash ("0C-EngineRPM")
+                    const char* param_name = strchr(param->name, '-');
+                    if(pid_info && param_name)
                     {
-                        cJSON* pid;
-                        
-                        cJSON_ArrayForEach(pid, pids) 
+                        ESP_LOGI(TAG, "PID Info for %s:", param->name);
+                        ESP_LOGI(TAG, "  Base name: %s", pid_info->base_name);
+                        ESP_LOGI(TAG, "  Num params: %d", pid_info->num_params);
+                        ESP_LOGI(TAG, "  Parameter details:");
+                        for(int i = 0; i < pid_info->num_params; i++)
                         {
-                            pid_data2_t* curr_pid = &all_pids->pids[pid_index];
-                            cJSON* pid_item = cJSON_GetObjectItem(pid, "pid");
-                            cJSON* init_item = cJSON_GetObjectItem(pid, "pid_init");
-
-                            curr_pid->init = NULL;
-                            if (init_item && init_item->valuestring) {
-                                size_t init_len = strlen(init_item->valuestring);
-                                
-                                if (init_len > 0) {
-                                    curr_pid->init = (char*)malloc(init_len + 2);
-                                    if (curr_pid->init) {
-                                        strncpy(curr_pid->init, init_item->valuestring, init_len);
-                                        curr_pid->init[init_len] = '\0';
-                                        
-                                        // Replace semicolons with carriage returns
-                                        for (size_t j = 0; j < init_len; j++) {
-                                            if (curr_pid->init[j] == ';') {
-                                                curr_pid->init[j] = '\r';
-                                            }
-                                        }
-                                    } else {
-                                        ESP_LOGE(TAG, "Failed to allocate memory for init");
-                                    }
-                                }
-                            }
-
-                                                        
-                            curr_pid->cmd = NULL;
-
-                            if (pid_item && pid_item->valuestring) {
-                                size_t cmd_len = strlen(pid_item->valuestring);
-
-                                if (cmd_len > 0) {
-                                    curr_pid->cmd = (char*)malloc(cmd_len + 2);
-                                    if (curr_pid->cmd) {
-                                        strncpy(curr_pid->cmd, pid_item->valuestring, cmd_len);
-                                        curr_pid->cmd[cmd_len] = '\r';
-                                        curr_pid->cmd[cmd_len + 1] = '\0';
-                                    } else {
-                                        ESP_LOGE(TAG, "Failed to allocate memory for cmd");
-                                    }
-                                }
-                            }
-
-                            curr_pid->pid_type = PID_SPECIFIC;
-                            
-                            cJSON* params = cJSON_GetObjectItem(pid, "parameters");
-                            if (params) 
+                            ESP_LOGI(TAG, "    [%d] Name: %s, Unit: %s", i, pid_info->params[i].name, pid_info->params[i].unit);
+                            if(strcmp(pid_info->params[i].name, param_name + 1) == 0)
                             {
-                                int param_count = cJSON_GetArraySize(params);
-                                curr_pid->parameters_count = param_count;  // Set the count
-                                curr_pid->parameters = (parameter_t*)calloc(param_count, sizeof(parameter_t));
-                                curr_pid->parameters->period = all_pids->cycle;
-                                curr_pid->parameters->timer = 0;
-                                curr_pid->parameters->value = FLT_MAX;
-                                cJSON* param;
-                                int param_index = 0;
-                                cJSON_ArrayForEach(param, params) 
-                                {
-                                    cJSON* name_item = cJSON_GetObjectItem(param, "name");
-                                    curr_pid->parameters[param_index].name = name_item ? strdup(name_item->valuestring) : NULL;
+                                param->class = strdup(pid_info->params[i].class);
+                                param->unit = strdup(pid_info->params[i].unit);
+                                char pid_hex[3];
+                                strncpy(pid_hex, param->name, 2);
+                                pid_hex[2] = '\0';
 
-                                    cJSON* expr_item = cJSON_GetObjectItem(param, "expression");
-                                    curr_pid->parameters[param_index].expression = expr_item ? strdup(expr_item->valuestring) : NULL;
-
-                                    cJSON* unit_item = cJSON_GetObjectItem(param, "unit");
-                                    curr_pid->parameters[param_index].unit = unit_item && unit_item->valuestring ? 
-                                        strdup(unit_item->valuestring) : strdup("none");
-
-                                    cJSON* class_item = cJSON_GetObjectItem(param, "class");
-                                    curr_pid->parameters[param_index].class = class_item && class_item->valuestring ? 
-                                        strdup(class_item->valuestring) : strdup("none");
-
-                                    cJSON* sensor_type_item = cJSON_GetObjectItem(param, "sensor_type");
-                                    curr_pid->parameters[param_index].sensor_type = sensor_type_item ? 
-                                            (strcmp(sensor_type_item->valuestring, "binary") == 0 ? BINARY_SENSOR : SENSOR) : SENSOR;
-
-                                    cJSON* min_item = cJSON_GetObjectItem(param, "min");
-                                    curr_pid->parameters[param_index].min = (min_item && strlen(min_item->valuestring) > 0) ?  atof(min_item->valuestring) : FLT_MAX;
-
-                                    cJSON* max_item = cJSON_GetObjectItem(param, "max");
-                                    curr_pid->parameters[param_index].max = (max_item && strlen(max_item->valuestring) > 0) ?  atof(max_item->valuestring) : FLT_MAX;
-
-                                    cJSON* period_item = cJSON_GetObjectItem(param, "period");
-                                    curr_pid->parameters[param_index].period = period_item ? atof(period_item->valuestring) : FLT_MAX;
-
-                                    cJSON* send_to_item = cJSON_GetObjectItem(param, "send_to");
-                                    curr_pid->parameters[param_index].destination = send_to_item ? strdup(send_to_item->valuestring) : strdup("none");
-
-                                    cJSON* destination_type_item = cJSON_GetObjectItem(param, "type");      //destination_type
-                                    curr_pid->parameters[param_index].destination_type = 
-                                        destination_type_item && destination_type_item->valuestring ? 
-                                            (strcmp(destination_type_item->valuestring, "MQTT_Topic") == 0 ? DEST_MQTT_TOPIC :
-                                            strcmp(destination_type_item->valuestring, "MQTT_WallBox") == 0 ? DEST_MQTT_WALLBOX :
-                                            DEST_DEFAULT) : DEST_DEFAULT;
-
-                                    param_index++;
+                                curr_pid->cmd = malloc(8); // "01XX1\r\0" needs 8 bytes
+                                if(curr_pid->cmd) {
+                                    sprintf(curr_pid->cmd, "01%s\r", pid_hex);
                                 }
                             }
-                            pid_index++;
                         }
-                        
+                    }
+                    else if(pid_info)
+                    {
+                        ESP_LOGW(TAG, "No parameter name after '-' in %s", param->name);
+                    }
+                    else
+                    {
+                        ESP_LOGW(TAG, "No PID info found for %s", param->name);
                     }
                 }
+                
+                pid_index++;
             }
-            cJSON_Delete(root);
         }
-        fclose(f);
     }
     
-    all_pids->pid_count = total_pids;
+    if (car) {
+        all_pids->specific_init = init_cmds(json_str(car, "init"));
+
+        if (json_array_size(car_pids) > 0) 
+        {
+            cJSON* pid;
+            
+            cJSON_ArrayForEach(pid, car_pids) 
+            {
+                if (pid_index >= total_pids) {
+                    break;
+                }
+                cJSON* params = cJSON_GetObjectItem(pid, "parameters");
+                int param_count = json_array_size(params);
+                if (param_count == 0 || !json_str(cJSON_GetArrayItem(params, 0), "name")) {
+                    ESP_LOGW(TAG, "car_data.json: PID without a named parameter skipped");
+                    continue;
+                }
+                pid_data2_t* curr_pid = &all_pids->pids[pid_index];
+                curr_pid->parameters = (parameter_t*)calloc(param_count, sizeof(parameter_t));
+                if (!curr_pid->parameters) {
+                    ESP_LOGE(TAG, "Failed to allocate memory for parameters");
+                    continue;
+                }
+                curr_pid->parameters_count = param_count;
+                curr_pid->init = init_cmds(json_str(pid, "pid_init"));
+
+                const char* cmd = json_str(pid, "pid");
+                if (cmd && strlen(cmd) > 0) {
+                    size_t cmd_len = strlen(cmd);
+                    curr_pid->cmd = (char*)malloc(cmd_len + 2);
+                    if (curr_pid->cmd) {
+                        memcpy(curr_pid->cmd, cmd, cmd_len);
+                        curr_pid->cmd[cmd_len] = '\r';
+                        curr_pid->cmd[cmd_len + 1] = '\0';
+                    } else {
+                        ESP_LOGE(TAG, "Failed to allocate memory for cmd");
+                    }
+                }
+
+                curr_pid->pid_type = PID_SPECIFIC;
+                curr_pid->parameters->period = all_pids->cycle;
+                curr_pid->parameters->timer = 0;
+                curr_pid->parameters->value = FLT_MAX;
+                cJSON* item;
+                int param_index = 0;
+                cJSON_ArrayForEach(item, params) 
+                {
+                    parameter_t* param = &curr_pid->parameters[param_index];
+                    const char* str = json_str(item, "period");
+
+                    param->name = json_strdup(item, "name", NULL);
+                    param->expression = json_strdup(item, "expression", NULL);
+                    param->unit = json_strdup(item, "unit", "none");
+                    param->class = json_strdup(item, "class", "none");
+                    param->sensor_type = sensor_type(json_str(item, "sensor_type"));
+                    param->min = json_limit(item, "min");
+                    param->max = json_limit(item, "max");
+                    param->period = str ? atof(str) : FLT_MAX;
+                    param->destination = json_strdup(item, "send_to", "none");
+                    param->destination_type = destination_type(json_str(item, "type"));
+
+                    param_index++;
+                }
+                if (!curr_pid->parameters[0].name) {
+                    ESP_LOGE(TAG, "Failed to allocate memory for name");
+                    free_pid(curr_pid);
+                    continue;
+                }
+                pid_index++;
+            }
+        }
+    }
+    cJSON_Delete(auto_root);
+    cJSON_Delete(car_root);
+
+    // Defaults also when auto_pid.json is missing: the autopid task compares
+    // these strings unconditionally.
+    if (!all_pids->grouping) {
+        all_pids->grouping = strdup("disable");
+    }
+    if (!all_pids->autopid_polling) {
+        all_pids->autopid_polling = strdup("enable");
+    }
+    if (!all_pids->webhook_data_mode) {
+        all_pids->webhook_data_mode = strdup("full");
+    }
+    if (pid_index == 0) {
+        ESP_LOGW(TAG, "No PIDs loaded");
+    }
+    all_pids->pid_count = pid_index;
     
     return all_pids;
 }
@@ -2636,6 +2624,11 @@ void autopid_init(char* id)
         ESP_LOGE(TAG, "Failed to create autopid_values mutex");
         return;
     }
+    if (all_pids->pid_count == 0)
+    {
+        ESP_LOGW(TAG, "No PIDs to poll");
+        return;
+    }
     autopid_values = malloc(sizeof(autopid_value_t) * all_pids->pid_count);
     if (!autopid_values)
     {
@@ -2645,10 +2638,11 @@ void autopid_init(char* id)
 
     for (int i = 0; i < all_pids->pid_count; i++)
     {
-        autopid_values[i].name = malloc(strlen(all_pids->pids[i].parameters->name) + 1);
-        strcpy(autopid_values[i].name, all_pids->pids[i].parameters->name);
+        // load_all_pids() only keeps PIDs whose first parameter is named
+        parameter_t *param = all_pids->pids[i].parameters;
+        autopid_values[i].name = param && param->name ? strdup(param->name) : NULL;
         autopid_values[i].value = FLT_MAX;
-        autopid_values[i].sensor_type = all_pids->pids[i].parameters->sensor_type;
+        autopid_values[i].sensor_type = param ? param->sensor_type : SENSOR;
     }
     autopid_values_count = all_pids->pid_count;
 

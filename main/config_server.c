@@ -493,8 +493,6 @@ static esp_err_t index_handler(httpd_req_t *req)
 #else
 #define CAR_DATA_MAX_LEN    (200 * 1024)
 #endif
-// The saved JSON files are at most 7 levels deep (car data parameters)
-#define JSON_MAX_DEPTH      8
 
 /* Receive the whole body of a POST of at most max_len bytes into a
  * NUL-terminated heap buffer. On failure the HTTP error has been sent (if the
@@ -542,7 +540,7 @@ static char *recv_body(httpd_req_t *req, size_t max_len, esp_err_t *ret)
 
 /* cJSON recurses per nesting level, and the httpd stack is only 5 KB: refuse
  * deep nesting before parsing. */
-static bool json_depth_ok(const char *s, int max_depth)
+bool json_depth_ok(const char *s, int max_depth)
 {
     int depth = 0;
     bool in_str = false;
@@ -591,8 +589,8 @@ static cJSON *parse_body_json(const char *buf, size_t len)
 }
 
 /* load_all_pids() (autopid.c) reads every value in auto_pid.json and
- * car_data.json as a string: a number or null there crashes it at boot, on
- * every boot. The page only ever sends strings. */
+ * car_data.json as a string and skips the rest. The page only ever sends
+ * strings. */
 static bool json_leaves_are_strings(const cJSON *item)
 {
     if (cJSON_IsObject(item) || cJSON_IsArray(item))
