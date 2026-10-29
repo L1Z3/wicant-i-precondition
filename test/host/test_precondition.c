@@ -724,6 +724,39 @@ static void run_ioniq6_status_frame(void) {
     expect_state("active");
 }
 
+// The Ioniq 6 takes about 90 s from the start command to fully started. Once its
+// status frame has identified it, the countdown starts from 90 and WAIT_STARTED
+// waits 90 s before retrying; other cars keep 70 s (run_short_press).
+static void run_ioniq6_start_timeout(void) {
+    precondition_init();
+    expect_state("idle");
+    egmp_car_model_t model;
+    ioniq6_status(0x01, CAN_BUS_0);
+    CHECK(precondition_get_car_model(&model) && model == EGMP_CAR_IONIQ6);
+
+    toggle();
+    expect_state("start-burst");
+    twai_message_t m;
+    CHECK(fwd(0x4E8, CAN_BUS_0, &m) == FWD_MODIFIED);
+    CHECK(fake_now == requested.last_attempt_ts);  // short press starts on release
+    CHECK((m.data[4] | (m.data[5] << 8)) == 90);
+    for (int i = 0; i < 6; i++) tick1();
+    ioniq6_status(0x05, CAN_BUS_0);
+    expect_state("wait-started");
+    int64_t attempt_ts = requested.last_attempt_ts;
+
+    advance_us(71000000);                          // past the 70 s other cars get
+    expect_state("wait-started");
+    CHECK(requested.retries == 0);
+    CHECK(fwd(0x4E8, CAN_BUS_0, &m) == FWD_MODIFIED);
+    CHECK((m.data[4] | (m.data[5] << 8)) == 90 - (fake_now - attempt_ts + 999999) / 1000000);
+
+    advance_until_state("start-burst", 20000000);
+    CHECK(requested.retries == 1);
+    CHECK(fake_now - attempt_ts > PRECONDITION_STARTED_TIMEOUT_IONIQ6_US);
+    CHECK(fake_now - attempt_ts <= PRECONDITION_STARTED_TIMEOUT_IONIQ6_US + 40000);
+}
+
 // The Ioniq 6 form of the power-status frame, 0x00C03503: the 11-bit 0x038 never
 // appears on that car's bus, so this is the only READY source. READY is what
 // gates a repeating mode's relaunch (managed_tick) and arms the utility-mode
@@ -1913,6 +1946,7 @@ static const suite_t suites[] = {
     {"precondition battery state of charge", ONCE, PRESS_SHORT, run_battery_soc},
     {"precondition Ioniq 6 battery frames", ONCE, PRESS_SHORT, run_ioniq6_battery_frames},
     {"precondition Ioniq 6 status frame", ONCE, PRESS_SHORT, run_ioniq6_status_frame},
+    {"precondition Ioniq 6 start timeout", ONCE, PRESS_SHORT, run_ioniq6_start_timeout},
     {"precondition Ioniq 6 power status", PERSISTENT, PRESS_SHORT, run_ioniq6_power_status},
     {"precondition automatic temperature cutoff", CONTINUOUS, PRESS_SHORT, run_automatic_temperature_cutoff},
     {"precondition persistent temperature cutoff", PERSISTENT, PRESS_SHORT, run_automatic_temperature_cutoff},
