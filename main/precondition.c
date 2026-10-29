@@ -1422,6 +1422,9 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
             egmp_car_model_t model;
             if (to_push->identifier == 0x0A82AA03U) {
                 model = EGMP_CAR_IONIQ6;
+                // the cluster ignores popup text on 0x04/0x05 here, but shows
+                // it on 0x02 (tested 2026-10-24, 2024 Ioniq 6)
+                (void)track_popup_set_fallback_media_type(0x02U);
             } else if (status & STATUS_EV6_BIT) {
                 model = EGMP_CAR_EV6;
             } else {

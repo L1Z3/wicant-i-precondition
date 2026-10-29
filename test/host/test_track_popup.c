@@ -427,7 +427,7 @@ static void test_known_media(void) {
     CHECK(media.data[1] == 0x01U);
 }
 
-static void expect_fallback(uint8_t media_type) {
+static void expect_fallback_type(uint8_t media_type, uint8_t fallback_type) {
     sent_count = 0U;
     track_popup_init();
     CHECK(track_popup_show("Fallback"));
@@ -442,7 +442,7 @@ static void expect_fallback(uint8_t media_type) {
     CHECK(track_popup_fwd(&media, TRACK_POPUP_TARGET_BUS) == FWD_MODIFIED);
     CHECK(trigger_ctx.strategy_selected);
     CHECK(popup.media_type_owned);
-    CHECK(media.data[0] == TRACK_POPUP_FALLBACK_MEDIA_TYPE);
+    CHECK(media.data[0] == fallback_type);
     CHECK(media.data[1] == 0x11U);
     CHECK(trigger_ctx.trigger_frames_remaining
           == TRACK_POPUP_TRIGGER_FRAME_COUNT - 1U);
@@ -452,9 +452,37 @@ static void expect_fallback(uint8_t media_type) {
           == TRACK_POPUP_FALLBACK_ISOTP_FLOW_CONTROL_ID);
 }
 
+static void expect_fallback(uint8_t media_type) {
+    expect_fallback_type(media_type, TRACK_POPUP_FALLBACK_MEDIA_TYPE);
+}
+
 static void test_fallbacks(void) {
     expect_fallback(TRACK_POPUP_MEDIA_OFF_TYPE);
     expect_fallback(0x12U);
+}
+
+// The Ioniq 6 switches the fallback to 0x02. Only types on the fallback's Apps
+// channel are accepted, and a popup keeps the type it started with.
+static void test_fallback_media_type(void) {
+    CHECK(!track_popup_set_fallback_media_type(TRACK_POPUP_MEDIA_OFF_TYPE));
+    CHECK(!track_popup_set_fallback_media_type(0x10U));   // Bluetooth channel
+    CHECK(!track_popup_set_fallback_media_type(0x00U));   // no channel
+    expect_fallback(TRACK_POPUP_MEDIA_OFF_TYPE);           // refusals changed nothing
+
+    CHECK(track_popup_set_fallback_media_type(0x02U));
+    expect_fallback_type(TRACK_POPUP_MEDIA_OFF_TYPE, 0x02U);
+
+    // mid-popup change: the rest of this popup still pins 0x02
+    CHECK(track_popup_set_fallback_media_type(TRACK_POPUP_FALLBACK_MEDIA_TYPE));
+    CHECK(fwd(TRACK_POPUP_MEDIA_FRAME_ID, TRACK_POPUP_TARGET_BUS, NULL)
+          == FWD_MODIFIED);
+    twai_message_t media = {0};
+    media.identifier = TRACK_POPUP_MEDIA_FRAME_ID;
+    media.data_length_code = 8U;
+    media.data[0] = TRACK_POPUP_MEDIA_OFF_TYPE;
+    CHECK(track_popup_fwd(&media, TRACK_POPUP_TARGET_BUS) == FWD_MODIFIED);
+    CHECK(media.data[0] == 0x02U);
+    expect_fallback(TRACK_POPUP_MEDIA_OFF_TYPE);           // the next one uses 0x04
 }
 
 static void start_queued_popup(void) {
@@ -553,6 +581,7 @@ int main(void) {
     test_media_transport_map();
     test_known_media();
     test_fallbacks();
+    test_fallback_media_type();
     test_popup_beeps();
     test_failed_popups_beep_once();
     return test_report("track popup state machine");
