@@ -1587,9 +1587,40 @@ static int upload_parse(const char *buf, int got, int content_len, upload_t *up)
     }
 }
 
+/* Each httpd_req_recv() waits recv_wait_timeout (5 s) for data; an upload
+ * gives up after this many in a row (30 s) rather than hold the server's one
+ * task (and with it all of the web UI) and, during an OTA, keep BLE and CAN off. */
+#define UPLOAD_RECV_TIMEOUTS 6
+
+static int upload_recv(httpd_req_t *req, char *buf, size_t len)
+{
+    int ret;
+    int timeouts = 0;
+
+    do
+    {
+        ret = httpd_req_recv(req, buf, len);
+    } while (ret == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts < UPLOAD_RECV_TIMEOUTS);
+    return ret;
+}
+
+/* Answers an upload whose body couldn't be received (an upload_recv() error) */
+static void upload_recv_failed(httpd_req_t *req, int err)
+{
+    ESP_LOGE(TAG, "File reception failed (%d)", err);
+    if (err == HTTPD_SOCK_ERR_TIMEOUT)
+    {
+        httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "Upload stalled");
+    }
+    else
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive file");
+    }
+}
+
 /* Receives the start of an upload into scratch until its file part's headers
  * are in. Returns the bytes received, 0 if the body isn't an upload (or the
- * headers don't fit in scratch), or an httpd_req_recv() error (< 0; a client
+ * headers don't fit in scratch), or an upload_recv() error (< 0; a client
  * that closed the connection gives HTTPD_SOCK_ERR_FAIL). */
 static int upload_recv_start(httpd_req_t *req, char *scratch, upload_t *up)
 {
@@ -1598,7 +1629,7 @@ static int upload_recv_start(httpd_req_t *req, char *scratch, upload_t *up)
 
     while (got < want)
     {
-        int ret = httpd_req_recv(req, scratch + got, want - got);
+        int ret = upload_recv(req, scratch + got, want - got);
         if (ret <= 0)
         {
             return ret < 0 ? ret : HTTPD_SOCK_ERR_FAIL;
@@ -1614,17 +1645,28 @@ static int upload_recv_start(httpd_req_t *req, char *scratch, upload_t *up)
 }
 
 /* Checks that the body ends with the closing boundary right after the file:
- * tail holds those of its bytes that came in with the file's start. */
-static bool upload_recv_end(httpd_req_t *req, const upload_t *up, const char *tail, int tail_len)
+ * tail holds those of its bytes that came in with the file's start. Returns 1
+ * if it does, 0 if not, or an upload_recv() error (< 0; a client that closed
+ * the connection gives HTTPD_SOCK_ERR_FAIL). */
+static int upload_recv_end(httpd_req_t *req, const upload_t *up, const char *tail, int tail_len)
 {
     char end[sizeof(up->end)];
+    int got = tail_len;
 
     if (tail_len > 0)
     {
         memcpy(end, tail, tail_len);
     }
-    return recv_full(req, end + tail_len, up->end_len - tail_len) == up->end_len - tail_len &&
-           memcmp(end, up->end, up->end_len) == 0;
+    while (got < up->end_len)
+    {
+        int ret = upload_recv(req, end + got, up->end_len - got);
+        if (ret <= 0)
+        {
+            return ret < 0 ? ret : HTTPD_SOCK_ERR_FAIL;
+        }
+        got += ret;
+    }
+    return memcmp(end, up->end, up->end_len) == 0;
 }
 
 /* Handler to upload a file onto the server */
@@ -1673,14 +1715,14 @@ static esp_err_t upload_ota(httpd_req_t *req)
     int got = upload_recv_start(req, scratch, &up);
     if (got <= 0)
     {
-        ESP_LOGE(TAG, "File reception failed (%d)", got);
         if (got == 0)
         {
+            ESP_LOGE(TAG, "Malformed upload");
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Malformed upload");
         }
         else
         {
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive file");
+            upload_recv_failed(req, got);
         }
         return ESP_FAIL;
     }
@@ -1740,19 +1782,10 @@ static esp_err_t upload_ota(httpd_req_t *req)
         vTaskDelay(5 / portTICK_PERIOD_MS);
 
         buf = scratch;
-        if ((received = httpd_req_recv(req, buf, MIN(up.file_len - total_size, SCRATCH_BUFSIZE))) <= 0)
+        if ((received = upload_recv(req, buf, MIN(up.file_len - total_size, SCRATCH_BUFSIZE))) <= 0)
         {
-            if (received == HTTPD_SOCK_ERR_TIMEOUT)
-            {
-                /* Retry if timeout occurred */
-                received = 0;
-                continue;
-            }
-
-            ESP_LOGE(TAG, "File reception failed!");
             esp_ota_abort(update_handle);
-            /* Respond with 500 Internal Server Error */
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive file");
+            upload_recv_failed(req, received);
             return ESP_FAIL;
         }
     }
@@ -1761,11 +1794,19 @@ static esp_err_t upload_ota(httpd_req_t *req)
     ESP_LOGI(TAG, "File reception complete: %lu", total_size);
 
     int tail = got - up.file_off - up.file_len;
-    if (!upload_recv_end(req, &up, tail > 0 ? scratch + up.file_off + up.file_len : NULL, MAX(tail, 0)))
+    int end = upload_recv_end(req, &up, tail > 0 ? scratch + up.file_off + up.file_len : NULL, MAX(tail, 0));
+    if (end != 1)
     {
-        ESP_LOGE(TAG, "Upload doesn't end with its closing boundary");
         esp_ota_abort(update_handle);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Malformed upload");
+        if (end < 0)
+        {
+            upload_recv_failed(req, end);
+        }
+        else
+        {
+            ESP_LOGE(TAG, "Upload doesn't end with its closing boundary");
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Malformed upload");
+        }
         return ESP_FAIL;
     }
 
@@ -1888,14 +1929,14 @@ static esp_err_t upload_car_data_handler(httpd_req_t *req)
     int got = upload_recv_start(req, scratch, &up);
     if (got <= 0)
     {
-        ESP_LOGE(TAG, "File reception failed (%d)", got);
         if (got == 0)
         {
+            ESP_LOGE(TAG, "Malformed upload");
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Malformed upload");
         }
         else
         {
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive file");
+            upload_recv_failed(req, got);
         }
         return ESP_FAIL;
     }
@@ -1935,30 +1976,30 @@ static esp_err_t upload_car_data_handler(httpd_req_t *req)
         vTaskDelay(5 / portTICK_PERIOD_MS);
 
         buf = scratch;
-        if ((received = httpd_req_recv(req, buf, MIN(up.file_len - total_size, SCRATCH_BUFSIZE))) <= 0)
+        if ((received = upload_recv(req, buf, MIN(up.file_len - total_size, SCRATCH_BUFSIZE))) <= 0)
         {
-            if (received == HTTPD_SOCK_ERR_TIMEOUT)
-            {
-                /* Retry if timeout occurred */
-                received = 0;
-                continue;
-            }
-
-            ESP_LOGE(TAG, "File reception failed!");
             fclose(fd);
             unlink(filepath);
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive file");
+            upload_recv_failed(req, received);
             return ESP_FAIL;
         }
     }
 
     int tail = got - up.file_off - up.file_len;
-    if (!upload_recv_end(req, &up, tail > 0 ? scratch + up.file_off + up.file_len : NULL, MAX(tail, 0)))
+    int end = upload_recv_end(req, &up, tail > 0 ? scratch + up.file_off + up.file_len : NULL, MAX(tail, 0));
+    if (end != 1)
     {
-        ESP_LOGE(TAG, "Upload doesn't end with its closing boundary");
         fclose(fd);
         unlink(filepath);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Malformed upload");
+        if (end < 0)
+        {
+            upload_recv_failed(req, end);
+        }
+        else
+        {
+            ESP_LOGE(TAG, "Upload doesn't end with its closing boundary");
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Malformed upload");
+        }
         return ESP_FAIL;
     }
 
