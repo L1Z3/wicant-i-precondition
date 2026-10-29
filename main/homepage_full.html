@@ -1422,6 +1422,13 @@
                             onclick="preconActivate()" value="Toggle" />
                     </td>
                 </tr>
+                <tr class="can1_row" style="display:none">
+                    <td>Start Remote Climate:</td>
+                    <td>
+                        <input id="remote_climate_button" name="remote_climate_button" type="button"
+                            onclick="remoteClimateStart()" value="Start Climate" />
+                    </td>
+                </tr>
                 <tr>
                     <td>Track Popup Text:</td>
                     <td>
@@ -2717,6 +2724,13 @@ function loadAutoTable(jsonData) {
 			document.getElementById("precondition_active_status").textContent = obj.precondition_starting ? "Starting" : (obj.precondition_active ? "Yes" : "No");
 			// the button toggles, so label it with the action it will take
 			document.getElementById("precon_activate_button").value = obj.precondition_requested ? "Stop Preconditioning" : "Activate";
+			// remote climate prototype: hidden on single-bus boards, and
+			// disabled while a start sequence is running
+			const climateButton = document.getElementById("remote_climate_button");
+			if (climateButton) {
+				climateButton.disabled = !!obj.remote_climate_active;
+				climateButton.value = obj.remote_climate_active ? "Starting..." : "Start Climate";
+			}
 			// car identified from CAN; the button filter uses it when the
 			// vehicle setting is "auto"
 			const carSelect = document.getElementById("egmp_car_model");
@@ -3098,6 +3112,26 @@ function loadAutoTable(jsonData) {
             showNotification("Failed to toggle preconditioning", "red");
         };
 		xhttp.open("POST", "/precondition_toggle");
+		xhttp.send();
+	}
+
+	// Remote climate prototype: the device replays the head unit's own
+	// activation sequence and blocks the head unit's copies while it runs.
+	function remoteClimateStart() {
+		const button = document.getElementById("remote_climate_button");
+		const xhttp = new XMLHttpRequest();
+		button.disabled = true;
+		xhttp.onload = function() {
+            showNotification(this.responseText, "green");
+            // the sequence takes a few seconds; checkStatus re-enables the
+            // button once the device reports it finished
+            setTimeout(checkStatus, 200);
+		};
+        xhttp.onerror = function() {
+            button.disabled = false;
+            showNotification("Failed to start remote climate", "red");
+        };
+		xhttp.open("POST", "/precondition_climate_start");
 		xhttp.send();
 	}
 

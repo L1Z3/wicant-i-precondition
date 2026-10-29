@@ -23,7 +23,8 @@ MAIN := ../../main
 # firmware files tests compile against (copied into build/src)
 FW_FILES := utf8_utf16_converter.c utf8_utf16_converter.h hsm.c hsm.h beep.c beep.h \
 	isotp_tx.c isotp_tx.h track_popup.c track_popup.h \
-	precondition.c precondition.h persistent_settings.c persistent_settings.h
+	precondition.c precondition.h climate.c climate.h \
+	persistent_settings.c persistent_settings.h
 # firmware sources linked into every test binary (tests that #include a
 # source instead, for introspection, don't list it here)
 LINK_SRCS := build/src/hsm.c
@@ -65,13 +66,15 @@ build/test_beep_single_bus: test_beep.c $(FW_COPIES) $(HEADERS) | build/src
 build/test_%: test_%.c $(FW_COPIES) $(HEADERS) | build/src
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DEXPECT_CAN_BUS_COUNT=2 -o $@ $< $(LINK_SRCS) \
 		$(if $(filter test_isotp_tx.c test_track_popup.c,$<),build/src/isotp_tx.c) \
-		$(if $(filter test_track_popup.c,$<),build/src/utf8_utf16_converter.c)
+		$(if $(filter test_track_popup.c,$<),build/src/utf8_utf16_converter.c) \
+		$(if $(filter test_precondition.c test_climate.c,$<),build/src/climate.c)
 
 # Explicit rule, so it wins over the build/test_% pattern above: the same suite
 # with the one-bus board's CAN_BUS_COUNT. The stub in stubs/can.h is #ifndef'd
 # so this -D takes effect.
 build/test_precondition_1bus: test_precondition.c $(FW_COPIES) $(HEADERS) | build/src
-	$(CC) $(CFLAGS) $(CPPFLAGS) -DCAN_BUS_COUNT=1 -DEXPECT_CAN_BUS_COUNT=1 -o $@ $< $(LINK_SRCS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DCAN_BUS_COUNT=1 -DEXPECT_CAN_BUS_COUNT=1 -o $@ $< $(LINK_SRCS) \
+		build/src/climate.c
 
 clean:
 	rm -rf build

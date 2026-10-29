@@ -6,6 +6,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "can.h"
+#include "climate.h"
 #include "hsm.h"
 #include "precondition.h"
 #include "persistent_settings.h"
@@ -1326,6 +1327,9 @@ static void precondition_global_tick(sm_t *sm) {
         sm_send_event(&precon_sm, EV_TOGGLE);
     }
 
+    // remote climate prototype: replay the head unit's own activation
+    climate_tick();
+
     push_precondition_state();
 }
 
@@ -1484,6 +1488,10 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
 
 static fwd_result_t precondition_global_fwd(sm_t *sm, twai_message_t *to_send,
                                             can_bus_t fwd_bus) {
+    fwd_result_t climate_result = climate_fwd_hook(to_send, fwd_bus);
+    if (climate_result != FWD_PASSTHROUGH) {
+        return climate_result;
+    }
     return track_popup_fwd(to_send, fwd_bus);
 }
 

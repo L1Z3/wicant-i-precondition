@@ -74,6 +74,7 @@
 #include "wc_mdns.h"
 #include "hw_config.h"
 #include "ha_webhooks.h"
+#include "climate.h"
 #include "precondition.h"
 #include "track_popup.h"
 #include "esp_timer.h"
@@ -742,6 +743,21 @@ static esp_err_t precondition_toggle_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// Remote climate prototype: replays the head unit's own activation sequence.
+// Always 200 like the preconditioning toggle; the body says what happened.
+static esp_err_t precondition_climate_start_handler(httpd_req_t *req)
+{
+	const char *resp_str = "Remote climate start requested";
+	esp_err_t err = climate_request_start();
+	if (err == ESP_ERR_NOT_SUPPORTED) {
+		resp_str = "Remote climate start needs the head-unit bus";
+	} else if (err != ESP_OK) {
+		resp_str = "Remote climate start already running";
+	}
+	httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
+	return ESP_OK;
+}
+
 static esp_err_t track_popup_handler(httpd_req_t *req)
 {
     if (req->content_len == 0U)
@@ -1060,6 +1076,9 @@ char *config_server_get_status_json(bool remove_sensitive_info)
         cJSON_AddBoolToObject(root, "precondition_active", pstate.active);
         cJSON_AddBoolToObject(root, "precondition_starting", pstate.starting);
 	}
+
+	// remote climate prototype; the UI disables its button while this is set
+	cJSON_AddBoolToObject(root, "remote_climate_active", climate_is_active());
 
 	// car identified from CAN this session; the web UI filters the buttons
 	// by it when the vehicle setting is "auto"
@@ -1763,6 +1782,12 @@ static const httpd_uri_t precondition_toggle = {
     .uri       = "/precondition_toggle",
     .method    = HTTP_POST,
     .handler   = precondition_toggle_handler,
+    .user_ctx  = NULL
+};
+static const httpd_uri_t precondition_climate_start = {
+    .uri       = "/precondition_climate_start",
+    .method    = HTTP_POST,
+    .handler   = precondition_climate_start_handler,
     .user_ctx  = NULL
 };
 static const httpd_uri_t track_popup = {
@@ -2610,6 +2635,7 @@ static httpd_handle_t config_server_init(void)
         httpd_register_uri_handler(server, &file_upload);
 		httpd_register_uri_handler(server, &system_reboot);
 		httpd_register_uri_handler(server, &precondition_toggle);
+		httpd_register_uri_handler(server, &precondition_climate_start);
 		httpd_register_uri_handler(server, &track_popup);
 		httpd_register_uri_handler(server, &store_canflt_uri);
 		httpd_register_uri_handler(server, &load_canflt_uri);
@@ -2651,6 +2677,7 @@ void config_server_restart(void)
         httpd_register_uri_handler(server, &file_upload);
 		httpd_register_uri_handler(server, &system_reboot);
 		httpd_register_uri_handler(server, &precondition_toggle);
+		httpd_register_uri_handler(server, &precondition_climate_start);
 		httpd_register_uri_handler(server, &track_popup);
 		httpd_register_uri_handler(server, &store_canflt_uri);
 		httpd_register_uri_handler(server, &load_canflt_uri);
