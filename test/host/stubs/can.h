@@ -17,4 +17,8 @@
 typedef enum { CAN_BUS_0 = 0, CAN_BUS_1 = 1 } can_bus_t;
 typedef int esp_err_t;
 
+// esp_err.h normally reaches this header through driver/twai.h; provide the
+// one value the firmware checks against can_send().
+#define ESP_OK 0
+
 esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_wait);
