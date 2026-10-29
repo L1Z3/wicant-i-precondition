@@ -1934,46 +1934,20 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
 
 static esp_err_t upload_car_data_handler(httpd_req_t *req)
 {
-    char filepath[FILE_PATH_MAX];
-    uint32_t total_size = 0;
-
-    /* Skip leading "/upload" from URI to get filename */
-    /* Note sizeof() counts NULL termination hence the -1 */
-    const char *filename = get_path_from_uri(filepath, ((struct file_server_data *)req->user_ctx)->base_path,
-                                             req->uri + sizeof("/upload") - 1, sizeof(filepath));
-    if (!filename) {
-        /* Respond with 500 Internal Server Error */
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Filename too long");
-        return ESP_FAIL;
-    }
-
-    /* Filename cannot have a trailing '/' */
-    if (filename[strlen(filename) - 1] == '/') {
-        ESP_LOGE(TAG, "Invalid filename : %s", filename);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Invalid filename");
-        return ESP_FAIL;
-    }
-
-    /* File cannot be larger than a limit */
-    if (req->content_len > MAX_FILE_SIZE)
+    /* The file plus its multipart framing */
+    if (req->content_len > CAR_DATA_MAX_LEN + SCRATCH_BUFSIZE)
     {
-        ESP_LOGE(TAG, "File too large : %d bytes", req->content_len);
-        /* Respond with 400 Bad Request */
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                            "File size must be less than "
-                            MAX_FILE_SIZE_STR "!");
+        ESP_LOGE(TAG, "Car data too large: %d bytes", req->content_len);
+        httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, "Car data too large");
         /* Return failure to close underlying connection else the
          * incoming file content will keep the socket busy */
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "Receiving file : %s...", filename);
-
     /* Retrieve the pointer to scratch buffer for temporary storage */
     char *scratch = ((struct file_server_data *)req->user_ctx)->scratch;
     upload_t up;
 
-    /* Before opening the file, which truncates it */
     int got = upload_recv_start(req, scratch, &up);
     if (got <= 0)
     {
@@ -1988,57 +1962,42 @@ static esp_err_t upload_car_data_handler(httpd_req_t *req)
         }
         return ESP_FAIL;
     }
-
-	FILE *fd = fopen(filepath, "w");
-    if (fd == NULL)
+    if (up.file_len > CAR_DATA_MAX_LEN)
     {
-        ESP_LOGE(TAG, "Failed to create file : %s", filepath);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to create file");
+        ESP_LOGE(TAG, "Car data too large: %d bytes", up.file_len);
+        httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, "Car data too large");
         return ESP_FAIL;
     }
 
-    /* The file's start came in with the part headers; receive the rest at
-     * the start of scratch, part by part */
-    char *buf = scratch + up.file_off;
-    int received = MIN(got - up.file_off, up.file_len);
-
-    while (1)
+    /* Receive and check the whole file before replacing car_data.json, so
+     * a failed upload leaves it as it was */
+    char *buf = malloc(up.file_len + 1);
+    if (buf == NULL)
     {
-        total_size += received;
-        /* Write buffer content to file on storage */
-        if (received > 0)
-        {
-            if (fwrite(buf, 1, received, fd) != received)
-            {
-                ESP_LOGE(TAG, "File write failed!");
-                fclose(fd);
-                unlink(filepath);
-                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to write file to storage");
-                return ESP_FAIL;
-            }
-        }
-        if (total_size >= up.file_len)
-        {
-            break;
-        }
-        vTaskDelay(5 / portTICK_PERIOD_MS);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        return ESP_FAIL;
+    }
+    /* The file's start came in with the part headers */
+    int received = MIN(got - up.file_off, up.file_len);
+    memcpy(buf, scratch + up.file_off, received);
 
-        buf = scratch;
-        if ((received = upload_recv(req, buf, MIN(up.file_len - total_size, SCRATCH_BUFSIZE))) <= 0)
+    while (received < up.file_len)
+    {
+        int ret = upload_recv(req, buf + received, up.file_len - received);
+        if (ret <= 0)
         {
-            fclose(fd);
-            unlink(filepath);
-            upload_recv_failed(req, received);
+            free(buf);
+            upload_recv_failed(req, ret);
             return ESP_FAIL;
         }
+        received += ret;
     }
 
     int tail = got - up.file_off - up.file_len;
     int end = upload_recv_end(req, &up, tail > 0 ? scratch + up.file_off + up.file_len : NULL, MAX(tail, 0));
     if (end != 1)
     {
-        fclose(fd);
-        unlink(filepath);
+        free(buf);
         if (end < 0)
         {
             upload_recv_failed(req, end);
@@ -2051,10 +2010,10 @@ static esp_err_t upload_car_data_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    fclose(fd);
-
-    ESP_LOGI(TAG, "File reception complete: %lu", total_size);
-    httpd_resp_sendstr(req, "File uploaded successfully");
+    ESP_LOGI(TAG, "File reception complete: %d", up.file_len);
+    buf[up.file_len] = 0;
+    save_car_data(req, buf, up.file_len, "File uploaded successfully");
+    free(buf);
     return ESP_OK;
 }
 
