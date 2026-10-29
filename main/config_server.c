@@ -68,6 +68,7 @@
 #include "wifi_network.h"
 #include "esp_vfs.h"
 #include "esp_ota_ops.h"
+#include "esp_bt.h"
 #include "can.h"
 #include "ble.h"
 #include "sleep_mode.h"
@@ -1509,19 +1510,11 @@ static esp_err_t ws_handler(httpd_req_t *req)
 }
 
 /* Handler to upload a file onto the server */
-static esp_err_t upload_post_handler(httpd_req_t *req)
+static esp_err_t upload_ota(httpd_req_t *req)
 {
     char filepath[FILE_PATH_MAX];
     uint32_t total_size = 0;
 
-    if(config_server_get_ble_config())
-    {
-    	ble_disable();
-    }
-    for(int bus = 0; bus < CAN_BUS_COUNT; bus++)
-    {
-        can_disable(bus);
-    }
     /* Skip leading "/upload" from URI to get filename */
     /* Note sizeof() counts NULL termination hence the -1 */
     const char *filename = get_path_from_uri(filepath, ((struct file_server_data *)req->user_ctx)->base_path,
@@ -1616,6 +1609,7 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
 
 
             ESP_LOGE(TAG, "File reception failed!");
+            esp_ota_abort(update_handle);
             /* Respond with 500 Internal Server Error */
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive file");
             return ESP_FAIL;
@@ -1707,6 +1701,48 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
 #endif
     httpd_resp_sendstr(req, "File uploaded successfully");
     return ESP_OK;
+}
+
+static esp_err_t upload_post_handler(httpd_req_t *req)
+{
+    // BLE also goes off while a client is on the AP (wifi_network.c)
+    bool ble_off = config_server_get_ble_config() &&
+                   esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED;
+    bool can_off = false;
+
+    if (config_server_get_ble_config())
+    {
+        ble_disable();
+    }
+    for (int bus = 0; bus < CAN_BUS_COUNT; bus++)
+    {
+        can_off |= can_is_enabled((can_bus_t)bus);
+        can_disable((can_bus_t)bus);
+    }
+
+    esp_err_t ret = upload_ota(req);
+
+    /* A successful update reboots into the new image. After a failure, bring
+     * back what was turned off above: BLE directly, CAN by rebooting into this
+     * image (still selected). Not when no bus was on: then bringing back BLE
+     * is enough. Never while asleep, which would wake the device. */
+    if (ret != ESP_OK && !dev_status_is_sleeping())
+    {
+        if (can_off)
+        {
+            ESP_LOGW(TAG, "OTA failed, restarting to bring back CAN");
+            if (xTimerStart(xrestartTimer, 0) != pdPASS)
+            {
+                ESP_LOGE(TAG, "Couldn't start the restart timer");
+            }
+        }
+        // Unless a client leaving the AP has brought it back already
+        else if (ble_off && esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_IDLE)
+        {
+            ble_enable();
+        }
+    }
+    return ret;
 }
 
 static esp_err_t upload_car_data_handler(httpd_req_t *req)
