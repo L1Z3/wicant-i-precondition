@@ -185,6 +185,8 @@ static bool is_utility_request(const twai_message_t *frame) {
 #define PRECONDITION_RETRY_US 10000000U  // 10 seconds
 #define PRECONDITION_MAX_RETRIES 4U
 #define PRECONDITION_STARTED_TIMEOUT_US 70000000U  // 70 seconds
+// the Ioniq 6 takes about 90 s from the start command to fully started
+#define PRECONDITION_STARTED_TIMEOUT_IONIQ6_US 90000000U  // 90 seconds
 #define PRECONDITION_CAR_START_DELAY_US 8000000U  // wait 8 seconds after READY before startup actions
 #define REPEATING_MODE_COOL_WAIT_US (3LL * 60LL * 1000000LL)  // continuously below cutoff before first re-nudge
 #define REPEATING_MODE_RETRY_INTERVAL_US (5LL * 60LL * 1000000LL)  // 5 minutes between re-nudges
@@ -215,9 +217,9 @@ static bool is_utility_request(const twai_message_t *frame) {
 #define HEAD_UNIT_BUS CAN_BUS_0
 #endif
 
-#define SECONDS_UNTIL_START(elapsed) \
-    (((elapsed) >= PRECONDITION_STARTED_TIMEOUT_US) ? 0U : \
-     ((PRECONDITION_STARTED_TIMEOUT_US - (elapsed)) / 1000000U))
+#define SECONDS_UNTIL_START(elapsed, timeout) \
+    (((elapsed) >= (timeout)) ? 0U : \
+     (((timeout) - (elapsed)) / 1000000U))
 
 #define SECONDS_UNTIL_STOP_RETRY(elapsed) \
     (((elapsed) >= PRECONDITION_RETRY_US) ? 0U : \
@@ -225,6 +227,17 @@ static bool is_utility_request(const twai_message_t *frame) {
 
 static int64_t ts_elapsed(int64_t now, int64_t old) {
     return now - old;
+}
+
+// How long a start may take to reach fully started. The model latches from the
+// first recognised status frame, so until then (and on platforms without status
+// frames) this is the default; if it latches mid-countdown the display jumps up.
+static int64_t started_timeout_us(void) {
+    egmp_car_model_t model;
+    if (precondition_get_car_model(&model) && model == EGMP_CAR_IONIQ6) {
+        return PRECONDITION_STARTED_TIMEOUT_IONIQ6_US;
+    }
+    return PRECONDITION_STARTED_TIMEOUT_US;
 }
 
 // ********************* state machine outline *********************
@@ -718,9 +731,10 @@ static fwd_result_t starting_display_fwd(sm_t *sm, twai_message_t *to_send, can_
     }
     if (to_send->identifier == 0x4E8U) {
         int64_t time_since_last_attempt = ts_elapsed(sm_now(sm), requested.last_attempt_ts);
+        int64_t started_timeout = started_timeout_us();
         set_0x4e8_distance_flag(
             to_send,
-            SECONDS_UNTIL_START(time_since_last_attempt),
+            SECONDS_UNTIL_START(time_since_last_attempt, started_timeout),
             // display retry count in tenths digit
             precon_status_available() ? (requested.retries % 10U) : 0U,
             precon_status_available() ? (requested.retries == 0U ? DIST_UNIT_YD : DIST_UNIT_KM) : DIST_UNIT_M,
@@ -990,7 +1004,7 @@ static void wait_starting_tick(sm_t *sm) {
     if (!precon_status_available()) {
         // without status frames we can't confirm or retry anything; after the
         // timeout, assume it worked so the countdown display goes away
-        if (time_since_last_attempt > PRECONDITION_STARTED_TIMEOUT_US) {
+        if (time_since_last_attempt > started_timeout_us()) {
             sm_transition(sm, &S_ACTIVE);
         }
         return;
@@ -1024,7 +1038,7 @@ static void wait_started_tick(sm_t *sm) {
     // the car said "starting" but hasn't reached fully started
     // (i.e. we got 2AD 05 but not 15 after a long time)
     int64_t time_since_last_attempt = ts_elapsed(sm_now(sm), requested.last_attempt_ts);
-    if (time_since_last_attempt > PRECONDITION_STARTED_TIMEOUT_US) {
+    if (time_since_last_attempt > started_timeout_us()) {
         start_timeout(sm);
     }
 }
@@ -1040,7 +1054,7 @@ static bool wait_started_event(sm_t *sm, sm_event_t ev) {
         case EV_STATUS_IDLE:
             // a bit odd; we previously got "starting", but now the BMU is showing "idle".
             // perhaps the SoC/temp conditions are no longer met?
-            // let's just stick with 70s retries for now.
+            // let's just keep retrying on the started timeout for now.
             return true;
     }
     return false;
