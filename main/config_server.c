@@ -1817,7 +1817,16 @@ static esp_err_t upload_ota(httpd_req_t *req)
     assert(update_partition != NULL);
     ESP_LOGI(TAG, "Writing to partition subtype %d at offset 0x%lx",
              update_partition->subtype, update_partition->address);
-    err = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &update_handle);
+    if ((uint32_t)up.file_len > update_partition->size)
+    {
+        ESP_LOGE(TAG, "Firmware too large: %d bytes, partition %lu", up.file_len, update_partition->size);
+        httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, "Firmware too large for this board");
+        return ESP_FAIL;
+    }
+    /* Each flash erase stops the CPU's flash cache. Erasing only the image's
+     * size up front (rounded up to 4 KB), not the whole partition, shortens
+     * the update: the upload turns BLE and CAN off when it starts. */
+    err = esp_ota_begin(update_partition, up.file_len, &update_handle);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "esp_ota_begin failed (%s)", esp_err_to_name(err));
