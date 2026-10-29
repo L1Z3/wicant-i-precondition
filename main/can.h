@@ -61,8 +61,8 @@ void can_disable(can_bus_t bus);
 // it so: can_disable() and the config setters refuse, and a bus that goes
 // down is brought back. Until can_park().
 void can_lock_bridge(void);
-// Sleep: takes every bus down for good (unlocking MITM forwarding); no bus
-// comes up again until the restart that waking is
+// Sleep: takes every bus down and unlocks MITM forwarding. No bus comes back
+// up until the board wakes, which is a restart.
 void can_park(void);
 // So clients can tell a refused change from one that took
 bool can_bridge_locked(void);
