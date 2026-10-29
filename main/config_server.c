@@ -115,6 +115,19 @@ static char can_datarate_str[11][7] = {
 								"1000K",
 };
 
+// Boards that can sense the car's ignition (EB-FD and proto) default to
+// car-off sleep; the others keep meatPi's default. This reaches any board that
+// falls back to the defaults (missing, unreadable or invalid config.json). On
+// the bench, a board fed below sleep_volt with nothing on the car-on pin sleeps
+// after sleep_time (2 min by default) and takes Wi-Fi, BLE and CAN forwarding
+// with it: raise the supply above sleep_volt or put the car-on pin above
+// CAR_ON_THRESHOLD_V to get it back.
+#if HW_HAS_CAR_ON_SENSE
+#define SLEEP_STATUS_DEFAULT "car_off"
+#else
+#define SLEEP_STATUS_DEFAULT "disable"
+#endif
+
 const char device_config_default[] = R"json({
 "wifi_mode":"AP",
 "ap_ch":"6",
@@ -134,8 +147,7 @@ const char device_config_default[] = R"json({
 "protocol":"savvycan",
 "ble_pass":"123456",
 "ble_status":"disable",
-"sleep_status":"disable",
-"sleep_volt":"13.1",
+)json" "\"sleep_status\":\"" SLEEP_STATUS_DEFAULT "\",\n" R"json("sleep_volt":"13.1",
 "wakeup_volt":"13.5",
 "batt_alert":"disable",
 "batt_alert_ssid":"MeatPi",
