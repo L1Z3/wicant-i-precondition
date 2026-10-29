@@ -1,3 +1,4 @@
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -16,7 +17,11 @@
 #define TRACK_POPUP_MEDIA_OFF_TYPE 0x14U
 #define TRACK_POPUP_MEDIA_FRAME_ID 0x4CEU
 
-// "Sounds of Nature" as fallback category
+// Media type pinned on the 0x4CE frame when nothing is playing, or the playing
+// type has no known channel: "Sounds of Nature" by default. An Ioniq 6 shows
+// only its built-in label for 0x04 and 0x05, ignoring our text, so
+// precondition.c switches it to 0x02 (labelled "Apps", then our text) with
+// track_popup_set_fallback_media_type().
 #define TRACK_POPUP_FALLBACK_MEDIA_TYPE 0x04U
 #define TRACK_POPUP_FALLBACK_ISOTP_TX_ID 0x6E0U
 #define TRACK_POPUP_FALLBACK_ISOTP_FLOW_CONTROL_ID 0x6BEU
@@ -205,6 +210,8 @@ typedef struct {
     track_popup_request_t pending_request;
     track_popup_transport_t active_transport;
     bool media_type_owned;
+    // fallback type for the current popup, latched when the strategy is chosen
+    uint8_t owned_media_type;
 } track_popup_t;
 
 typedef struct {
@@ -217,6 +224,9 @@ typedef struct {
 
 static track_popup_t popup;
 static trigger_ctx_t trigger_ctx;  // owned by TRIGGER state
+// Set from the CAN task and read when a popup picks its strategy; relaxed is
+// enough because nothing else is published with it.
+static _Atomic uint8_t fallback_media_type = TRACK_POPUP_FALLBACK_MEDIA_TYPE;
 static const sm_state_t S_IDLE, S_TRIGGER, S_SENDING, S_HOLD;
 
 _Static_assert(offsetof(track_popup_t, sm) == 0,
@@ -301,7 +311,11 @@ static void select_fallback_strategy(track_popup_t *service) {
     };
     set_active_transport(service, &fallback);
     service->media_type_owned = true;
+    service->owned_media_type =
+        atomic_load_explicit(&fallback_media_type, memory_order_relaxed);
     trigger_ctx.strategy_selected = true;
+    ESP_LOGI(TAG, "fallback media type 0x%02X with ISO-TP 0x%03X/0x%03X",
+             service->owned_media_type, fallback.tx_id, fallback.flow_control_id);
 }
 
 static bool select_active_media_strategy(track_popup_t *service,
@@ -325,7 +339,7 @@ static fwd_result_t pin_media_type(track_popup_t *service,
             || !is_media_frame(msg, fwd_bus)) {
         return FWD_PASSTHROUGH;
     }
-    msg->data[0] = TRACK_POPUP_FALLBACK_MEDIA_TYPE;
+    msg->data[0] = service->owned_media_type;
     return FWD_MODIFIED;
 }
 
@@ -488,6 +502,22 @@ static const sm_state_t S_HOLD = {
 };
 
 // ********************* public API *********************
+
+bool track_popup_set_fallback_media_type(uint8_t media_type) {
+    // the fallback always sends on its fixed channel, so only types that the
+    // head unit also routes there fit
+    track_popup_transport_t transport;
+    if (media_type == TRACK_POPUP_MEDIA_OFF_TYPE
+            || !transport_for_media_type(media_type, &transport)
+            || transport.tx_id != TRACK_POPUP_FALLBACK_ISOTP_TX_ID
+            || transport.flow_control_id
+                    != TRACK_POPUP_FALLBACK_ISOTP_FLOW_CONTROL_ID) {
+        ESP_LOGW(TAG, "media type 0x%02X can't be the fallback", media_type);
+        return false;
+    }
+    atomic_store_explicit(&fallback_media_type, media_type, memory_order_relaxed);
+    return true;
+}
 
 void track_popup_init(void) {
     memset(&popup, 0, sizeof(popup));

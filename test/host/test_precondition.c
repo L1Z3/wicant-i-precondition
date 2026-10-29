@@ -75,6 +75,11 @@ int8_t config_server_precon_press(void) { return cfg_press; }
 static int popup_show_count = 0;
 static char popup_text[128];
 void track_popup_init(void) {}
+static uint8_t popup_fallback_media_type;
+bool track_popup_set_fallback_media_type(uint8_t media_type) {
+    popup_fallback_media_type = media_type;
+    return true;
+}
 void track_popup_tick(void) {}
 void track_popup_rx(const twai_message_t *msg, can_bus_t rx_bus) {
     (void)msg;
@@ -473,6 +478,11 @@ static void run_short_press(void) {
     expect_state("idle");
     advance_us(15000000);
     CHECK(sent_count == 0);                    // no burst continuation, no retries
+
+    // an Ioniq 5 (0x2AD, EV6 bit clear) keeps the default popup fallback
+    egmp_car_model_t model;
+    CHECK(precondition_get_car_model(&model) && model == EGMP_CAR_IONIQ5);
+    CHECK(popup_fallback_media_type == 0U);
 }
 
 static void run_long_press(void) {
@@ -684,6 +694,7 @@ static void run_ioniq6_status_frame(void) {
 
     // No status frame yet, so nothing has decided the model.
     CHECK(!precondition_get_car_model(&model));
+    CHECK(popup_fallback_media_type == 0U);      // popups keep their default
 
     sent_count = 0;
     toggle();
@@ -704,6 +715,7 @@ static void run_ioniq6_status_frame(void) {
     CHECK(platform.precon_status == PRECON_STATUS_IDLE);
     CHECK(precondition_get_car_model(&model));
     CHECK(model == EGMP_CAR_IONIQ6);
+    CHECK(popup_fallback_media_type == 0x02U);   // popups switch with the model
 
     for (int i = 0; i < 6; i++) tick1();
     CHECK(sent_count == 6);

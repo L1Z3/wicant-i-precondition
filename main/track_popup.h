@@ -15,6 +15,12 @@
 // media type and transport when possible, otherwise force the fallback type.
 void track_popup_init(void);
 
+// Pin this media type instead of "Sounds of Nature" when no media is playing, or
+// the playing type has no known channel.
+// It must use the fallback's Apps channel; anything else is refused. Popups
+// already under way keep the type they started with.
+bool track_popup_set_fallback_media_type(uint8_t media_type);
+
 // Drive the popup state machine from the precondition machine's global hooks.
 void track_popup_tick(void);
 void track_popup_rx(const twai_message_t *msg, can_bus_t rx_bus);
