@@ -2,6 +2,7 @@
 #define __CLIMATE_H__
 
 #include <stdbool.h>
+#include <stddef.h>
 #include "esp_err.h"
 #include "hsm.h"
 
@@ -27,5 +28,15 @@ esp_err_t climate_request_start(void);
 
 // Whether a start is queued or running; the web UI disables its button.
 bool climate_is_active(void);
+
+// Feed every received frame in so the module can log what the car answers.
+// Cheap for the frames it does not track, safe to call from the CAN task.
+void climate_rx_hook(const twai_message_t *msg, can_bus_t rx_bus);
+
+// One line for the Status tab: what the replay is doing and the last frame
+// that looked like a response, e.g.
+//   "idle; 0x4EB 80 hu +1.2 s"
+// Returns false on hardware without the second bus (nothing is written then).
+bool climate_get_status(char *out, size_t len);
 
 #endif

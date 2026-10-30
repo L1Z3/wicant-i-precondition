@@ -60,6 +60,49 @@ static bool payload_is(size_t index, uint32_t id, const uint8_t expected[8]) {
 
 // ********************* suites *********************
 
+// The car's answers are only interesting as edges, and they are reported as one
+// short line the Status tab can show.
+static void suite_logging(void) {
+    char status[64];
+    twai_message_t frame = {0};
+    frame.data_length_code = 8U;
+
+    CHECK(climate_get_status(status, sizeof(status)));
+    CHECK(strcmp(status, "idle") == 0);
+
+    // idle wake frames (bit 4 clear) are not a state change
+    frame.identifier = 0x4F1U;
+    frame.data[1] = 0xC0U;
+    climate_rx_hook(&frame, CAN_BUS_1);
+    CHECK(climate_get_status(status, sizeof(status)));
+    CHECK(strcmp(status, "idle") == 0);
+
+    // the wake bit, as the head unit sends it
+    memcpy(frame.data, wake_payload, 8U);
+    climate_rx_hook(&frame, CAN_BUS_1);
+    CHECK(climate_get_status(status, sizeof(status)));
+    CHECK(strcmp(status, "idle; 0x4F1 D0 00 hu") == 0);
+
+    // the car answers on its own bus with its own 0x4A2 payload
+    frame.identifier = 0x4A2U;
+    frame.data[2] = 0x01U;
+    climate_rx_hook(&frame, CAN_BUS_0);
+    CHECK(climate_get_status(status, sizeof(status)));
+    CHECK(strcmp(status, "idle; 0x4A2 01 00 car") == 0);
+
+    // the head unit's active flag, the response the prototype watches
+    frame.identifier = 0x4EBU;
+    memcpy(frame.data, "\x20\xA0\x16\x01\x80\x00\x00\x00", 8U);
+    climate_rx_hook(&frame, CAN_BUS_1);
+    CHECK(climate_get_status(status, sizeof(status)));
+    CHECK(strcmp(status, "idle; 0x4EB 80 16 hu") == 0);
+
+    // repeating the same frame must not move the reported edge
+    climate_rx_hook(&frame, CAN_BUS_1);
+    CHECK(climate_get_status(status, sizeof(status)));
+    CHECK(strcmp(status, "idle; 0x4EB 80 16 hu") == 0);
+}
+
 // A fresh request is invisible until it is queued, then blocks both frames on
 // the way to the car (and only to the car) before the tick picks it up.
 static void suite_blocking_window(void) {
@@ -97,10 +140,18 @@ static void suite_sequence(void) {
     size_t per_tick[CLIMATE_TEST_TICKS];
     size_t before = sent_count;
 
+    char status[64];
     for (size_t tick = 0; tick < CLIMATE_TEST_TICKS; tick++) {
         size_t previous = sent_count;
         climate_tick();
         per_tick[tick] = sent_count - previous;
+        if (tick == 0U) {
+            // the line says what is running and how the last response sat
+            // relative to the start of the sequence
+            CHECK(climate_get_status(status, sizeof(status)));
+            CHECK(strstr(status, "replaying 0.0/6.3 s;") != NULL);
+            CHECK(strstr(status, "0x4EB 80 16 hu +0.0 s") != NULL);
+        }
     }
 
     // ticks 0..2 wake burst, then nothing until the lead time elapses
@@ -161,6 +212,7 @@ static void suite_sequence(void) {
 }
 
 int main(void) {
+    suite_logging();
     suite_blocking_window();
     suite_sequence();
 

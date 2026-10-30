@@ -1077,8 +1077,13 @@ char *config_server_get_status_json(bool remove_sensitive_info)
         cJSON_AddBoolToObject(root, "precondition_starting", pstate.starting);
 	}
 
-	// remote climate prototype; the UI disables its button while this is set
+	// remote climate prototype; the UI disables its button while this is set,
+	// and shows the short status line next to the preconditioning rows
 	cJSON_AddBoolToObject(root, "remote_climate_active", climate_is_active());
+	char climate_status[96] = {0};
+	if (climate_get_status(climate_status, sizeof(climate_status))) {
+		cJSON_AddStringToObject(root, "remote_climate_status", climate_status);
+	}
 
 	// car identified from CAN this session; the web UI filters the buttons
 	// by it when the vehicle setting is "auto"

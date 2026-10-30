@@ -1571,6 +1571,8 @@ void precondition_tick(void) {
 }
 
 void precondition_can_rx_hook(twai_message_t *to_push, can_bus_t rx_bus) {
+    // the remote-climate prototype watches the car's answers on both buses
+    climate_rx_hook(to_push, rx_bus);
     sm_rx(&precon_sm, to_push, rx_bus);
 }
 

@@ -591,6 +591,11 @@
                     <td>Preconditioning Active:</td>
                     <td><div id="precondition_active_status">Loading...</div></td>
                 </tr>
+                <!-- remote climate prototype: head-unit bus only -->
+                <tr class="can1_row" style="display:none">
+                    <td>Remote Climate:</td>
+                    <td><div id="remote_climate_status">Loading...</div></td>
+                </tr>
                 <tr>
                     <td><input id="check_status_button" name="check_status_button" type="button" onclick="checkStatus()"
                             value="Check status" /></td>
@@ -2724,8 +2729,11 @@ function loadAutoTable(jsonData) {
 			document.getElementById("precondition_active_status").textContent = obj.precondition_starting ? "Starting" : (obj.precondition_active ? "Yes" : "No");
 			// the button toggles, so label it with the action it will take
 			document.getElementById("precon_activate_button").value = obj.precondition_requested ? "Stop Preconditioning" : "Activate";
-			// remote climate prototype: hidden on single-bus boards, and
-			// disabled while a start sequence is running
+			// remote climate prototype: the device reports what the replay is
+			// doing and the last frame that looked like the car answering
+			document.getElementById("remote_climate_status").textContent =
+				obj.remote_climate_status || "Not available";
+			// hidden on single-bus boards, and disabled while it runs
 			const climateButton = document.getElementById("remote_climate_button");
 			if (climateButton) {
 				climateButton.disabled = !!obj.remote_climate_active;
