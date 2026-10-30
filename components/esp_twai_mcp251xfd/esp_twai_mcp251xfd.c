@@ -222,14 +222,26 @@ static int controller_reset(mcp251xfd_node_t *node)
 		ret = mcp251xfd_reset(dev);
 		// A controller still in Sleep mode reads as in Configuration mode
 		// and ignores RESET, so check that it's awake. That also catches
-		// erratum DS80000789 #7, a wake from Sleep mode that doesn't last.
-		// This firmware only sleeps in Low Power Mode, where it doesn't
-		// apply, but a controller keeps its power across restarts.
+		// erratum DS80000789 #7: a wake from Sleep mode by clearing OSCDIS
+		// can fail, the controller going back to sleep after waking
+		// briefly. Of its two workarounds, this does the second: two reads
+		// in a row must show it awake, and a failed attempt wakes it again.
+		// The first (a longer gap after the byte holding OSCDIS) isn't
+		// done; the retries cover it.
 		if (ret == 0) {
 			ret = mcp251xfd_reg_check_value_wtimeout(
 				dev, MCP251XFD_REG_OSC, MCP251XFD_REG_OSC_OSCRDY,
 				MCP251XFD_REG_OSC_OSCRDY | MCP251XFD_REG_OSC_OSCDIS, OSC_STAB_USEC, 1,
 				true);
+		}
+		if (ret == 0) {
+			uint32_t *reg = mcp251xfd_read_crc(dev, MCP251XFD_REG_OSC, MCP251XFD_REG_SIZE);
+
+			if (!reg || (sys_le32_to_cpu(*reg) &
+				     (MCP251XFD_REG_OSC_OSCRDY | MCP251XFD_REG_OSC_OSCDIS)) !=
+					    MCP251XFD_REG_OSC_OSCRDY) {
+				ret = -EIO;
+			}
 		}
 	}
 	if (ret == 0) {
@@ -261,14 +273,31 @@ static int controller_reset(mcp251xfd_node_t *node)
 	return ret;
 }
 
+// Set by twai_mcp251xfd_set_wake_on_bus(), read by controller_sleep()
+static volatile bool s_wake_on_bus;
+// Whether the controller sleeps able to wake on bus activity: set by a
+// controller_sleep() that armed it, cleared by the next node creation
+static volatile bool s_wake_armed;
+
 // Low Power Mode stops the controller's clock and powers most of it down (4 uA
 // typical instead of ~15 mA), losing its registers and RAM, which
 // controller_reset() rebuilds. Asserting nCS wakes it, so there is no
 // confirmation that it went to sleep. Without CiINT.WAKIE, bus activity does
 // not wake it.
+//
+// With wake on bus activity (twai_mcp251xfd_set_wake_on_bus()), it sleeps in
+// Sleep mode instead (15 uA typical), which keeps its registers: the datasheet
+// doesn't say whether INT is asserted after a wake from Low Power Mode, which
+// loses them. CiINT.WAKIE is set, so bus activity sets WAKIF, which holds INT
+// low until the next reset. The driver doesn't handle WAKIF, so INT's
+// interrupt is left disabled, as it is for Low Power Mode: its thread would
+// otherwise service INT forever. node_enable() turns it back on. In Sleep
+// mode SPI reads don't wake the controller, so it can confirm that it's
+// asleep.
 static int controller_sleep(mcp251xfd_node_t *node)
 {
 	const struct device *dev = &node->dev;
+	const bool wake = s_wake_on_bus;
 	uint32_t *reg;
 	uint8_t *reg_byte;
 
@@ -310,17 +339,32 @@ static int controller_sleep(mcp251xfd_node_t *node)
 	}
 
 	k_mutex_lock(&node->data.mutex, K_FOREVER);
+	if (ret == 0 && wake) {
+		reg = mcp251xfd_get_spi_buf_ptr(dev);
+		*reg = sys_cpu_to_le32(MCP251XFD_REG_INT_WAKIE);
+		ret = mcp251xfd_write(dev, MCP251XFD_REG_INT, MCP251XFD_REG_SIZE);
+	}
 	// LPMEN makes the Sleep mode request below enter Low Power Mode.
 	if (ret == 0) {
 		reg_byte = mcp251xfd_get_spi_buf_ptr(dev);
 		*reg_byte = FIELD_PREP(MCP251XFD_REG_OSC_CLKODIV_MASK, node->config.clko_div) |
-			    MCP251XFD_REG_OSC_LPMEN;
+			    (wake ? 0 : MCP251XFD_REG_OSC_LPMEN);
 		ret = mcp251xfd_write(dev, MCP251XFD_REG_OSC, 1);
 	}
 	if (ret == 0) {
 		reg_byte = mcp251xfd_get_spi_buf_ptr(dev);
 		*reg_byte = FIELD_PREP(MCP251XFD_REG_CON_REQOP_MASK, MCP251XFD_REG_CON_MODE_SLEEP) >> 24;
 		ret = mcp251xfd_write(dev, MCP251XFD_REG_CON_B3, 1);
+	}
+	// Armed once the requests are written. Bus activity may wake it before
+	// the check below, but it then holds INT low, which wakes the board too.
+	s_wake_armed = ret == 0 && wake;
+	// In Sleep mode OSCDIS reads as set (datasheet, CiCON note 2)
+	if (ret == 0 && wake) {
+		ret = mcp251xfd_reg_check_value_wtimeout(dev, MCP251XFD_REG_OSC,
+							 MCP251XFD_REG_OSC_OSCDIS,
+							 MCP251XFD_REG_OSC_OSCDIS, OSC_STAB_USEC, 1,
+							 true);
 	}
 	k_mutex_unlock(&node->data.mutex);
 	return ret;
@@ -577,6 +621,8 @@ esp_err_t twai_new_node_mcp251xfd(spi_host_device_t host, const twai_mcp251xfd_n
 	}
 	ESP_RETURN_ON_FALSE(!s_node->in_use, ESP_ERR_INVALID_STATE, TAG, "node already in use");
 	ESP_RETURN_ON_ERROR(s_node->init_error, TAG, "controller unavailable until restart");
+	// The reset ends a Sleep mode armed for wake on bus activity
+	s_wake_armed = false;
 	int ret = controller_reset(s_node);
 	if (ret == 0) {
 		// Keep INT disabled until node_enable() has started the controller.
@@ -595,4 +641,14 @@ esp_err_t twai_new_node_mcp251xfd(spi_host_device_t host, const twai_mcp251xfd_n
 uint32_t twai_mcp251xfd_get_rx_overflow_count(void)
 {
 	return s_node ? s_node->data.rx_overflows : 0;
+}
+
+void twai_mcp251xfd_set_wake_on_bus(bool enable)
+{
+	s_wake_on_bus = enable;
+}
+
+bool twai_mcp251xfd_wake_armed(void)
+{
+	return s_wake_armed;
 }

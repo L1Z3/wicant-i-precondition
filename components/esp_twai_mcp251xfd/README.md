@@ -81,9 +81,18 @@ In `zephyr/drivers/can/can_mcp251xfd.{c,h}`, each marked `LOCAL PATCH`:
 - **Sleep.** `twai_node_delete()` puts the controller in Low Power Mode:
   4 uA typical instead of ~15 mA, losing registers and RAM, which the next
   reset rebuilds. Any SPI access wakes it, so it waits for the driver's
-  thread to finish first; bus activity does not wake it. Unlike Sleep mode,
-  which keeps the registers, waking doesn't clear `OSCDIS`, so [erratum
-  DS80000789 #7][errata] (a wake that doesn't last) doesn't apply.
+  thread to finish first; bus activity does not wake it.
+- **Wake on bus activity.** With `twai_mcp251xfd_set_wake_on_bus(true)`,
+  `twai_node_delete()` uses Sleep mode instead (15 uA typical), which keeps
+  the registers, and sets `CiINT.WAKIE`: bus activity then sets `WAKIF`,
+  which holds INT low until the next reset. The driver doesn't handle
+  `WAKIF`, so INT's interrupt stays disabled until the node is enabled.
+  `twai_mcp251xfd_wake_armed()` says whether the controller went to sleep
+  that way. Waking it again by clearing `OSCDIS` is subject to [erratum
+  DS80000789 #7][errata] (a wake that doesn't last). The reset does the
+  erratum's second workaround: it checks twice in a row that the
+  controller is awake, and wakes it again if not. The first (a longer gap
+  after the byte holding `OSCDIS`) isn't done; the retries cover it.
 - **RX filters.** By default all standard and extended frames are accepted.
   Mask filter 0 replaces that. Upstream's filter removal also clears the next
   three filters' enable bits, so the adapter always removes every filter before
