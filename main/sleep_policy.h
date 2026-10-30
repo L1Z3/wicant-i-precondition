@@ -79,4 +79,19 @@ static inline sleep_decision_t sleep_policy_decide(uint8_t mode, bool bus_sleep,
 	return d;
 }
 
+// The 12 V battery reads above this only while the car charges it (driving,
+// charging, remote climate); a resting one stays below. Fixed, not the
+// configured sleep voltage, which can be set as low as 12.0 V.
+#define SLEEP_CHARGING_V 13.2f
+
+// Whether our own polling (AutoPID) may run. With bus sleep, its requests
+// would wake the car's network and the replies keep the buses busy, holding
+// the car and the board awake for good. So it waits for a sign that the car is
+// on by itself, which our frames can't cause: the car-on wire, or the 12 V
+// battery being charged.
+static inline bool sleep_policy_polling_allowed(bool bus_sleep, float vbatt, bool car_on_pin)
+{
+	return !bus_sleep || car_on_pin || vbatt > SLEEP_CHARGING_V;
+}
+
 #endif

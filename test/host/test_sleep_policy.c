@@ -1,6 +1,7 @@
 // sleep_policy_decide(): when sleep_mode.c wants the board asleep or awake.
 // Every combination of mode, bus sleep, battery, car-on pin, READY and bus
-// activity is checked against the rules written out below.
+// activity is checked against the rules written out below. Also
+// sleep_policy_polling_allowed(), which gates AutoPID.
 #include <stdbool.h>
 #include <stdint.h>
 #include "test_support.h"
@@ -79,6 +80,23 @@ int main(void) {
     // sleep off
     d = sleep_policy_decide(0, true, 12.4f, SLEEP_VOLT, false, false, true);
     CHECK(!d.sleep && !d.wake);
+
+    // AutoPID: free unless bus sleep, then only with the car-on wire or a
+    // battery being charged
+    static const float poll_volts[] = { 12.0f, 12.6f, SLEEP_CHARGING_V, 13.3f, 14.2f };
+    for (int bs = 0; bs < 2; bs++) {
+        for (size_t v = 0; v < sizeof(poll_volts) / sizeof(poll_volts[0]); v++) {
+            for (int pin = 0; pin < 2; pin++) {
+                bool want = !bs || pin || poll_volts[v] > SLEEP_CHARGING_V;
+                CHECK_MSG(sleep_policy_polling_allowed(bs, poll_volts[v], pin) == want,
+                          "bus_sleep %d vbatt %.1f pin %d", bs, poll_volts[v], pin);
+            }
+        }
+    }
+    // car off, battery resting: paused, even with a low sleep voltage set
+    CHECK(!sleep_policy_polling_allowed(true, 12.6f, false));
+    // charging: polls
+    CHECK(sleep_policy_polling_allowed(true, 14.3f, false));
 
     return test_report("sleep policy");
 }

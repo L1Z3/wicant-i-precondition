@@ -84,6 +84,9 @@ static uint8_t enable_sleep = 0;
 // Sleep follows the buses instead of the battery: MITM forwarding on the
 // EB-FD, whose buses can both wake it (see sleep_policy_decide())
 static bool bus_sleep = false;
+// sleep_policy_polling_allowed(), as of the last battery reading. With bus
+// sleep, false until the first one (sleep_mode_init()).
+static volatile bool polling_allowed = true;
 static QueueHandle_t voltage_queue = NULL;
 static QueueHandle_t car_on_sense_voltage_queue = NULL;
 adc_oneshot_unit_handle_t adc_handle;
@@ -456,6 +459,12 @@ static void adc_task(void *pvParameters)
                                                         bus_idle);
         sleep_wanted = decision.sleep;
         awake_wanted = decision.wake;
+        bool allowed = sleep_policy_polling_allowed(bus_sleep, battery_voltage, car_on_pin);
+        if(allowed != polling_allowed)
+        {
+            ESP_LOGI(TAG, "AutoPID polling %s", allowed ? "resumed" : "paused: the car looks off");
+            polling_allowed = allowed;
+        }
     	if(enable_sleep == 1 || enable_sleep == 2)
     	{
 			switch(sleep_state)
@@ -637,6 +646,11 @@ int8_t sleep_mode_get_voltage(float *val)
 	return -1;
 }
 
+bool sleep_mode_polling_allowed(void)
+{
+	return polling_allowed;
+}
+
 int8_t sleep_mode_get_car_on_sense_voltage(float *val)
 {
 	if(car_on_sense_voltage_queue != NULL)
@@ -666,6 +680,7 @@ int8_t sleep_mode_init(uint8_t enable, float sleep_volt)
 	// The same condition main.c locks MITM forwarding on
 	bus_sleep = (enable == 1 || enable == 2) && HW_HAS_MCP2518FD
 				&& config_server_get_fwd_en();
+	polling_allowed = !bus_sleep;
 	if(bus_sleep)
 	{
 		ESP_LOGW(TAG, "MITM: sleep follows the buses, and their traffic wakes the board");
