@@ -27,9 +27,12 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_attr.h"
+#include <stdio.h>
 #include <string.h>
 #include "esp_twai.h"
 #include "esp_twai_onchip.h"
+#include "hal/twai_hal.h"
 #include "can.h"
 #include "hw_config.h"
 #if HW_HAS_MCP2515 || HW_HAS_MCP2518FD
@@ -55,11 +58,13 @@ typedef struct {
 	twai_frame_t frame;
 	uint8_t data[TWAI_FRAME_MAX_LEN];
 	int64_t queued_us;	// when can_send() claimed the slot, for stall detection
+	int8_t wire_slot;	// our own frame's wire_tx slot to restamp when sent, or -1
 } can_tx_slot_t;
 
 typedef struct {
 	twai_message_t msg;
 	can_bus_t bus;
+	int64_t us;		// received (from the driver), for the shared-wire guard
 } can_rx_item_t;
 
 // Indexed by the CAN_5K..CAN_1000K rate codes in can.h
@@ -114,6 +119,16 @@ static portMUX_TYPE tx_slot_mux = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint32_t rx_drop_count[CAN_BUS_COUNT];
 static uint32_t rx_drop_logged[CAN_BUS_COUNT];
 static int64_t rx_drop_log_us[CAN_BUS_COUNT];
+#if HW_HAS_MCP2518FD
+// Bus 1's controller RX FIFO overflows (events, not frames), from the driver
+static uint32_t rx_overflow_logged;
+static int64_t rx_overflow_log_us;
+#endif
+// Frames bus 0's controller lost to a full RX FIFO, counted in
+// __wrap_twai_hal_read_rx_fifo() and logged like the above
+static volatile uint32_t bus0_rx_overruns;
+static uint32_t bus0_rx_overrun_logged;
+static int64_t bus0_rx_overrun_log_us;
 
 // TX frames dropped by can_send() (bus down, or no free slot within the
 // caller's timeout). Counted and logged in place--can_send() is task
@@ -137,9 +152,9 @@ static int64_t tx_drop_log_us[CAN_BUS_COUNT];
 static volatile bool bus_err_passive[CAN_BUS_COUNT];
 // Recovery only helps a bus whose peers are there but starved. With no peer
 // at all (a head unit asleep while forwarding continues), every recovery
-// stalls again, and each one costs 250 ms of downtime and a flush of the
-// shared RX queue. So each stall recovery that no acknowledged frame follows
-// doubles the bus's threshold, up to 64 s; an acknowledged frame resets it.
+// stalls again, and each one costs 250 ms of downtime. So each stall recovery
+// that no acknowledged frame follows doubles the bus's threshold, up to 64 s;
+// an acknowledged frame resets it.
 #define CAN_TX_STALL_BACKOFF_MAX 6
 static uint8_t tx_stall_backoff[CAN_BUS_COUNT];
 // A frame was acknowledged since the last stall check; set in can_on_tx_done()
@@ -156,17 +171,106 @@ static TaskHandle_t can_recovery_task_handle = NULL;
 static volatile uint32_t can_busoff_pending;	// bitmask, set from driver callbacks and the stall check
 static uint32_t can_busoff_count[CAN_BUS_COUNT];
 
+// MITM forwarding lock (can_lock_bridge). The head unit only reaches the rest
+// of the bus through us, so while it's set nothing a client does reaches the
+// buses: can_disable() refuses (an slcan close, an upload), and so do the
+// config setters, even while recovery has a bus down, so a bus always comes
+// back as it was locked. ELM327 and SavvyCAN check can_bridge_locked() and
+// leave the buses alone; slcan answers a refused change with BEL. The
+// recovery task takes buses down through can_disable_node(), and brings back
+// any that end up down. Sleep parks the buses (can_park), which also unlocks.
+static volatile bool bridge_locked;
+// Set for good by can_park(): can_enable() refuses until the restart that
+// waking is
+static volatile bool can_parked;
+#if CAN_BUS_COUNT > 1
+// Shared-wire guard for MITM forwarding. A MITM harness splits one bus in two,
+// so each frame's sender is on one side only, and neither controller receives
+// its own transmissions: no frame ever arrives on both buses. If they share a
+// wire instead, both receive every frame, and bridging would copy each one
+// back onto the wire it came from. So the same frame (ID, data) arriving on
+// both buses within WIRE_MATCH_US isn't bridged, and WIRE_LATCH_MATCHES such
+// frames within WIRE_LATCH_US turn forwarding off until restart. RTR frames
+// carry no data to tell their senders apart, so they're left out.
+// Frames we send ourselves never arrive on their own bus, so they'd loop
+// (other bus, bridge, back) without ever matching: one of them arriving on
+// the other bus isn't bridged either. That's not counted towards the latch,
+// since the far side can send the same frame: for 50 ms after we send one,
+// the head unit's all-zero 0x0C7 (stop burst) or the car's idle 0x465 (beep
+// release) isn't bridged, but they're the same as ours. As a backstop for
+// anything else that circulates (one of ours whose entry another of ours
+// overwrote; RTR frames; modified frames), arrivals in one slot faster than
+// anything repeats on a real bus also latch. That misses only several of ours
+// escaping at once into different slots while nothing else is on the wire
+// (full-rate SavvyCAN playback on a bench); any other node's frames latch it.
+// Times are when the driver received the frame, not when it's dequeued: the
+// queue fills before can_rx_task starts, and a backlog drains in a few ms.
+#define WIRE_SLOTS			64		// per bus, direct-mapped by frame hash
+#define WIRE_MATCH_US		50000	// bus 1 trails bus 0 by up to ~18 ms during flash writes
+#define WIRE_LATCH_MATCHES	3
+#define WIRE_LATCH_US		100000
+#define WIRE_LOOP_REPEATS	16		// arrivals in one slot this fast: circulating,
+#define WIRE_LOOP_US		25000	// one frame comes back about every 0.5 ms
+typedef struct {
+	int64_t us;					// last seen; 0: empty
+	int64_t run_us;				// first of the latest run of arrivals in this slot
+	uint32_t id;
+	uint8_t extd;
+	uint8_t rtr;
+	uint8_t dlc;
+	uint8_t repeats;
+	uint8_t data[TWAI_FRAME_MAX_DLC];
+} wire_frame_t;
+// Recently received frames: can_bridge_check() only, so no lock
+static wire_frame_t wire_rx[CAN_BUS_COUNT][WIRE_SLOTS];
+// When the frame can_receive() returned last was received
+static int64_t wire_rx_us;
+// Our own recently sent frames, while MITM is on: written by any can_send()
+// caller, and stamped again by can_on_tx_done() once on the wire, so a frame
+// that waited in the TX pool still counts as ours when it comes back
+static wire_frame_t wire_tx[CAN_BUS_COUNT][WIRE_SLOTS];
+static portMUX_TYPE wire_tx_mux = portMUX_INITIALIZER_UNLOCKED;
+#endif
+// Latched by can_bridge_check(); outside the #if so status can read it on
+// every build
+static volatile bool wire_shared;
+// Rate limit for the "kept on" warning, which a client can trigger per poll
+#define CAN_LOCK_LOG_US 60000000
+static int64_t lock_log_us[CAN_BUS_COUNT];
+// A locked bus that's down (it failed to come up, or a recreate failed) is
+// retried after 1 s, doubling up to 32 s
+#define CAN_LOCK_RETRY_BACKOFF_MAX 5
+static int64_t lock_retry_at_us[CAN_BUS_COUNT];
+static uint8_t lock_retry_backoff[CAN_BUS_COUNT];
+
+static void can_disable_node(can_bus_t bus);
+
 // Driver callbacks run in ISR context for the on-chip controller and in a
 // driver task for the SPI controllers, so they pick FreeRTOS APIs to match.
+//
+// On the S3 the on-chip controller's interrupt also runs while flash writes
+// have the cache off (CONFIG_TWAI_ISR_CACHE_SAFE): its FIFO holds about five
+// frames, 1.2 ms at 500 kbit/s, and a 4 KB flash write takes ~6 ms. The
+// callbacks then run from IRAM and may only touch internal RAM: no logging,
+// no constants in flash, nothing in PSRAM.
+#if CONFIG_TWAI_ISR_CACHE_SAFE
+#define CAN_ISR_ATTR IRAM_ATTR
+#else
+#define CAN_ISR_ATTR
+#endif
+// Flash auto-suspend keeps the cache on instead, and hides the option
+#if CONFIG_IDF_TARGET_ESP32S3 && !CONFIG_TWAI_ISR_CACHE_SAFE && !CONFIG_SPI_FLASH_AUTO_SUSPEND
+#error "CONFIG_TWAI_ISR_CACHE_SAFE is off; an older build.<variant>/sdkconfig? Delete it to pick up sdkconfig.defaults.esp32s3"
+#endif
 
 // Callback to receive frames from driver: drain the frame out
 // of the hardware, tag it with its bus, and hand it to can_receive() via the
 // shared queue--all protocol work happens later in task context
-static bool can_on_rx_done(twai_node_handle_t handle, const twai_rx_done_event_data_t *edata, void *user_ctx)
+static CAN_ISR_ATTR bool can_on_rx_done(twai_node_handle_t handle, const twai_rx_done_event_data_t *edata, void *user_ctx)
 {
 	(void)edata;
 	// Bus id was registered as the callback's user_ctx in can_enable()
-	can_rx_item_t item = { .bus = (can_bus_t)(uintptr_t)user_ctx };
+	can_rx_item_t item = { .bus = (can_bus_t)(uintptr_t)user_ctx, .us = esp_timer_get_time() };
 	// Point the driver's output buffer directly at the queue item's payload
 	// array, so the data lands in its final place with no second copy
 	twai_frame_t rx_frame = {
@@ -204,10 +308,29 @@ static bool can_on_rx_done(twai_node_handle_t handle, const twai_rx_done_event_d
 	return (task_woken == pdTRUE);
 }
 
+// Frames that arrive while the on-chip controller's FIFO is full are kept as
+// overrun slots without data. ESP-IDF's driver reads them with
+// twai_hal_read_rx_fifo(), which releases the slot and returns false, and
+// moves on with no callback or count. CMakeLists.txt wraps that call so each
+// one is counted here. It's a lower bound: the controller marks at most about
+// 60 per overrun. If ESP-IDF renames the function or changes its signature,
+// the build fails.
+__typeof__(twai_hal_read_rx_fifo) __real_twai_hal_read_rx_fifo, __wrap_twai_hal_read_rx_fifo;
+
+CAN_ISR_ATTR bool __wrap_twai_hal_read_rx_fifo(twai_hal_context_t *hal_ctx, twai_hal_frame_t *rx_frame)
+{
+	bool ok = __real_twai_hal_read_rx_fifo(hal_ctx, rx_frame);
+	if (!ok)
+	{
+		bus0_rx_overruns++;
+	}
+	return ok;
+}
+
 // Callback when the driver finishes (or abandons) a transmitted frame:
 // return its backing TX slot to the pool. This is the only thing that
 // replenishes the slots a can_send() may be blocked waiting on.
-static bool can_on_tx_done(twai_node_handle_t handle, const twai_tx_done_event_data_t *edata, void *user_ctx)
+static CAN_ISR_ATTR bool can_on_tx_done(twai_node_handle_t handle, const twai_tx_done_event_data_t *edata, void *user_ctx)
 {
 	(void)handle;
 	// Bus id was registered as the callback's user_ctx in can_enable()
@@ -216,6 +339,24 @@ static bool can_on_tx_done(twai_node_handle_t handle, const twai_tx_done_event_d
 	// recover the slot containing it
 	can_tx_slot_t *slot = __containerof(edata->done_tx_frame, can_tx_slot_t, frame);
 
+#if CAN_BUS_COUNT > 1
+	if (slot->wire_slot >= 0 && edata->is_tx_success)
+	{
+		// Rewritten whole: another of ours may have taken the entry since
+		wire_frame_t *f = &wire_tx[bus][slot->wire_slot];
+		portENTER_CRITICAL_SAFE(&wire_tx_mux);
+		f->us = esp_timer_get_time();
+		f->id = slot->frame.header.id;
+		f->extd = slot->frame.header.ide;
+		f->rtr = 0;
+		f->dlc = slot->frame.header.dlc;
+		for (int i = 0; i < f->dlc; i++)
+		{
+			f->data[i] = slot->data[i];
+		}
+		portEXIT_CRITICAL_SAFE(&wire_tx_mux);
+	}
+#endif
 	portENTER_CRITICAL_SAFE(&tx_slot_mux);
 	tx_slot_used[bus] &= ~BIT(slot - &tx_slot[bus][0]);
 	portEXIT_CRITICAL_SAFE(&tx_slot_mux);
@@ -240,7 +381,7 @@ static bool can_on_tx_done(twai_node_handle_t handle, const twai_tx_done_event_d
 
 // Flag a bus for can_recovery_task(). Returns whether a higher-priority task
 // was woken (ISR context only).
-static bool can_request_recovery(can_bus_t bus)
+static CAN_ISR_ATTR bool can_request_recovery(can_bus_t bus)
 {
 	__atomic_fetch_or(&can_busoff_pending, BIT(bus), __ATOMIC_SEQ_CST);
 
@@ -259,7 +400,7 @@ static bool can_request_recovery(can_bus_t bus)
 	return (task_woken == pdTRUE);
 }
 
-static bool can_on_state_change(twai_node_handle_t handle, const twai_state_change_event_data_t *edata, void *user_ctx)
+static CAN_ISR_ATTR bool can_on_state_change(twai_node_handle_t handle, const twai_state_change_event_data_t *edata, void *user_ctx)
 {
 	(void)handle;
 	can_bus_t bus = (can_bus_t)(uintptr_t)user_ctx;
@@ -312,14 +453,50 @@ static void can_check_tx_stalls(void)
 	}
 }
 
+// Brings back any bus that's down while MITM forwarding is locked (it failed
+// to come up, or a recreate failed), with backoff (CAN_LOCK_RETRY_BACKOFF_MAX).
+// Runs in the recovery task, so it never sees a recovery's own 250 ms gap.
+static void can_retry_locked_buses(void)
+{
+	int64_t now = esp_timer_get_time();
+
+	for (int bus = 0; bus < CAN_BUS_COUNT; bus++)
+	{
+		if (!bridge_locked || can_is_enabled((can_bus_t)bus))
+		{
+			lock_retry_at_us[bus] = 0;
+			lock_retry_backoff[bus] = 0;
+			continue;
+		}
+		if (lock_retry_at_us[bus] == 0)
+		{
+			lock_retry_at_us[bus] = now + (1000000LL << lock_retry_backoff[bus]);
+			continue;
+		}
+		if (now < lock_retry_at_us[bus])
+		{
+			continue;
+		}
+		ESP_LOGW(TAG, "bus %d: down with MITM forwarding locked, bringing it up", bus);
+		can_enable((can_bus_t)bus);
+		lock_retry_at_us[bus] = 0;
+		if (!can_is_enabled((can_bus_t)bus) && lock_retry_backoff[bus] < CAN_LOCK_RETRY_BACKOFF_MAX)
+		{
+			lock_retry_backoff[bus]++;
+		}
+	}
+}
+
 static void can_recovery_task(void *arg)
 {
 	(void)arg;
 	while (1)
 	{
-		// Woken for bus-off, and periodically to look for TX stalls
+		// Woken for bus-off, and periodically to look for TX stalls and for
+		// locked buses that are down
 		ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(CAN_TX_STALL_CHECK_MS));
 		can_check_tx_stalls();
+		can_retry_locked_buses();
 
 		// Tear down first so can_send() fails fast (bus enable bit cleared)
 		// instead of burning its full timeout per frame against a dead node.
@@ -343,7 +520,7 @@ static void can_recovery_task(void *arg)
 			can_busoff_count[bus]++;
 			ESP_LOGW(TAG, "bus %d: failure #%lu, recreating node (%lu TX dropped so far)",
 					 bus, can_busoff_count[bus], tx_drop_count[bus]);
-			can_disable((can_bus_t)bus);
+			can_disable_node((can_bus_t)bus);
 		}
 
 		if (pending == 0)
@@ -647,9 +824,10 @@ void can_enable(can_bus_t bus)
 	// can_send()/can_disable() touching the node handle.
 	xSemaphoreTake(node_lock[bus], portMAX_DELAY);
 
-	if (can_cfg[bus].bus_state == ON_BUS)
+	// Bus is already on, or parked for sleep (checked under node_lock, so a
+	// retry or recovery enable racing can_park() can't win)
+	if (can_cfg[bus].bus_state == ON_BUS || can_parked)
 	{
-		// Bus is already on
 		xSemaphoreGive(node_lock[bus]);
 		return;
 	}
@@ -690,6 +868,16 @@ void can_enable(can_bus_t bus)
 	if (err == ESP_OK)
 	{
 		can_tx_slots_reset(bus);	// fresh node: all slots are free
+		// With every bus off, can_receive() has stopped draining the shared
+		// RX queue, so what's left in it is old: drop it. With another bus
+		// on, its frames keep flowing and must not be dropped. Before the
+		// enable, so this bus's own first frames survive. The other bus's
+		// bit is read without its lock: a race only drops a few frames as
+		// the old unconditional flush did, or keeps a few ms-old ones.
+		if (!(xEventGroupGetBits(s_can_event_group) & CAN_ENABLE_BIT_ANY))
+		{
+			xQueueReset(can_rx_queue);
+		}
 		can_transceiver_standby(bus, false);
 		err = twai_node_enable(can_node[bus]);
 	}
@@ -706,12 +894,6 @@ void can_enable(can_bus_t bus)
 		return;
 	}
 
-	// Clear the queue on enable. The queue is shared, so this also drops
-	// any pending frames of the other bus. This can happen at boot, or at
-	// runtime during bus recovery. In-flight frames on the other bus will be
-	// lost. TODO(ejones): maybe eventually we can split into one rx queue per bus?
-	xQueueReset(can_rx_queue);
-
 	can_cfg[bus].bus_state = ON_BUS;
 	// Publish "bus up" last: unparks can_receive(), opens can_send()'s gate
 	xEventGroupSetBits(s_can_event_group, CAN_ENABLE_BIT(bus));
@@ -719,9 +901,9 @@ void can_enable(can_bus_t bus)
 	xSemaphoreGive(node_lock[bus]);
 }
 
-// Tear a bus down: stops the interrupt sources (no callbacks after this), then
-// delete frees the node.
-void can_disable(can_bus_t bus)
+// Tear a bus down: stops the interrupt sources, then delete frees the node (no
+// callbacks after this).
+static void can_disable_node(can_bus_t bus)
 {
 	if (bus >= CAN_BUS_COUNT || s_can_event_group == NULL)
 	{
@@ -752,13 +934,95 @@ void can_disable(can_bus_t bus)
 	xSemaphoreGive(node_lock[bus]);
 }
 
+void can_disable(can_bus_t bus)
+{
+	if (bridge_locked && bus < CAN_BUS_COUNT)
+	{
+		int64_t now = esp_timer_get_time();
+		if (lock_log_us[bus] == 0 || now - lock_log_us[bus] >= CAN_LOCK_LOG_US)
+		{
+			lock_log_us[bus] = now;
+			ESP_LOGW(TAG, "bus %d: kept on, MITM forwarding is locked", bus);
+		}
+		return;
+	}
+	can_disable_node(bus);
+}
+
+void can_park(void)
+{
+	if (!can_parked)
+	{
+		ESP_LOGI(TAG, "buses parked for sleep");
+	}
+	// Before taking the buses down, so a retry or recovery re-enable
+	// already in progress can't bring one back
+	can_parked = true;
+	bridge_locked = false;
+	for (int bus = 0; bus < CAN_BUS_COUNT; bus++)
+	{
+		can_disable_node((can_bus_t)bus);
+	}
+}
+
+void can_lock_bridge(void)
+{
+	// Set first, so nothing reconfigures a bus between here and its enable
+	bridge_locked = true;
+	ESP_LOGI(TAG, "MITM forwarding locked");
+
+	for (int bus = 0; bus < CAN_BUS_COUNT; bus++)
+	{
+		// Forwarding needs normal mode, every frame and retransmission.
+		// Modes and filters are creation-time: recreate the node if needed.
+		// The settings go in before the node comes down, so a recovery
+		// re-enable in between brings it back with them.
+		bool recreate = can_cfg[bus].silent || can_cfg[bus].loopback || !can_cfg[bus].auto_tx
+						|| can_cfg[bus].filter != 0 || can_cfg[bus].mask != 0xFFFFFFFF;
+		if (can_cfg[bus].silent)
+		{
+			ESP_LOGI(TAG, "bus %d: configured listen-only, but MITM forwarding needs normal mode", bus);
+		}
+		can_cfg[bus].silent = 0;
+		can_cfg[bus].loopback = 0;
+		can_cfg[bus].auto_tx = 1;
+		can_cfg[bus].filter = 0;
+		can_cfg[bus].mask = 0xFFFFFFFF;
+		if (recreate)
+		{
+			can_disable_node((can_bus_t)bus);
+		}
+		can_enable((can_bus_t)bus);
+		if (!can_is_enabled((can_bus_t)bus))
+		{
+			ESP_LOGE(TAG, "bus %d: down with MITM forwarding locked, will retry", bus);
+		}
+	}
+#if CAN_BUS_COUNT > 1
+	if (can_cfg[CAN_BUS_0].rate != can_cfg[CAN_BUS_1].rate)
+	{
+		ESP_LOGW(TAG, "MITM: bus 0 and bus 1 bitrates differ; check the CAN settings");
+	}
+#endif
+}
+
+bool can_bridge_locked(void)
+{
+	return bridge_locked;
+}
+
 // Config setters. As in the legacy driver, they are no-ops while the bus is
 // ON: values are latched into the node at the next can_enable(). Callers
-// that reconfigure at runtime (slcan/gvret/elm327) always disable first.
+// that reconfigure at runtime (slcan/gvret/elm327) disable first. While MITM
+// forwarding is locked they're no-ops whether the bus is on or not.
+static bool can_cfg_frozen(can_bus_t bus)
+{
+	return bus >= CAN_BUS_COUNT || bridge_locked || can_cfg[bus].bus_state == ON_BUS;
+}
 
 void can_set_silent(can_bus_t bus, uint8_t flag)
 {
-	if (bus >= CAN_BUS_COUNT || can_cfg[bus].bus_state == ON_BUS)
+	if (can_cfg_frozen(bus))
 	{
 		return;
 	}
@@ -767,7 +1031,7 @@ void can_set_silent(can_bus_t bus, uint8_t flag)
 
 void can_set_loopback(can_bus_t bus, uint8_t flag)
 {
-	if (bus >= CAN_BUS_COUNT || can_cfg[bus].bus_state == ON_BUS)
+	if (can_cfg_frozen(bus))
 	{
 		return;
 	}
@@ -785,7 +1049,7 @@ uint8_t can_is_silent(can_bus_t bus)
 
 void can_set_auto_retransmit(can_bus_t bus, uint8_t flag)
 {
-	if (bus >= CAN_BUS_COUNT || can_cfg[bus].bus_state == ON_BUS)
+	if (can_cfg_frozen(bus))
 	{
 		return;
 	}
@@ -807,7 +1071,7 @@ void can_set_auto_retransmit(can_bus_t bus, uint8_t flag)
 
 void can_set_filter(can_bus_t bus, uint32_t f)
 {
-	if (bus >= CAN_BUS_COUNT || can_cfg[bus].bus_state == ON_BUS)
+	if (can_cfg_frozen(bus))
 	{
 		return;
 	}
@@ -816,7 +1080,7 @@ void can_set_filter(can_bus_t bus, uint32_t f)
 
 void can_set_mask(can_bus_t bus, uint32_t m)
 {
-	if (bus >= CAN_BUS_COUNT || can_cfg[bus].bus_state == ON_BUS)
+	if (can_cfg_frozen(bus))
 	{
 		return;
 	}
@@ -825,7 +1089,7 @@ void can_set_mask(can_bus_t bus, uint32_t m)
 
 void can_set_bitrate(can_bus_t bus, uint8_t rate)
 {
-	if (bus >= CAN_BUS_COUNT || can_cfg[bus].bus_state == ON_BUS)
+	if (can_cfg_frozen(bus))
 	{
 		return;
 	}
@@ -906,6 +1170,32 @@ esp_err_t can_receive(twai_message_t *message, can_bus_t *bus, TickType_t ticks_
 			}
 		}
 	}
+#if HW_HAS_MCP2518FD
+	uint32_t overflows = twai_mcp251xfd_get_rx_overflow_count();
+	if (overflows != rx_overflow_logged)
+	{
+		int64_t now = esp_timer_get_time();
+		if (now - rx_overflow_log_us > 1000000)
+		{
+			rx_overflow_log_us = now;
+			rx_overflow_logged = overflows;
+			ESP_LOGW(TAG, "bus %d: controller RX FIFO overflowed (frames lost), %lu events total",
+					 CAN_BUS_1, overflows);
+		}
+	}
+#endif
+	uint32_t overruns = bus0_rx_overruns;
+	if (overruns != bus0_rx_overrun_logged)
+	{
+		int64_t now = esp_timer_get_time();
+		if (now - bus0_rx_overrun_log_us > 1000000)
+		{
+			bus0_rx_overrun_log_us = now;
+			bus0_rx_overrun_logged = overruns;
+			ESP_LOGW(TAG, "bus %d: controller RX FIFO overflowed, %lu frames lost total",
+					 CAN_BUS_0, overruns);
+		}
+	}
 
 	// The caller's timeout applies to the actual wait-for-data
 	can_rx_item_t item;
@@ -914,6 +1204,9 @@ esp_err_t can_receive(twai_message_t *message, can_bus_t *bus, TickType_t ticks_
 		return ESP_ERR_TIMEOUT;
 	}
 
+#if CAN_BUS_COUNT > 1
+	wire_rx_us = item.us;
+#endif
 	*message = item.msg;
 	if (bus != NULL)	// bus tag is optional
 	{
@@ -922,10 +1215,148 @@ esp_err_t can_receive(twai_message_t *message, can_bus_t *bus, TickType_t ticks_
 	return ESP_OK;
 }
 
+#if CAN_BUS_COUNT > 1
+static uint32_t wire_slot(const twai_message_t *msg, uint8_t dlc)
+{
+	// FNV-1a over the ID and data
+	uint32_t h = 2166136261u ^ (msg->identifier | ((uint32_t)msg->extd << 31)
+								| ((uint32_t)msg->rtr << 30));
+	h *= 16777619u;
+	for (int i = 0; i < dlc; i++)
+	{
+		h = (h ^ msg->data[i]) * 16777619u;
+	}
+	return (h ^ (h >> 16)) % WIRE_SLOTS;
+}
+
+static bool wire_match(const wire_frame_t *f, const twai_message_t *msg, uint8_t dlc, int64_t now)
+{
+	return f->us != 0 && now - f->us <= WIRE_MATCH_US
+		&& f->id == msg->identifier && f->extd == msg->extd && f->rtr == msg->rtr && f->dlc == dlc
+		&& memcmp(f->data, msg->data, dlc) == 0;
+}
+
+static void wire_store(wire_frame_t *f, const twai_message_t *msg, uint8_t dlc, int64_t now)
+{
+	f->us = now;
+	f->id = msg->identifier;
+	f->extd = msg->extd;
+	f->rtr = msg->rtr;
+	f->dlc = dlc;
+	memcpy(f->data, msg->data, dlc);
+}
+#endif
+
+#if CAN_BUS_COUNT > 1
+static void wire_latch(const twai_message_t *msg, uint8_t dlc, can_bus_t rx_bus, const char *why)
+{
+	wire_shared = true;
+	char hex[3 * TWAI_FRAME_MAX_DLC + 1] = "";
+	for (int i = 0; i < dlc && !msg->rtr; i++)
+	{
+		snprintf(hex + 3 * i, sizeof(hex) - 3 * i, " %02x", msg->data[i]);
+	}
+	ESP_LOGE(TAG, "ID 0x%03lx%s%s on bus %d %s: bus 0 and bus 1 share a wire, so MITM forwarding "
+			 "is off until restart. Check the harness, or set the forwarding mode to parallel",
+			 (unsigned long)msg->identifier, msg->rtr ? " RTR" : "", hex, rx_bus, why);
+}
+#endif
+
+bool can_bridge_check(const twai_message_t *msg, can_bus_t rx_bus)
+{
+#if CAN_BUS_COUNT > 1
+	if (wire_shared || rx_bus >= CAN_BUS_COUNT)
+	{
+		return false;
+	}
+	uint8_t dlc = (msg->data_length_code > TWAI_FRAME_MAX_DLC)
+					  ? TWAI_FRAME_MAX_DLC : msg->data_length_code;
+	if (msg->rtr)
+	{
+		dlc = 0;	// no data to compare
+	}
+	can_bus_t other = (rx_bus == CAN_BUS_0) ? CAN_BUS_1 : CAN_BUS_0;
+	uint32_t slot = wire_slot(msg, dlc);
+	int64_t now = wire_rx_us;
+
+	// Counted per slot, not per frame: frames looping together that share a
+	// slot would otherwise keep restarting each other's run
+	wire_frame_t *own = &wire_rx[rx_bus][slot];
+	if (own->us != 0 && now - own->run_us <= WIRE_LOOP_US)
+	{
+		if (own->repeats < UINT8_MAX)
+		{
+			own->repeats++;
+		}
+	}
+	else
+	{
+		own->run_us = now;
+		own->repeats = 1;
+	}
+	wire_store(own, msg, dlc, now);
+	if (own->repeats >= WIRE_LOOP_REPEATS)
+	{
+		wire_latch(msg, dlc, rx_bus, "keeps coming back");
+		return false;
+	}
+	if (msg->rtr)
+	{
+		return true;
+	}
+
+	portENTER_CRITICAL(&wire_tx_mux);
+	bool ours = wire_match(&wire_tx[other][slot], msg, dlc, now);
+	portEXIT_CRITICAL(&wire_tx_mux);
+	if (ours)
+	{
+		return false;
+	}
+	if (!wire_match(&wire_rx[other][slot], msg, dlc, now))
+	{
+		return true;
+	}
+
+	static int64_t first_us;
+	static int matches;
+	if (matches == 0 || now - first_us > WIRE_LATCH_US)
+	{
+		first_us = now;
+		matches = 0;
+	}
+	if (++matches >= WIRE_LATCH_MATCHES)
+	{
+		wire_latch(msg, dlc, rx_bus, "was received on both");
+	}
+	return false;
+#else
+	(void)msg;
+	(void)rx_bus;
+	return false;
+#endif
+}
+
+bool can_bridge_shared_wire(void)
+{
+	return wire_shared;
+}
+
+static esp_err_t can_send_frame(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_wait, bool ours);
+
 // Queue a frame for transmission. Fire-and-forget: the message is copied
 // into a pool slot the driver transmits from later, so ticks_to_wait is
 // spent waiting for a free slot--not for the frame to reach the wire.
 esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_wait)
+{
+	return can_send_frame(bus, message, ticks_to_wait, true);
+}
+
+esp_err_t can_bridge_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_wait)
+{
+	return can_send_frame(bus, message, ticks_to_wait, false);
+}
+
+static esp_err_t can_send_frame(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_wait, bool ours)
 {
 	if (bus >= CAN_BUS_COUNT || s_can_event_group == NULL)
 	{
@@ -1017,6 +1448,19 @@ esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_w
 	memcpy(slot->data, message->data, dlc);
 	slot->frame.buffer = slot->data;
 	slot->frame.buffer_len = message->rtr ? 0 : dlc;
+	slot->wire_slot = -1;
+#if CAN_BUS_COUNT > 1
+	if (ours && bridge_locked && !wire_shared && !message->rtr)
+	{
+		uint32_t wslot = wire_slot(message, dlc);
+		slot->wire_slot = (int8_t)wslot;
+		portENTER_CRITICAL(&wire_tx_mux);
+		wire_store(&wire_tx[bus][wslot], message, dlc, now);
+		portEXIT_CRITICAL(&wire_tx_mux);
+	}
+#else
+	(void)ours;
+#endif
 
 	// Timeout 0: the slot semaphore already did the waiting (queue space is
 	// guaranteed), and staying non-blocking keeps the node_lock hold short
@@ -1057,14 +1501,4 @@ bool can_any_enabled(void)
 		return false;
 	}
 	return (xEventGroupGetBits(s_can_event_group) & CAN_ENABLE_BIT_ANY) != 0;
-}
-
-// Drops pending frames from ALL buses (the queue is shared); fine for its
-// one caller (elm327 clearing stale frames before a request on bus 0)
-void can_flush_rx(void)
-{
-	if (can_rx_queue != NULL)
-	{
-		xQueueReset(can_rx_queue);
-	}
 }

@@ -1,7 +1,11 @@
 // TWAI node adapter for the vendored Zephyr MCP251xFD driver (see README.md).
 // The driver source is compiled into this file so its static functions can be
 // instantiated directly, without Zephyr's devicetree.
+#pragma GCC diagnostic push
+// The driver casts its thread function to Zephyr's three-argument entry type.
+#pragma GCC diagnostic ignored "-Wcast-function-type"
 #include "zephyr/drivers/can/can_mcp251xfd.c"
+#pragma GCC diagnostic pop
 
 #include <string.h>
 #include "esp_check.h"
@@ -276,11 +280,16 @@ static int controller_sleep(mcp251xfd_node_t *node)
 }
 
 // Releases the node for the next twai_new_node_mcp251xfd(), which resets the
-// controller, and puts the controller to sleep until then.
+// controller, and puts the controller to sleep until then. No callback runs
+// once it returns: the driver delivers them all under its mutex.
 static esp_err_t node_delete(twai_node_handle_t handle)
 {
 	mcp251xfd_node_t *node = node_of(handle);
 
+	// Held until the callbacks are gone, so the driver's thread can't act on
+	// a controller still started meanwhile (switch it back to Normal mode,
+	// report a state).
+	k_mutex_lock(&node->data.mutex, K_FOREVER);
 	// can_stop() failed partway (an SPI failure or a mode-change timeout) and
 	// left the driver started, possibly with the controller still on the bus.
 	// Reset it so it can go to sleep, and release the node anyway.
@@ -294,12 +303,16 @@ static esp_err_t node_delete(twai_node_handle_t handle)
 		node->data.common.started = false;
 	}
 	node->callbacks = (twai_event_callbacks_t){};
-	node->in_use = false;
+	k_mutex_unlock(&node->data.mutex);
 	int ret = controller_sleep(node);
 	if (ret < 0) {
 		// The node is still released; the next creation resets the controller.
 		ESP_LOGW(TAG, "controller sleep failed: %d", ret);
 	}
+	// Released only now, so a creation can't set the controller up and have
+	// it put to sleep here. Create and delete aren't otherwise safe against
+	// each other: callers serialize them (can.c's node_lock).
+	node->in_use = false;
 	return ESP_OK;
 }
 
@@ -327,8 +340,10 @@ static esp_err_t register_cbs(twai_node_handle_t handle, const twai_event_callba
 	if (node->data.common.started) {
 		return ESP_ERR_INVALID_STATE;
 	}
+	k_mutex_lock(&node->data.mutex, K_FOREVER);
 	node->callbacks = *cbs;
 	node->user_data = user_data;
+	k_mutex_unlock(&node->data.mutex);
 	return ESP_OK;
 }
 
@@ -418,7 +433,9 @@ static esp_err_t create(spi_host_device_t host, const twai_mcp251xfd_node_config
 	};
 	esp_err_t err = spi_bus_add_device(host, &spi_config, &node->spi);
 	// The bus is dedicated to this controller: reserve it once instead of
-	// arbitrating on every short transfer.
+	// arbitrating on every short transfer. This also holds the bus's power-
+	// management lock for good, which spi_transfer_ll() relies on (see
+	// compat/zephyr/drivers/spi.h).
 	if (err == ESP_OK) {
 		err = spi_device_acquire_bus(node->spi, portMAX_DELAY);
 		if (err != ESP_OK) {
@@ -521,4 +538,9 @@ esp_err_t twai_new_node_mcp251xfd(spi_host_device_t host, const twai_mcp251xfd_n
 	s_node->in_use = true;
 	*node_ret = &s_node->base;
 	return ESP_OK;
+}
+
+uint32_t twai_mcp251xfd_get_rx_overflow_count(void)
+{
+	return s_node ? s_node->data.rx_overflows : 0;
 }

@@ -559,10 +559,9 @@ static void adc_task(void *pvParameters)
 				ESP_LOGW(TAG, "sleeping");
                                 // todo (trh): add config option to leave
                                 // can busses up in sleep.
-				for(int bus = 0; bus < CAN_BUS_COUNT; bus++)
-				{
-					can_disable(bus);
-				}
+				// Sleep is the one thing allowed to take MITM forwarding
+				// down; waking is a restart, which locks it again
+				can_park();
 				wifi_network_deinit();
 				ble_disable();
 				esp_sleep_enable_timer_wakeup(2*1000000);

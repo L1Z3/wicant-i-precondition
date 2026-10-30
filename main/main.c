@@ -354,7 +354,10 @@ static void can_rx_task(void *pvParameters)
                 bool fwd_wanted;
                 TickType_t fwd_wait;
                 static int64_t fwd_fastdrop_until_us[CAN_BUS_COUNT];
-                if (fwd_bridge_en)
+                // The guard keeps a frame off the bridge if the buses turn
+                // out to share a wire, or if it's one of our own coming back
+                const bool bridged = fwd_bridge_en && can_bridge_check(&rx_msg, rx_bus);
+                if (bridged)
                 {
                     // MITM bridge: forward all traffic to the other bus, with
 					// adaptive backpressure. This task gets preempted, then
@@ -372,18 +375,21 @@ static void can_rx_task(void *pvParameters)
                 }
                 else
                 {
-                    // Parallel mode (and single-bus builds): no bridging; inject
-                    // a modified duplicate alongside the original, on the bus it
-                    // arrived on. precondition_fwd_hook only modifies
-                    // CAR_BUS-bound frames, so bus 1 traffic is left alone.
+                    // Parallel mode, single-bus builds and frames the guard keeps
+                    // off the bridge: no bridging; inject a modified duplicate
+                    // alongside the original, on the bus it arrived on.
+                    // precondition_fwd_hook only modifies CAR_BUS-bound frames,
+                    // so bus 1 traffic is left alone.
                     fwd_bus = rx_bus;
                     fwd_result = precondition_fwd_hook(&fwd_msg, fwd_bus);
                     fwd_wanted = (fwd_result == FWD_MODIFIED);
                     fwd_wait = 1;
                 }
-                if (fwd_wanted && can_send(fwd_bus, &fwd_msg, fwd_wait) != ESP_OK)
+                if (fwd_wanted
+                    && (bridged ? can_bridge_send(fwd_bus, &fwd_msg, fwd_wait)
+                                : can_send(fwd_bus, &fwd_msg, fwd_wait)) != ESP_OK)
                 {
-                    if (fwd_bridge_en && fwd_wait != 0)
+                    if (bridged && fwd_wait != 0)
                     {
                         fwd_fastdrop_until_us[fwd_bus] = esp_timer_get_time() + 100000;
                     }
@@ -597,6 +603,13 @@ void app_main(void)
 	if(config_server_get_can1_en())
 	{
 		can_enable(CAN_BUS_1);
+	}
+
+	// MITM: the head unit reaches the rest of the bus only through us, so
+	// both buses come up now, before any protocol is set up, and stay up
+	if(config_server_get_fwd_en())
+	{
+		can_lock_bridge();
 	}
 #endif
 

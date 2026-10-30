@@ -176,6 +176,7 @@ static int mcp251xfd_fifo_write(const struct device *dev, int mailbox_idx,
 	}
 
 	/* check if fifo is full */
+	// LOCAL PATCH: the TX FIFO's not-full flag rather than TXQNIF.
 	if (!(regs[0] & MCP251XFD_REG_FIFOSTA_TFNRFNIF)) {
 		return -ENOMEM;
 	}
@@ -196,6 +197,7 @@ static int mcp251xfd_fifo_write(const struct device *dev, int mailbox_idx,
 	}
 
 	reg_byte = mcp251xfd_get_spi_buf_ptr(dev);
+	// LOCAL PATCH: TX FIFO instead of TXQ (see MCP251XFD_TX_FIFO_IDX).
 	*reg_byte = MCP251XFD_UINT32_FLAG_TO_BYTE_MASK(MCP251XFD_REG_FIFOCON_UINC |
 						       MCP251XFD_REG_FIFOCON_TXREQ);
 
@@ -764,6 +766,23 @@ static int mcp251xfd_handle_fifo_read(const struct device *dev, const struct mcp
 	fifosta = sys_le32_to_cpu(regs[0]);
 	ua = sys_le32_to_cpu(regs[1]);
 
+	// LOCAL PATCH: count RX FIFO overflows. Upstream only enables and handles
+	// RXOVIF with CONFIG_CAN_STATS, so a full FIFO dropped frames unnoticed.
+	// No interrupt is needed: a full FIFO keeps RXIF set, so this runs. The
+	// write reuses the SPI buffer that regs points into, so it comes after
+	// fifosta and ua are copied out. A failed clear leaves the flag for the
+	// next pass and doesn't change what this returns.
+	if (fifo_type == MCP251XFD_FIFO_TYPE_RX && (fifosta & MCP251XFD_REG_FIFOSTA_RXOVIF)) {
+		reg_byte = mcp251xfd_get_spi_buf_ptr(dev);
+		*reg_byte = 0;
+		if (mcp251xfd_write(dev, MCP251XFD_REG_FIFOCON_TO_STA(fifo->reg_fifocon_addr),
+				    1) < 0) {
+			LOG_ERR("Failed to clear RXOVIF");
+		} else {
+			dev_data->rx_overflows++;
+		}
+	}
+
 	/* is there any data in the fifo? */
 	if (!(fifosta & MCP251XFD_REG_FIFOSTA_TFNRFNIF)) {
 		goto done;
@@ -775,7 +794,7 @@ static int mcp251xfd_handle_fifo_read(const struct device *dev, const struct mcp
 	// LOCAL PATCH: MCP2518FD erratum DS80000789 #6. A read of FIFOSTA.FIFOCI
 	// for an RX FIFO can return a wrong value with a matching CRC.
 	// Workaround: don't use FIFOCI: read RX one message at a time from
-	// FIFOSTA/UA, like TEF. (The interrupt loop calls back while RXIF remains set.) 
+	// FIFOSTA/UA, like TEF. (The interrupt loop calls back while RXIF remains set.)
 	// Errata:
 	// https://ww1.microchip.com/downloads/aemDocuments/documents/APID/ProductDocuments/Errata/MCP2518FD-Silicon-Errata-and-Data-Sheet-Clarification-DS80000789.pdf
 	if (fifo_type == MCP251XFD_FIFO_TYPE_RX || fifo_type == MCP251XFD_FIFO_TYPE_TEF) {
@@ -826,6 +845,9 @@ static int mcp251xfd_handle_fifo_read(const struct device *dev, const struct mcp
 			goto done;
 		}
 	}
+	// LOCAL PATCH: 1 when an object was read and released, so the interrupt
+	// loop can tell that from an empty FIFO (0).
+	ret = ui_inc > 0;
 
 done:
 	k_mutex_unlock(&dev_data->mutex);
@@ -1035,6 +1057,7 @@ static void mcp251xfd_handle_interrupts(const struct device *dev)
 	bool state_pending = false;
 
 	while (1) {
+		// LOCAL PATCH: whether this pass read an RX or TEF object (see below).
 		bool progress = false;
 
 		k_mutex_lock(&dev_data->mutex, K_FOREVER);
@@ -1055,7 +1078,13 @@ static void mcp251xfd_handle_interrupts(const struct device *dev)
 		/* these interrupt flags need to be explicitly cleared */
 		if (reg_int & MCP251XFD_REG_INT_IF_CLEARABLE_MASK) {
 
-			*reg_int_hw &= ~MCP251XFD_REG_INT_IF_CLEARABLE_MASK;
+			// LOCAL PATCH: clear only the flags read above. The clearable
+			// flags are cleared by writing 0, and a 1 leaves every bit here
+			// unchanged, so write 1 everywhere else. Upstream wrote
+			// 0 to every clearable flag, also clearing any set since the read,
+			// which this pass never handles (a CERRIF while the state is
+			// error-active, say). Linux does the same.
+			*reg_int_hw = (uint16_t)~(reg_int & MCP251XFD_REG_INT_IF_CLEARABLE_MASK);
 
 			*reg_int_hw = sys_cpu_to_le16(*reg_int_hw);
 
@@ -1072,7 +1101,8 @@ static void mcp251xfd_handle_interrupts(const struct device *dev)
 							 MCP251XFD_FIFO_TYPE_RX);
 			if (ret < 0) {
 				LOG_ERR("Error handling RXIF [%d]", ret);
-			} else {
+			} else if (ret > 0) {
+				// LOCAL PATCH: an object was read.
 				progress = true;
 			}
 		}
@@ -1082,7 +1112,8 @@ static void mcp251xfd_handle_interrupts(const struct device *dev)
 							 MCP251XFD_FIFO_TYPE_TEF);
 			if (ret < 0) {
 				LOG_ERR("Error handling TEFIF [%d]", ret);
-			} else {
+			} else if (ret > 0) {
+				// LOCAL PATCH: an object was read.
 				progress = true;
 			}
 		}
@@ -1106,6 +1137,7 @@ static void mcp251xfd_handle_interrupts(const struct device *dev)
 		 * On the MCP2527FD and MCP2518FD, we don't get a CERRIF IRQ on the transition
 		 * TX ERROR_WARNING -> TX ERROR_ACTIVE.
 		 */
+		// LOCAL PATCH: also retry a failed state read (state_pending).
 		if ((reg_int & MCP251XFD_REG_INT_CERRIF) ||
 		    dev_data->state > CAN_STATE_ERROR_ACTIVE || state_pending) {
 			ret = mcp251xfd_handle_cerrif(dev);
@@ -1131,7 +1163,8 @@ static void mcp251xfd_handle_interrupts(const struct device *dev)
 
 check_int_pin:
 		/* Break from loop if INT pin is inactive */
-		// LOCAL PATCH: count only passes that moved no RX or TEF object.
+		// LOCAL PATCH: count only passes that moved no RX or TEF object
+		// (handle_fifo_read() returned 1 for neither).
 		// Upstream counts every pass, and with one object per pass (erratum
 		// #6 above) any burst of ten frames paused servicing.
 		consecutive_calls = progress ? 0 : consecutive_calls + 1;
@@ -1146,6 +1179,9 @@ check_int_pin:
 			/* All interrupt flags handled */
 			break;
 		} else if (consecutive_calls >= MCP251XFD_MAX_INT_HANDLER_CALLS) {
+			// LOCAL PATCH: progress resets consecutive_calls, so compare
+			// and reset here instead of upstream's
+			// consecutive_calls % MCP251XFD_MAX_INT_HANDLER_CALLS == 0.
 			consecutive_calls = 0;
 			/* If there are clock problems, then MODIF cannot be cleared. */
 			/* This is detected if there are too many consecutive calls. */
@@ -1514,8 +1550,10 @@ static int mcp251xfd_init_tscon(const struct device *dev)
 static int mcp251xfd_reset(const struct device *dev)
 {
 	const struct mcp251xfd_config *dev_cfg = dev->config;
-	uint16_t cmd = sys_cpu_to_be16(MCP251XFD_SPI_INSTRUCTION_RESET);
-	const struct spi_buf tx_buf = {.buf = &cmd, .len = sizeof(cmd),};
+	// LOCAL PATCH: padded to a word. The SPI transfer copies its buffer in
+	// 4-byte words, so a lone uint16_t would be over-read by 2 bytes.
+	uint16_t cmd[2] = {sys_cpu_to_be16(MCP251XFD_SPI_INSTRUCTION_RESET)};
+	const struct spi_buf tx_buf = {.buf = cmd, .len = sizeof(cmd[0]),};
 	const struct spi_buf_set tx = {.buffers = &tx_buf, .count = 1};
 	int ret;
 
@@ -1587,6 +1625,8 @@ static int mcp251xfd_init(const struct device *dev)
 		return -EINVAL;
 	}
 
+	// LOCAL PATCH: upstream enabled INT's interrupt here; it is now enabled at
+	// the end of mcp251xfd_init(), once the controller is set up.
 	k_thread_create(&dev_data->int_thread, dev_data->int_thread_stack,
 			CONFIG_CAN_MCP251XFD_INT_THREAD_STACK_SIZE,
 			(k_thread_entry_t)mcp251xfd_int_thread, (void *)dev, NULL, NULL,

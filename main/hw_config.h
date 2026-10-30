@@ -45,9 +45,6 @@
 
 #define TX_GPIO_NUM                 2
 #define RX_GPIO_NUM                 1
-// As per Ali, the transceiver standby mode (i.e. RS mode-select pin (pin 8))
-// doesn't work on proto. 
-// As such, CAN_STDBY_GPIO_NUM is not defined here.
 
 // Indicates whether the hardware has a second voltage divider
 // to read a second (hot-when-car-on) power pin.
@@ -91,10 +88,17 @@
 
 #else
 
-// STDBY_1 -> U2 RS and STDBY_2 -> U4 STB each have a 10 kOhm pull-up.
+// STDBY_1 -> U2 RS and STDBY_2 -> U4 STB each have a 10 kOhm pull-up
+// (pins and polarity checked on the bench).
 // Drive low for normal operation, high for standby.
 #define CAN_STDBY_GPIO_NUM          11
 #define MCP2518FD_STDBY_GPIO_NUM    12
+
+// OBD-II pins, on the WiCAN's own plug: bus 0 is 6 (H)/14 (L) and connects to 
+// the rest of the M-CAN; bus 1 is 12 (H)/13 (L) connects only to the head unit. 
+// The harness socket it plugs into is numbered as a mirror image (harness pin 1 
+// mates with WiCAN pin 8, 9 with 16), so the harness calls these 3/11 and 13/12.
+//  See README.md.
 
 // -- Bus 1: MCP2518FD U57 (SPI2) -> TCAN3413 U4 -- //
 // MCP2518FD resets over SPI; GPIO 8 is unused.

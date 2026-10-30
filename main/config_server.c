@@ -113,6 +113,19 @@ static char can_datarate_str[11][7] = {
 								"1000K",
 };
 
+// Boards that can sense the car's ignition (EB-FD and proto) default to
+// car-off sleep; the others keep meatPi's default. This reaches any board that
+// falls back to the defaults (missing, unreadable or invalid config.json). On
+// the bench, a board fed below sleep_volt with nothing on the car-on pin sleeps
+// after sleep_time (2 min by default) and takes Wi-Fi, BLE and CAN forwarding
+// with it: raise the supply above sleep_volt or put the car-on pin above
+// CAR_ON_THRESHOLD_V to get it back.
+#if HW_HAS_CAR_ON_SENSE
+#define SLEEP_STATUS_DEFAULT "car_off"
+#else
+#define SLEEP_STATUS_DEFAULT "disable"
+#endif
+
 const char device_config_default[] = R"json({
 "wifi_mode":"AP",
 "ap_ch":"6",
@@ -132,8 +145,7 @@ const char device_config_default[] = R"json({
 "protocol":"savvycan",
 "ble_pass":"123456",
 "ble_status":"disable",
-"sleep_status":"disable",
-"sleep_volt":"13.1",
+)json" "\"sleep_status\":\"" SLEEP_STATUS_DEFAULT "\",\n" R"json("sleep_volt":"13.1",
 "wakeup_volt":"13.5",
 "batt_alert":"disable",
 "batt_alert_ssid":"MeatPi",
@@ -1004,6 +1016,9 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	cJSON_AddStringToObject(root, "can1_mode", device_config.can1_mode);
 	cJSON_AddStringToObject(root, "can1_en", device_config.can1_en);
 	cJSON_AddStringToObject(root, "can_fwd_mode", device_config.can_fwd_mode);
+	// What forwarding is doing now: MITM turns itself off on a shared wire
+	cJSON_AddStringToObject(root, "can_fwd_state", !config_server_get_fwd_en() ? "parallel"
+							: can_bridge_shared_wire() ? "off_shared_wire" : "mitm");
 #endif
 	cJSON_AddStringToObject(root, "port_type", device_config.port_type);
 	cJSON_AddStringToObject(root, "port", device_config.port);
@@ -1257,6 +1272,37 @@ static esp_err_t ws_handler(httpd_req_t *req)
     return ret;
 }
 
+/* Copies an image's board variant, the field after "wican-fw_" (CMakeLists.txt
+ * names images wican-fw_<variant>_<version>), into out. Images from before the
+ * proto variant was renamed say "custom". Returns false for any other name. */
+static bool app_variant(const esp_app_desc_t *app, char *out, size_t out_len)
+{
+    static const char prefix[] = "wican-fw_";
+    const size_t prefix_len = sizeof(prefix) - 1;
+    const char *name = app->project_name;
+    size_t name_len = strnlen(name, sizeof(app->project_name));
+
+    if (name_len <= prefix_len || strncmp(name, prefix, prefix_len) != 0)
+    {
+        return false;
+    }
+    const char *field = name + prefix_len;
+    const char *end = memchr(field, '_', name_len - prefix_len);
+    size_t len = end ? (size_t)(end - field) : name_len - prefix_len;
+
+    if (len == 0 || len >= out_len)
+    {
+        return false;
+    }
+    memcpy(out, field, len);
+    out[len] = '\0';
+    if (strcmp(out, "custom") == 0)
+    {
+        strlcpy(out, "proto", out_len);
+    }
+    return true;
+}
+
 /* Handler to upload a file onto the server */
 static esp_err_t upload_post_handler(httpd_req_t *req)
 {
@@ -1432,6 +1478,38 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
         ESP_LOGE(TAG, "esp_ota_end failed (%s)!", esp_err_to_name(err));
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "esp_ota_end failed");
         return ESP_FAIL;
+    }
+
+    /* An image built for another board variant (a proto image on an EB-FD,
+     * say) installs and boots, then drives CAN hardware that isn't there:
+     * refuse it. A USB flash still installs anything. */
+    char running_variant[16];
+    if (app_variant(esp_app_get_description(), running_variant, sizeof(running_variant)))
+    {
+        esp_app_desc_t new_app;
+        char new_variant[16];
+
+        err = esp_ota_get_partition_description(update_partition, &new_app);
+        if (err != ESP_OK || !app_variant(&new_app, new_variant, sizeof(new_variant)) ||
+            strcmp(new_variant, running_variant) != 0)
+        {
+            ESP_LOGE(TAG, "Refusing firmware %.32s: not for this %s board",
+                     err == ESP_OK ? new_app.project_name : "(unreadable)", running_variant);
+            /* Keep the image from ever booting, then reboot into this one,
+             * still selected, which brings back the CAN and BLE turned off
+             * above. */
+            esp_err_t erase_err = esp_partition_erase_range(update_partition, 0,
+                                                            update_partition->erase_size);
+            if (erase_err != ESP_OK)
+            {
+                ESP_LOGE(TAG, "Couldn't erase the refused firmware (%s)", esp_err_to_name(erase_err));
+            }
+            char msg[80];
+            snprintf(msg, sizeof(msg), "Firmware is not for this board (this is %s)", running_variant);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
+            xTimerStart(xrestartTimer, 0);
+            return ESP_FAIL;
+        }
     }
 
     err = esp_ota_set_boot_partition(update_partition);

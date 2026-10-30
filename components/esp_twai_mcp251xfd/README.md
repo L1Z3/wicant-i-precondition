@@ -1,8 +1,10 @@
 # esp_twai_mcp251xfd
 
-A TWAI node (the `esp_driver_twai` interface) for an MCP2517FD/MCP2518FD on
-SPI, built on Zephyr's MCP251xFD driver. Classical CAN only. WiCAN uses it for
-bus 1 on `eb-fd`.
+A TWAI node (the `esp_driver_twai` interface) for an MCP2518FD on SPI, built
+on Zephyr's MCP251xFD driver. Classical CAN only. WiCAN uses it for bus 1 on
+`eb-fd`. The MCP2517FD shares the register map but has no Low Power Mode, so
+`twai_node_delete()` would leave it in Sleep mode; it is untested, and its
+errata (DS80000792) haven't been reviewed.
 
 ## Layout
 
@@ -41,11 +43,28 @@ In `zephyr/drivers/can/can_mcp251xfd.{c,h}`, each marked `LOCAL PATCH`:
    then, so the state change would otherwise be lost.
 5. **Bounded abort wait in `stop()`.** Upstream polls for `ABAT` to clear
    without a limit, hanging the caller if the controller never clears it.
-   The wait now times out after 200 ms and fails the stop.
+   The wait now times out and fails the stop. It uses the driver's
+   mode-change timeout, nominally 200 ms (101 reads with 2 ms sleeps between
+   them), but each sleep is 3 ticks at the 1 kHz tick, so it can take up to
+   about 300 ms, as the mode-change waits can.
 6. **INT's interrupt enabled after controller setup.** Upstream enables it
    before resetting the controller, which may still be asserting INT after an
    MCU restart; the interrupt thread then accesses the controller alongside
    initialization, which doesn't take the driver's mutex.
+7. **RX FIFO overflows counted.** Upstream enables and handles the RX FIFO's
+   `RXOVIF` only with `CONFIG_CAN_STATS`, which isn't set here, so frames
+   dropped by a full FIFO went unnoticed. The RX read now checks `RXOVIF` in
+   the `FIFOSTA` it already reads, clears it and counts it for
+   `twai_mcp251xfd_get_rx_overflow_count()`. It needs no interrupt of its
+   own: a full FIFO keeps `RXIF` set. If `CONFIG_CAN_STATS` is ever enabled,
+   upstream's handler clears the flag too and the two counts can disagree.
+8. **Only the interrupt flags read are cleared.** Upstream writes 0 to every
+   clearable `CiINT` flag after reading them, also clearing any set since the
+   read, which that pass never handles: a lost `CERRIF` could leave the
+   driver reporting error-active with the controller bus-off. The write now
+   clears only the flags the pass read, as Linux's driver does.
+9. **RESET command padded to a word.** The SPI transfer copies its buffer in
+   4-byte words, so the 2-byte command was over-read by 2 bytes.
 
 [errata]: https://ww1.microchip.com/downloads/aemDocuments/documents/APID/ProductDocuments/Errata/MCP2518FD-Silicon-Errata-and-Data-Sheet-Clarification-DS80000789.pdf
 

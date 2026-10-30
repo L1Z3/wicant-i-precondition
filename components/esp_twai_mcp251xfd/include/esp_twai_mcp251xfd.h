@@ -22,7 +22,7 @@ typedef struct {
     } flags;
 } twai_mcp251xfd_node_config_t;
 
-// Classical CAN TWAI node on an MCP2517FD/MCP2518FD, using Zephyr's driver.
+// Classical CAN TWAI node on an MCP2518FD, using Zephyr's driver.
 //
 // The caller initializes the SPI bus without DMA and installs the GPIO ISR
 // service. The node reserves the SPI bus for itself.
@@ -38,6 +38,11 @@ typedef struct {
 // sent (no one-shot mode). Filter 0 is the only mask filter.
 esp_err_t twai_new_node_mcp251xfd(spi_host_device_t host, const twai_mcp251xfd_node_config_t *config,
                                   twai_node_handle_t *node_ret);
+
+// RX FIFO overflows since boot, across node delete and create; 0 before the
+// first node. It counts events (the controller's overflow flag seen set), not
+// frames, so it is a lower bound on the frames the controller dropped.
+uint32_t twai_mcp251xfd_get_rx_overflow_count(void);
 
 #ifdef __cplusplus
 }
