@@ -1,7 +1,7 @@
 // sleep_policy_decide(): when sleep_mode.c wants the board asleep or awake.
 // Every combination of mode, bus sleep, battery, car-on pin, READY and bus
 // activity is checked against the rules written out below. Also
-// sleep_policy_polling_allowed(), which gates AutoPID.
+// sleep_policy_polling_allowed(), which gates AutoPID, and sleep_policy_timer_us().
 #include <stdbool.h>
 #include <stdint.h>
 #include "test_support.h"
@@ -97,6 +97,14 @@ int main(void) {
     CHECK(!sleep_policy_polling_allowed(true, 12.6f, false));
     // charging: polls
     CHECK(sleep_policy_polling_allowed(true, 14.3f, false));
+
+    // Timer wake: long only in bus sleep with bus 0 able to wake the board
+    CHECK(sleep_policy_timer_us(true, false) == SLEEP_BUS_TIMER_US);
+    CHECK(sleep_policy_timer_us(true, true) == SLEEP_TIMER_US);
+    CHECK(sleep_policy_timer_us(false, false) == SLEEP_TIMER_US);
+    CHECK(sleep_policy_timer_us(false, true) == SLEEP_TIMER_US);
+    CHECK(SLEEP_TIMER_US == 2000000ULL);
+    CHECK(SLEEP_BUS_TIMER_US == 60000000ULL);
 
     return test_report("sleep policy");
 }

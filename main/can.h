@@ -76,6 +76,9 @@ void can_set_bus_wake(bool enable);
 // held low for 1 ms, a bus stuck dominant that carries no traffic: that pin
 // then stops waking the board until it reads high again.
 bool can_woke_on_traffic(void);
+// Whether bus 0's RX pin is latched off as stuck: it's checked again, and
+// re-armed once released, on each can_park(true)
+bool can_wake_stuck(void);
 // Frames received on every bus since boot, queued or dropped: tells a quiet
 // bus from a live one
 uint32_t can_rx_frame_count(void);

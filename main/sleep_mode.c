@@ -347,6 +347,28 @@ esp_err_t read_ss_adc_voltage(float *voltage_out, adc_channel_t adc_ch)
 #define SLEEP_STATE			2
 #define WAKEUP_STATE		3
 
+// Without this, light sleep keeps the CPU powered: IDF only sets up the CPU's
+// retention memory from esp_pm_configure(), which we don't use. ~650 uA on
+// the S3 (esp_pm Kconfig), for ~13 KB of internal RAM with the cache tags.
+// Taken at the first sleep, not at boot, and never freed: waking is a
+// restart. If it fails, sleep goes on with the CPU powered.
+static void sleep_cpu_power_down_once(void)
+{
+#if ESP_SLEEP_POWER_DOWN_CPU
+	static bool tried = false;
+
+	if(!tried)
+	{
+		tried = true;
+		esp_err_t err = esp_sleep_cpu_retention_init();
+		if(err != ESP_OK)
+		{
+			ESP_LOGE(TAG, "the CPU stays powered in sleep: %s", esp_err_to_name(err));
+		}
+	}
+#endif
+}
+
 static void adc_task(void *pvParameters)
 {
     esp_err_t ret;
@@ -356,8 +378,8 @@ static void adc_task(void *pvParameters)
     static int64_t pub_time = 0;
     static float alert_voltage = 0;
     static uint64_t alert_time;
-    // Wi-Fi/BLE/CAN are torn down once per sleep entry, not on every 2 s
-    // timer wake. The flag survives transitions into and out of WAKEUP_STATE.
+    // Wi-Fi is torn down once per sleep entry, not on every timer wake. The
+    // flag survives transitions into and out of WAKEUP_STATE.
     static bool sleep_teardown_done = false;
 	uint64_t sleep_time = 0;
     alert_time = config_server_get_alert_time();
@@ -594,18 +616,23 @@ static void adc_task(void *pvParameters)
 				// Sleep is the one thing allowed to take MITM forwarding
 				// down; waking is a restart, which locks it again
 				can_park(bus_sleep);
-				// The 2 s timer wake re-enters this block; the teardown below
-				// must happen only on the first pass, or Wi-Fi and BLE are
-				// re-deinitialized every 2 s for the whole time the car is
-				// parked.
+				// A timer wake re-enters this block; Wi-Fi is torn down on
+				// the first pass only, or it would be deinitialized again on
+				// every wake for the whole time the car is parked.
 				if(!sleep_teardown_done)
 				{
 					sleep_teardown_done = true;
 					ESP_LOGW(TAG, "sleeping");
 					wifi_network_deinit();
-					ble_disable();
 				}
-				esp_sleep_enable_timer_wakeup(2*1000000);
+				// BLE every pass: an AP client leaving can turn it back on,
+				// and a repeat call returns at once
+				ble_disable();
+				if(bus_sleep)
+				{
+					sleep_cpu_power_down_once();
+				}
+				esp_sleep_enable_timer_wakeup(sleep_policy_timer_us(bus_sleep, can_wake_stuck()));
 				esp_err_t slept = esp_light_sleep_start();
 				// Bus traffic wakes the board at once: the head unit needs
 				// the car now (Bluelink), and with nobody acknowledging its

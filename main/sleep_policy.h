@@ -79,6 +79,20 @@ static inline sleep_decision_t sleep_policy_decide(uint8_t mode, bool bus_sleep,
 	return d;
 }
 
+// Light sleep's timer wake. Each costs an estimated ~25 ms awake (16 voltage
+// samples 1 ms apart, and a slow-clock calibration), roughly 0.5 mA on
+// average every 2 s (datasheet currents, not measured). With bus sleep,
+// traffic wakes the board through its pins, so the timer is only a backstop:
+// the battery alert, and the car-on wire. Except while bus 0 is latched off as
+// stuck, when only a timer wake notices it's been released.
+#define SLEEP_TIMER_US (2 * 1000000ULL)
+#define SLEEP_BUS_TIMER_US (60 * 1000000ULL)
+
+static inline uint64_t sleep_policy_timer_us(bool bus_sleep, bool bus0_stuck)
+{
+	return (bus_sleep && !bus0_stuck) ? SLEEP_BUS_TIMER_US : SLEEP_TIMER_US;
+}
+
 // The 12 V battery reads above this only while the car charges it (driving,
 // charging, remote climate); a resting one stays below. Fixed, not the
 // configured sleep voltage, which can be set as low as 12.0 V.

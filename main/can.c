@@ -956,14 +956,22 @@ static void can_arm_wake(void)
 		gpio_set_direction(RX_GPIO_NUM, GPIO_MODE_INPUT);
 		gpio_wakeup_enable(RX_GPIO_NUM, GPIO_INTR_LOW_LEVEL);
 	}
+	// Light sleep isolates every other pin, floating it. Bus 0's TX: the
+	// SN65HVD233 datasheet specifies standby current with D high (recessive)
+	gpio_sleep_set_direction(TX_GPIO_NUM, GPIO_MODE_INPUT);
+	gpio_sleep_set_pull_mode(TX_GPIO_NUM, GPIO_PULLUP_ONLY);
 #if HW_HAS_MCP2518FD
-	// Light sleep isolates every other pin, floating it. A floating SDO
-	// raises the controller's Sleep current (datasheet, SPI section), and a
-	// floating nCS could let noise on SCK reach it: pull both up.
+	// A floating SDO raises the controller's Sleep current (datasheet, SPI
+	// section), and floating SCK and SDI inputs can draw current too: SCK
+	// down, its idle level in SPI mode 0, and nCS, SDO and SDI up.
 	gpio_sleep_set_direction(MCP2518FD_MISO_GPIO_NUM, GPIO_MODE_INPUT);
 	gpio_sleep_set_pull_mode(MCP2518FD_MISO_GPIO_NUM, GPIO_PULLUP_ONLY);
 	gpio_sleep_set_direction(MCP2518FD_CS_GPIO_NUM, GPIO_MODE_INPUT);
 	gpio_sleep_set_pull_mode(MCP2518FD_CS_GPIO_NUM, GPIO_PULLUP_ONLY);
+	gpio_sleep_set_direction(MCP2518FD_MOSI_GPIO_NUM, GPIO_MODE_INPUT);
+	gpio_sleep_set_pull_mode(MCP2518FD_MOSI_GPIO_NUM, GPIO_PULLUP_ONLY);
+	gpio_sleep_set_direction(MCP2518FD_SCLK_GPIO_NUM, GPIO_MODE_INPUT);
+	gpio_sleep_set_pull_mode(MCP2518FD_SCLK_GPIO_NUM, GPIO_PULLDOWN_ONLY);
 	if (twai_mcp251xfd_wake_armed())
 	{
 		gpio_wakeup_enable(MCP2518FD_INT_GPIO_NUM, GPIO_INTR_LOW_LEVEL);
@@ -1001,6 +1009,11 @@ void can_park(bool wake_on_bus)
 	{
 		can_arm_wake();
 	}
+}
+
+bool can_wake_stuck(void)
+{
+	return rx_wake_stuck;
 }
 
 uint32_t can_rx_frame_count(void)
