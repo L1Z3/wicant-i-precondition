@@ -75,6 +75,11 @@ int8_t config_server_precon_press(void) { return cfg_press; }
 static int popup_show_count = 0;
 static char popup_text[128];
 void track_popup_init(void) {}
+static uint8_t popup_fallback_media_type;
+bool track_popup_set_fallback_media_type(uint8_t media_type) {
+    popup_fallback_media_type = media_type;
+    return true;
+}
 void track_popup_tick(void) {}
 void track_popup_rx(const twai_message_t *msg, can_bus_t rx_bus) {
     (void)msg;
@@ -473,6 +478,11 @@ static void run_short_press(void) {
     expect_state("idle");
     advance_us(15000000);
     CHECK(sent_count == 0);                    // no burst continuation, no retries
+
+    // an Ioniq 5 (0x2AD, EV6 bit clear) keeps the default popup fallback
+    egmp_car_model_t model;
+    CHECK(precondition_get_car_model(&model) && model == EGMP_CAR_IONIQ5);
+    CHECK(popup_fallback_media_type == 0U);
 }
 
 static void run_long_press(void) {
@@ -684,6 +694,7 @@ static void run_ioniq6_status_frame(void) {
 
     // No status frame yet, so nothing has decided the model.
     CHECK(!precondition_get_car_model(&model));
+    CHECK(popup_fallback_media_type == 0U);      // popups keep their default
 
     sent_count = 0;
     toggle();
@@ -704,6 +715,7 @@ static void run_ioniq6_status_frame(void) {
     CHECK(platform.precon_status == PRECON_STATUS_IDLE);
     CHECK(precondition_get_car_model(&model));
     CHECK(model == EGMP_CAR_IONIQ6);
+    CHECK(popup_fallback_media_type == 0x02U);   // popups switch with the model
 
     for (int i = 0; i < 6; i++) tick1();
     CHECK(sent_count == 6);
@@ -722,6 +734,39 @@ static void run_ioniq6_status_frame(void) {
     ioniq6_status(0x15, CAN_BUS_0);
     CHECK(platform.precon_status == PRECON_STATUS_STARTED);
     expect_state("active");
+}
+
+// The Ioniq 6 takes about 90 s from the start command to fully started. Once its
+// status frame has identified it, the countdown starts from 90 and WAIT_STARTED
+// waits 90 s before retrying; other cars keep 70 s (run_short_press).
+static void run_ioniq6_start_timeout(void) {
+    precondition_init();
+    expect_state("idle");
+    egmp_car_model_t model;
+    ioniq6_status(0x01, CAN_BUS_0);
+    CHECK(precondition_get_car_model(&model) && model == EGMP_CAR_IONIQ6);
+
+    toggle();
+    expect_state("start-burst");
+    twai_message_t m;
+    CHECK(fwd(0x4E8, CAN_BUS_0, &m) == FWD_MODIFIED);
+    CHECK(fake_now == requested.last_attempt_ts);  // short press starts on release
+    CHECK((m.data[4] | (m.data[5] << 8)) == 90);
+    for (int i = 0; i < 6; i++) tick1();
+    ioniq6_status(0x05, CAN_BUS_0);
+    expect_state("wait-started");
+    int64_t attempt_ts = requested.last_attempt_ts;
+
+    advance_us(71000000);                          // past the 70 s other cars get
+    expect_state("wait-started");
+    CHECK(requested.retries == 0);
+    CHECK(fwd(0x4E8, CAN_BUS_0, &m) == FWD_MODIFIED);
+    CHECK((m.data[4] | (m.data[5] << 8)) == 90 - (fake_now - attempt_ts + 999999) / 1000000);
+
+    advance_until_state("start-burst", 20000000);
+    CHECK(requested.retries == 1);
+    CHECK(fake_now - attempt_ts > PRECONDITION_STARTED_TIMEOUT_IONIQ6_US);
+    CHECK(fake_now - attempt_ts <= PRECONDITION_STARTED_TIMEOUT_IONIQ6_US + 40000);
 }
 
 // The Ioniq 6 form of the power-status frame, 0x00C03503: the 11-bit 0x038 never
@@ -1913,6 +1958,7 @@ static const suite_t suites[] = {
     {"precondition battery state of charge", ONCE, PRESS_SHORT, run_battery_soc},
     {"precondition Ioniq 6 battery frames", ONCE, PRESS_SHORT, run_ioniq6_battery_frames},
     {"precondition Ioniq 6 status frame", ONCE, PRESS_SHORT, run_ioniq6_status_frame},
+    {"precondition Ioniq 6 start timeout", ONCE, PRESS_SHORT, run_ioniq6_start_timeout},
     {"precondition Ioniq 6 power status", PERSISTENT, PRESS_SHORT, run_ioniq6_power_status},
     {"precondition automatic temperature cutoff", CONTINUOUS, PRESS_SHORT, run_automatic_temperature_cutoff},
     {"precondition persistent temperature cutoff", PERSISTENT, PRESS_SHORT, run_automatic_temperature_cutoff},

@@ -39,8 +39,9 @@ typedef struct {
 
 bool precondition_get_battery_soc(precondition_soc_t *out);
 
-// E-GMP model identified from the precondition status frame. Only the web UI's
-// button filter uses it, when the vehicle setting is "auto".
+// E-GMP model identified from the precondition status frame. The web UI's
+// button filter uses it when the vehicle setting is "auto"; an Ioniq 6 also gets
+// a longer start timeout and its own popup fallback media type.
 typedef enum {
     EGMP_CAR_IONIQ5,
     EGMP_CAR_IONIQ6,
