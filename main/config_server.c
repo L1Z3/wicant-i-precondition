@@ -38,6 +38,7 @@
 #include "esp_err.h"
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include <sys/unistd.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -67,6 +68,7 @@
 #include "wifi_network.h"
 #include "esp_vfs.h"
 #include "esp_ota_ops.h"
+#include "esp_bt.h"
 #include "can.h"
 #include "ble.h"
 #include "sleep_mode.h"
@@ -176,8 +178,8 @@ TimerHandle_t xrestartTimer;
 /* Scratch buffer size */
 #define SCRATCH_BUFSIZE  4096
 
-#define MAX_FILE_SIZE   (2000*1024) // 200 KB
-#define MAX_FILE_SIZE_STR "200KB"
+#define MAX_FILE_SIZE   (2000*1024) // 2000 KB
+#define MAX_FILE_SIZE_STR "2000KB"
 
 struct file_server_data {
     /* Base path of file storage */
@@ -429,6 +431,42 @@ int32_t config_server_get_port(void)
 	return -1;
 }
 
+/* A client sending a byte now and then would otherwise hold the server's one
+ * task (all of the web UI and, during an OTA, BLE and CAN off) for as long as
+ * it likes: receiving a body of len bytes gives up after 30 s plus 1 s per
+ * 16 KB. A 1.7 MB OTA, ~10 s over the AP, may take ~140 s. */
+#define RECV_GRACE_US   (30 * 1000000LL)
+#define RECV_MIN_RATE   (16 * 1024)
+
+static int64_t recv_deadline(size_t len)
+{
+    return esp_timer_get_time() + RECV_GRACE_US + (int64_t)len * 1000000 / RECV_MIN_RATE;
+}
+
+/* httpd_req_recv returns only what has arrived so far: loop until all len
+ * bytes are in. Returns len, or the httpd_req_recv error (a timeout is not
+ * retried: a client silent for longer than recv_wait_timeout fails, and so
+ * does one too slow for recv_deadline()). */
+static int recv_full(httpd_req_t *req, char *buf, size_t len)
+{
+    int64_t deadline = recv_deadline(len);
+    size_t got = 0;
+    while (got < len)
+    {
+        if (esp_timer_get_time() > deadline)
+        {
+            return HTTPD_SOCK_ERR_TIMEOUT;
+        }
+        int ret = httpd_req_recv(req, buf + got, len - got);
+        if (ret <= 0)
+        {
+            return ret;
+        }
+        got += (size_t)ret;
+    }
+    return (int)got;
+}
+
 static esp_err_t index_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
@@ -441,125 +479,463 @@ static esp_err_t index_handler(httpd_req_t *req)
 }
 
 
+// config.json is ~1.2 KB, under 4 KB with every field at its maximum
+#define CONFIG_MAX_LEN      (16 * 1024)
+// ~90 CAN filter rows of maximum length
+#define CANFLT_MAX_LEN      (16 * 1024)
+// ~150 custom PIDs at the page's maximum field lengths; real tables are a
+// few KB
+#define AUTOPID_MAX_LEN     (64 * 1024)
+// The page saves one car (<10 KB), but older pages uploaded whole vehicle
+// profile files (115 KB today) of up to 200 KB, which a backup restore posts
+// again. The C3 has neither the heap to parse one that big nor the storage.
+#if CONFIG_IDF_TARGET_ESP32C3
+#define CAR_DATA_MAX_LEN    (32 * 1024)
+#else
+#define CAR_DATA_MAX_LEN    (200 * 1024)
+#endif
+
+/* Receive the whole body of a POST of at most max_len bytes into a
+ * NUL-terminated heap buffer. On failure the HTTP error has been sent (if the
+ * client is still there) and *ret is what the handler should return. */
+static char *recv_body(httpd_req_t *req, size_t max_len, esp_err_t *ret)
+{
+    size_t len = req->content_len;
+
+    // ESP_FAIL whenever the body is left unread: the session is closed
+    // instead of httpd draining up to content_len bytes
+    *ret = ESP_FAIL;
+    if (len == 0)
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty request");
+        *ret = ESP_OK;
+        return NULL;
+    }
+    if (len > max_len)
+    {
+        httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, "Request too large");
+        return NULL;
+    }
+
+    char *buf = malloc(len + 1);
+    if (buf == NULL)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        return NULL;
+    }
+
+    int got = recv_full(req, buf, len);
+    if (got <= 0)
+    {
+        // Any other error means the client is gone
+        if (got == HTTPD_SOCK_ERR_TIMEOUT)
+        {
+            httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "Timed out receiving request");
+        }
+        free(buf);
+        return NULL;
+    }
+    buf[len] = 0;
+    return buf;
+}
+
+/* cJSON recurses per nesting level, and the httpd stack is only 5 KB: refuse
+ * deep nesting before parsing. */
+bool json_depth_ok(const char *s, int max_depth)
+{
+    int depth = 0;
+    bool in_str = false;
+
+    for (; *s; s++)
+    {
+        if (in_str)
+        {
+            if (*s == '\\' && s[1] != 0)
+            {
+                s++;
+            }
+            else if (*s == '"')
+            {
+                in_str = false;
+            }
+        }
+        else if (*s == '"')
+        {
+            in_str = true;
+        }
+        else if (*s == '{' || *s == '[')
+        {
+            if (++depth > max_depth)
+            {
+                return false;
+            }
+        }
+        else if ((*s == '}' || *s == ']') && --depth < 0)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Parse a received body the way it will be read back from the file: as a C
+ * string (so no NUL inside) holding nothing but the JSON. NULL if invalid. */
+static cJSON *parse_body_json(const char *buf, size_t len)
+{
+    if (strlen(buf) != len || !json_depth_ok(buf, JSON_MAX_DEPTH))
+    {
+        return NULL;
+    }
+    return cJSON_ParseWithOpts(buf, NULL, true);
+}
+
+/* load_all_pids() (autopid.c) reads every value in auto_pid.json and
+ * car_data.json as a string and skips the rest. The page only ever sends
+ * strings. */
+static bool json_leaves_are_strings(const cJSON *item)
+{
+    if (cJSON_IsObject(item) || cJSON_IsArray(item))
+    {
+        const cJSON *child;
+        cJSON_ArrayForEach(child, item)
+        {
+            if (!json_leaves_are_strings(child))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+    return cJSON_IsString(item);
+}
+
+/* An array of objects, or NULL (the key is optional). */
+static bool json_object_array_or_null(const cJSON *item)
+{
+    if (item == NULL)
+    {
+        return true;
+    }
+    if (!cJSON_IsArray(item))
+    {
+        return false;
+    }
+    const cJSON *child;
+    cJSON_ArrayForEach(child, item)
+    {
+        if (!cJSON_IsObject(child))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Arrays of objects, or NULL, whose objects all have a string key. */
+static bool json_objects_have_string(const cJSON *array, const char *key)
+{
+    if (!json_object_array_or_null(array))
+    {
+        return false;
+    }
+    const cJSON *child;
+    cJSON_ArrayForEach(child, array)
+    {
+        if (!cJSON_IsString(cJSON_GetObjectItem(child, key)))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The shape load_all_pids() (autopid.c) uses from auto_pid.json. It skips
+ * entries it can't use, but refusing them here tells the user. */
+static bool auto_pid_usable(const cJSON *root)
+{
+    return cJSON_IsObject(root) && json_leaves_are_strings(root) &&
+           json_objects_have_string(cJSON_GetObjectItem(root, "pids"), "Name") &&
+           json_objects_have_string(cJSON_GetObjectItem(root, "std_pids"), "Name");
+}
+
+/* The same for car_data.json: a cars array of objects, each PID with at
+ * least one parameter, every parameter named. */
+static bool car_data_usable(const cJSON *root)
+{
+    const cJSON *cars = cJSON_GetObjectItem(root, "cars");
+    if (!cJSON_IsObject(root) || !json_leaves_are_strings(root) ||
+        !cJSON_IsArray(cars) || !json_object_array_or_null(cars))
+    {
+        return false;
+    }
+    const cJSON *car;
+    cJSON_ArrayForEach(car, cars)
+    {
+        const cJSON *pids = cJSON_GetObjectItem(car, "pids");
+        if (!json_object_array_or_null(pids))
+        {
+            return false;
+        }
+        const cJSON *pid;
+        cJSON_ArrayForEach(pid, pids)
+        {
+            const cJSON *params = cJSON_GetObjectItem(pid, "parameters");
+            if (!cJSON_IsArray(params) || cJSON_GetArraySize(params) == 0 ||
+                !json_objects_have_string(params, "name"))
+            {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/* Replace path with len bytes of buf: write path.tmp, then rename it over
+ * path (atomic on LittleFS), so a failed save leaves the old file in place. */
+static bool save_file_atomic(const char *path, const char *buf, size_t len)
+{
+    char tmp[64];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+
+    FILE *f = fopen(tmp, "w");
+    if (f == NULL)
+    {
+        ESP_LOGE(TAG, "Can't create %s (errno %d)", tmp, errno);
+        return false;
+    }
+    bool ok = fwrite(buf, 1, len, f) == len;
+    ok = (fclose(f) == 0) && ok;
+    if (!ok || rename(tmp, path) != 0)
+    {
+        ESP_LOGE(TAG, "Failed to save %s (errno %d)", path, errno);
+        unlink(tmp);
+        return false;
+    }
+    return true;
+}
+
+/* The rules for each key config_server_load_cfg() copies with CFG_GET(),
+ * also applied when the page saves the config: at boot, a required key that
+ * is missing or breaks its rule resets the whole config to defaults, an
+ * optional one falls back to its own default. Keep in step with
+ * config_server_load_cfg(). */
+#define CFG_FIELD_MAX(field)    (sizeof(device_config.field) - 1)
+#define CFG_REQUIRED(field)     { #field, 0, CFG_FIELD_MAX(field), true }
+#define CFG_OPTIONAL(field)     { #field, 0, CFG_FIELD_MAX(field), false }
+
+static const struct
+{
+    const char *key;
+    size_t min_len;
+    size_t max_len;
+    bool required;
+} config_keys[] = {
+    CFG_REQUIRED(wifi_mode),
+    CFG_REQUIRED(ap_ch),
+    { "sta_ssid", 1, 32, true },
+    // 63: the page's limit, and the longest WPA passphrase
+    { "sta_pass", 8, 63, true },
+    CFG_REQUIRED(can_datarate),
+    CFG_REQUIRED(can_mode),
+    CFG_REQUIRED(port_type),
+    CFG_REQUIRED(port),
+    { "ap_pass", 8, 63, true },
+    { "protocol", 2, 64, true },
+    { "ble_pass", 4, 16, true },
+    CFG_REQUIRED(sleep_status),
+    CFG_REQUIRED(ble_status),
+    CFG_REQUIRED(sleep_volt),
+    CFG_REQUIRED(batt_alert),
+    CFG_REQUIRED(batt_alert_ssid),
+    CFG_REQUIRED(batt_alert_pass),
+    CFG_REQUIRED(batt_alert_volt),
+    CFG_REQUIRED(batt_alert_protocol),
+    CFG_REQUIRED(batt_alert_url),
+    CFG_REQUIRED(batt_alert_port),
+    CFG_REQUIRED(batt_alert_topic),
+    CFG_REQUIRED(batt_mqtt_user),
+    CFG_REQUIRED(batt_mqtt_pass),
+    CFG_REQUIRED(batt_alert_time),
+    CFG_REQUIRED(mqtt_en),
+    CFG_REQUIRED(mqtt_url),
+    CFG_REQUIRED(mqtt_port),
+    CFG_REQUIRED(mqtt_user),
+    CFG_REQUIRED(mqtt_pass),
+    CFG_REQUIRED(mqtt_elm327_log),
+    CFG_REQUIRED(precon_mode),
+    CFG_REQUIRED(precon_button),
+    CFG_OPTIONAL(precon_press),
+    CFG_REQUIRED(mqtt_tx_topic),
+    CFG_OPTIONAL(mqtt_tx_en),
+    CFG_OPTIONAL(mqtt_rx_en),
+    { "mqtt_rx_topic", 1, CFG_FIELD_MAX(mqtt_rx_topic), true },
+    { "mqtt_status_topic", 1, CFG_FIELD_MAX(mqtt_status_topic), true },
+    CFG_OPTIONAL(wakeup_volt),
+    CFG_OPTIONAL(sleep_time),
+    CFG_OPTIONAL(sta_security),
+    CFG_OPTIONAL(ap_auto_disable),
+    CFG_OPTIONAL(keep_alive),
+};
+
+/* NULL if root is a config config_server_load_cfg() will take, else the
+ * first key that is wrong. */
+static const char *config_invalid_key(const cJSON *root)
+{
+    if (!cJSON_IsObject(root))
+    {
+        return "(not an object)";
+    }
+    for (size_t i = 0; i < sizeof(config_keys) / sizeof(config_keys[0]); i++)
+    {
+        const cJSON *key = cJSON_GetObjectItem(root, config_keys[i].key);
+        if (key == NULL)
+        {
+            if (config_keys[i].required)
+            {
+                return config_keys[i].key;
+            }
+            continue;
+        }
+        if (!cJSON_IsString(key) || key->valuestring == NULL ||
+            strlen(key->valuestring) < config_keys[i].min_len ||
+            strlen(key->valuestring) > config_keys[i].max_len)
+        {
+            return config_keys[i].key;
+        }
+    }
+    return NULL;
+}
+
+/* Copy root's value for key into dst (size bytes) if it is a string that
+ * keeps key's rule in config_keys[] and fits dst; otherwise leave dst alone
+ * and return false. Never truncates. */
+static bool cfg_get(const cJSON *root, const char *key, char *dst, size_t size)
+{
+    size_t min_len = 0;
+    size_t max_len = size - 1;
+    bool required = false;
+    for (size_t i = 0; i < sizeof(config_keys) / sizeof(config_keys[0]); i++)
+    {
+        if (strcmp(config_keys[i].key, key) == 0)
+        {
+            min_len = config_keys[i].min_len;
+            max_len = config_keys[i].max_len;
+            required = config_keys[i].required;
+            break;
+        }
+    }
+
+    const cJSON *item = cJSON_GetObjectItem(root, key);
+    if (item == NULL)
+    {
+        if (required)
+        {
+            ESP_LOGE(TAG, "config.json: %s missing", key);
+        }
+        return false;
+    }
+    if (!cJSON_IsString(item) || item->valuestring == NULL)
+    {
+        ESP_LOGE(TAG, "config.json: %s is not a string", key);
+        return false;
+    }
+    size_t len = strlen(item->valuestring);
+    if (len < min_len || len > max_len || len >= size)
+    {
+        ESP_LOGE(TAG, "config.json: %s length %u not in %u..%u", key,
+                 (unsigned)len, (unsigned)min_len, (unsigned)max_len);
+        return false;
+    }
+    memcpy(dst, item->valuestring, len + 1);
+    return true;
+}
+
+#define CFG_GET(root, field) \
+    cfg_get(root, #field, device_config.field, sizeof(device_config.field))
+
 static esp_err_t store_config_handler(httpd_req_t *req)
 {
-    char *buf = NULL;
-    size_t buf_size = req->content_len;
-
-    if (buf_size <= 0)
+    esp_err_t ret;
+    char *buf = recv_body(req, CONFIG_MAX_LEN, &ret);
+    if (buf == NULL)
     {
-        return ESP_FAIL; // Invalid content length
+        return ret;
     }
 
-    buf = (char *)malloc(buf_size);
-    if (!buf)
+    // A config.json that config_server_load_cfg() rejects is replaced by
+    // the defaults at boot, so never save one
+    cJSON *root = parse_body_json(buf, req->content_len);
+    const char *bad_key = root != NULL ? config_invalid_key(root) : "(invalid JSON)";
+    if (bad_key != NULL)
     {
-        return ESP_ERR_NO_MEM; // Memory allocation failure
-    }
-
-    int ret = httpd_req_recv(req, buf, buf_size);
-
-    if (ret <= 0)
-    {
-        if (ret == HTTPD_SOCK_ERR_TIMEOUT)
-        {
-            // Retry receiving if timeout occurred
-            free(buf);
-            return ESP_FAIL;
-        }
-        // Handle read error
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Invalid configuration: %s", bad_key);
+        ESP_LOGE(TAG, "%s", msg);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
+        cJSON_Delete(root);
         free(buf);
-        return ESP_FAIL;
+        return ESP_OK;
     }
+    cJSON_Delete(root);
 
-    FILE *f = fopen(FS_MOUNT_POINT"/config.json", "w");
-    if (f)
-    {
-        // Write the received data into the file
-        fwrite(buf, 1, buf_size, f);
-        fclose(f);
-    }
-    else
-    {
-        // Handle file open error
-        free(buf);
-        return ESP_FAIL;
-    }
-
-    // Free dynamically allocated memory
+    bool saved = save_file_atomic(FS_MOUNT_POINT"/config.json", buf, req->content_len);
     free(buf);
+    if (!saved)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save configuration");
+        return ESP_OK;
+    }
 
+    // Before replying: a running timer tells config_server_set_ble_config()
+    // that config.json no longer matches the config read at boot.
+    if (xTimerStart(xrestartTimer, 0) != pdPASS)
+    {
+        ESP_LOGE(TAG, "Couldn't start the restart timer");
+    }
     const char *resp_str = "Configuration saved! Rebooting...";
     httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
-
-    xTimerStart( xrestartTimer, 0 );
     return ESP_OK;
 }
 
 static esp_err_t store_canflt_handler(httpd_req_t *req)
 {
-    char *buf = NULL;
-    size_t buf_size = req->content_len;
-
-    if (buf_size <= 0)
+    esp_err_t ret;
+    char *buf = recv_body(req, CANFLT_MAX_LEN, &ret);
+    if (buf == NULL)
     {
-        return ESP_FAIL; // Invalid content length
+        return ret;
     }
 
-    buf = (char *)malloc(buf_size);
-    if (!buf)
+    // The page parses /load_canflt as JSON and mqtt_load_filter() wants a
+    // can_flt array of row objects
+    cJSON *root = parse_body_json(buf, req->content_len);
+    const cJSON *rows = cJSON_GetObjectItem(root, "can_flt");
+    bool valid = cJSON_IsObject(root) && cJSON_IsArray(rows);
+    const cJSON *row;
+    cJSON_ArrayForEach(row, rows)
     {
-        return ESP_ERR_NO_MEM; // Memory allocation failure
+        valid = valid && cJSON_IsObject(row);
     }
-
-    int ret = httpd_req_recv(req, buf, buf_size);
-
-    if (ret <= 0)
+    cJSON_Delete(root);
+    if (!valid)
     {
-        if (ret == HTTPD_SOCK_ERR_TIMEOUT)
-        {
-            // Retry receiving if timeout occurred
-            free(buf);
-            return ESP_FAIL;
-        }
-        // Handle read error
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid CAN filter");
         free(buf);
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
-    FILE *f = fopen(FS_MOUNT_POINT"/mqtt_canfilt.json", "w");
-    if (f)
+    if (!save_file_atomic(FS_MOUNT_POINT"/mqtt_canfilt.json", buf, req->content_len))
     {
-        // Write the received data into the file
-        fwrite(buf, 1, buf_size, f);
-        fclose(f);
-    }
-    else
-    {
-        // Handle file open error
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save CAN filter");
         free(buf);
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
-    // Free dynamically allocated memory
-    free(buf);
+    // What was saved is what /load_canflt serves now
+    free(mqtt_canflt_file);
+    mqtt_canflt_file = buf;
+    ESP_LOGI(TAG, "mqtt_canfilt.json: %s", mqtt_canflt_file);
 
-	free(mqtt_canflt_file);
-	mqtt_canflt_file = NULL;
-	FILE* f1 = fopen(FS_MOUNT_POINT"/mqtt_canfilt.json", "r");
-	if (f1 != NULL)
-	{
-		fseek(f1, 0, SEEK_END);
-		int32_t filesize = ftell(f1);
-		fseek(f1, 0, SEEK_SET);
-		mqtt_canflt_file = malloc(filesize+1);
-		ESP_LOGI(__func__, "mqtt_canflt_file File size: %ld", filesize);
-		fseek(f1, 0, SEEK_SET);
-		fread(mqtt_canflt_file, sizeof(char), filesize, f1);
-		mqtt_canflt_file[filesize] = 0;
-		fseek(f1, 0, SEEK_SET);
-		ESP_LOGI(TAG, "mqtt_canfilt.json: %s", mqtt_canflt_file);
-	}
     const char *resp_str = "CAN filter saved! Filter will take effect after submit.";
     httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
 
@@ -759,18 +1135,12 @@ static esp_err_t track_popup_handler(httpd_req_t *req)
     }
 
     char text[TRACK_POPUP_MAX_TEXT_UTF8_BYTES + 1U];
-    size_t received = 0U;
-    while (received < req->content_len)
+    size_t received = req->content_len;
+    if (recv_full(req, text, received) <= 0)
     {
-        int chunk_size = httpd_req_recv(req, text + received,
-                                        req->content_len - received);
-        if (chunk_size <= 0)
-        {
-            httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT,
-                                "Failed to receive track popup text");
-            return ESP_FAIL;
-        }
-        received += (size_t)chunk_size;
+        httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT,
+                            "Failed to receive track popup text");
+        return ESP_FAIL;
     }
 
     // track_popup_show accepts a NUL-terminated string, so reject embedded NUL
@@ -803,142 +1173,73 @@ static esp_err_t logo_handler(httpd_req_t *req)
 
 static esp_err_t store_auto_data_handler(httpd_req_t *req)
 {
-    if (!req)
-	{
-        return ESP_ERR_INVALID_ARG;
+    esp_err_t ret;
+    char *buf = recv_body(req, AUTOPID_MAX_LEN, &ret);
+    if (buf == NULL)
+    {
+        return ret;
     }
 
-    char *buf = NULL;
-    size_t buf_size = req->content_len;
-    esp_err_t ret = ESP_OK;
-
-    // Validate content length
-    if (buf_size <= 0 || buf_size > MAX_FILE_SIZE)
-	{
-        ESP_LOGE(TAG, "Invalid content length: %d", buf_size);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid content length");
-        return ESP_FAIL;
+    cJSON *root = parse_body_json(buf, req->content_len);
+    bool valid = auto_pid_usable(root);
+    cJSON_Delete(root);
+    if (!valid)
+    {
+        ESP_LOGE(TAG, "Invalid AutoPID data");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid AutoPID data");
+        free(buf);
+        return ESP_OK;
     }
 
-    // Allocate buffer with extra byte for null termination
-    buf = (char *)calloc(1, buf_size + 1);
-    if (!buf)
-	{
-        ESP_LOGE(TAG, "Memory allocation failed for size %d", buf_size + 1);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Memory allocation failed");
-        return ESP_ERR_NO_MEM;
+    bool saved = save_file_atomic(FS_MOUNT_POINT"/auto_pid.json", buf, req->content_len);
+    free(buf);
+    if (!saved)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save AutoPID data");
+        return ESP_OK;
     }
 
-    // Receive data with timeout handling
-    int received = httpd_req_recv(req, buf, buf_size);
-    if (received <= 0)
-	{
-        ESP_LOGE(TAG, "Failed to receive data: %d", received);
-        ret = ESP_FAIL;
-        goto cleanup;
-    }
-
-    // Validate received data length
-    if (received != buf_size)
-	{
-        ESP_LOGE(TAG, "Incomplete data received: %d/%d", received, buf_size);
-        ret = ESP_FAIL;
-        goto cleanup;
-    }
-
-    buf[received] = '\0';
-    
-    // Validate JSON format
-    cJSON *json = cJSON_Parse(buf);
-    if (!json)
-	{
-        ESP_LOGE(TAG, "Invalid JSON format");
-        ret = ESP_FAIL;
-        goto cleanup;
-    }
-    cJSON_Delete(json);
-
-    ESP_LOGI(TAG, "Auto Table json: %s", buf);
-
-    // Open file with error handling
-    FILE *f = fopen(FS_MOUNT_POINT"/auto_pid.json", "w");
-    if (!f)
-	{
-        ESP_LOGE(TAG, "Failed to open file for writing");
-        ret = ESP_FAIL;
-        goto cleanup;
-    }
-
-    // Write data with size verification
-    size_t written = fwrite(buf, 1, received, f);
-    if (written != received) 
-	{
-        ESP_LOGE(TAG, "File write failed: %d/%d bytes", written, received);
-        fclose(f);
-        ret = ESP_FAIL;
-        goto cleanup;
-    }
-
-    fclose(f);
-
-    // Send success response
     const char *resp_str = "Auto PID table will take effect after submit.";
     httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
-
-cleanup:
-    if (buf)
-	{
-        free(buf);
-    }
-    
-    if (ret != ESP_OK)
-	{
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to store data");
-    }
-
-    return ret;
+    return ESP_OK;
 }
 
 
+/* Saves len bytes of buf (NUL-terminated, the whole body received) as
+ * car_data.json if load_all_pids() and the page can use it, and answers the
+ * request: ok_msg if saved. */
+static void save_car_data(httpd_req_t *req, const char *buf, size_t len, const char *ok_msg)
+{
+    cJSON *root = parse_body_json(buf, len);
+    bool valid = car_data_usable(root);
+    cJSON_Delete(root);
+    if (!valid)
+    {
+        ESP_LOGE(TAG, "Invalid car data");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid car data");
+        return;
+    }
+
+    if (!save_file_atomic(FS_MOUNT_POINT"/car_data.json", buf, len))
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save car data");
+        return;
+    }
+    ESP_LOGI(TAG, "car_data.json saved (%u bytes)", (unsigned)len);
+    httpd_resp_send(req, ok_msg, HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t store_car_data_handler(httpd_req_t *req)
 {
-    int total_len = req->content_len;
-    int received = 0;
-	const char *filepath = FS_MOUNT_POINT"/car_data.json";
-
-    FILE *file = fopen(filepath, "w");
-    if (!file)
+    esp_err_t ret;
+    char *buf = recv_body(req, CAR_DATA_MAX_LEN, &ret);
+    if (buf == NULL)
     {
-        ESP_LOGE(TAG, "Failed to open file for writing");
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to open file for writing");
-        return ESP_FAIL;
+        return ret;
     }
 
-    static char buffer[16];
-    while (received < total_len)
-    {
-        int ret = httpd_req_recv(req, buffer, sizeof(buffer));
-        if (ret <= 0)
-        {
-            ESP_LOGE(TAG, "Failed to receive JSON data");
-            fclose(file);
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive JSON data");
-            return ESP_FAIL;
-        }
-        if (fwrite(buffer, 1, ret, file) != ret)
-        {
-            ESP_LOGE(TAG, "Failed to write data to file");
-            fclose(file);
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to write data to file");
-            return ESP_FAIL;
-        }
-        received += ret;
-    }
-
-    fclose(file);
-    ESP_LOGI(TAG, "JSON data successfully stored");
-
-    httpd_resp_send(req, "Data stored successfully", HTTPD_RESP_USE_STRLEN);
+    save_car_data(req, buf, req->content_len, "Data stored successfully");
+    free(buf);
     return ESP_OK;
 }
 
@@ -1268,20 +1569,179 @@ static esp_err_t ws_handler(httpd_req_t *req)
     return ret;
 }
 
+/* Uploads are multipart/form-data bodies holding the file in one part:
+ *   "--<boundary>\r\n" <part headers> "\r\n\r\n" <file> "\r\n--<boundary>--\r\n"
+ * The part headers name a filename; form fields (parts without one) may come
+ * before it. */
+#define UPLOAD_BOUNDARY_MAX 70  /* RFC 2046 */
+
+typedef struct {
+    int file_off;       /* where the file starts in scratch */
+    int file_len;
+    char end[UPLOAD_BOUNDARY_MAX + 8];  /* "\r\n--<boundary>--\r\n" */
+    int end_len;
+    int64_t deadline;   /* recv_deadline() of the whole body */
+} upload_t;
+
+static int find_bytes(const char *buf, int len, const char *s, int s_len)
+{
+    for (int i = 0; i + s_len <= len; i++)
+    {
+        if (memcmp(buf + i, s, s_len) == 0)
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Finds the file part in the first got bytes of the body. Returns 1 when
+ * found, 0 if more of the body is needed, -1 if it isn't an upload. */
+static int upload_parse(const char *buf, int got, int content_len, upload_t *up)
+{
+    if (got >= 2 && (buf[0] != '-' || buf[1] != '-'))
+    {
+        return -1;
+    }
+    const char *eol = memchr(buf, '\n', got);
+    if (!eol)
+    {
+        return got < UPLOAD_BOUNDARY_MAX + 4 ? 0 : -1;
+    }
+    int line = eol + 1 - buf;   /* "--<boundary>\r\n" */
+    if (line < 5 || line > UPLOAD_BOUNDARY_MAX + 4 || eol[-1] != '\r')
+    {
+        return -1;
+    }
+    /* The delimiter before each later part is "\r\n" plus that line */
+    char delim[UPLOAD_BOUNDARY_MAX + 6];
+    memcpy(delim, "\r\n", 2);
+    memcpy(delim + 2, buf, line);
+
+    memcpy(up->end, delim, line);       /* "\r\n--<boundary>" */
+    memcpy(up->end + line, "--\r\n", 4);
+    up->end_len = line + 4;
+
+    int part = line;
+    while (1)
+    {
+        /* The part headers end with an empty line (none at all: right away) */
+        int hdr_end = find_bytes(buf + part - 2, got - (part - 2), "\r\n\r\n", 4);
+        if (hdr_end < 0)
+        {
+            return 0;
+        }
+        hdr_end += part - 2;
+        int body = hdr_end + 4;
+        if (find_bytes(buf + part, hdr_end - part, "filename=", 9) >= 0)
+        {
+            up->file_off = body;
+            up->file_len = content_len - body - up->end_len;
+            return up->file_len > 0 ? 1 : -1;
+        }
+        int next = find_bytes(buf + body, got - body, delim, line + 2);
+        if (next < 0)
+        {
+            return 0;
+        }
+        part = body + next + line + 2;
+    }
+}
+
+/* Each httpd_req_recv() waits recv_wait_timeout (5 s) for data; an upload
+ * gives up after this many in a row (30 s) rather than hold the server's one
+ * task (and with it all of the web UI) and, during an OTA, keep BLE and CAN off.
+ * It also gives up once past up->deadline. */
+#define UPLOAD_RECV_TIMEOUTS 6
+
+static int upload_recv(httpd_req_t *req, const upload_t *up, char *buf, size_t len)
+{
+    int ret;
+    int timeouts = 0;
+
+    do
+    {
+        if (esp_timer_get_time() > up->deadline)
+        {
+            return HTTPD_SOCK_ERR_TIMEOUT;
+        }
+        ret = httpd_req_recv(req, buf, len);
+    } while (ret == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts < UPLOAD_RECV_TIMEOUTS);
+    return ret;
+}
+
+/* Answers an upload whose body couldn't be received (an upload_recv() error) */
+static void upload_recv_failed(httpd_req_t *req, int err)
+{
+    ESP_LOGE(TAG, "File reception failed (%d)", err);
+    if (err == HTTPD_SOCK_ERR_TIMEOUT)
+    {
+        httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "Upload timed out");
+    }
+    else
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive file");
+    }
+}
+
+/* Receives the start of an upload into scratch until its file part's headers
+ * are in. Returns the bytes received, 0 if the body isn't an upload (or the
+ * headers don't fit in scratch), or an upload_recv() error (< 0; a client
+ * that closed the connection gives HTTPD_SOCK_ERR_FAIL). */
+static int upload_recv_start(httpd_req_t *req, char *scratch, upload_t *up)
+{
+    int want = MIN(req->content_len, SCRATCH_BUFSIZE);
+    int got = 0;
+
+    up->deadline = recv_deadline(req->content_len);
+    while (got < want)
+    {
+        int ret = upload_recv(req, up, scratch + got, want - got);
+        if (ret <= 0)
+        {
+            return ret < 0 ? ret : HTTPD_SOCK_ERR_FAIL;
+        }
+        got += ret;
+        ret = upload_parse(scratch, got, req->content_len, up);
+        if (ret != 0)
+        {
+            return ret > 0 ? got : 0;
+        }
+    }
+    return 0;
+}
+
+/* Checks that the body ends with the closing boundary right after the file:
+ * tail holds those of its bytes that came in with the file's start. Returns 1
+ * if it does, 0 if not, or an upload_recv() error (< 0; a client that closed
+ * the connection gives HTTPD_SOCK_ERR_FAIL). */
+static int upload_recv_end(httpd_req_t *req, const upload_t *up, const char *tail, int tail_len)
+{
+    char end[sizeof(up->end)];
+    int got = tail_len;
+
+    if (tail_len > 0)
+    {
+        memcpy(end, tail, tail_len);
+    }
+    while (got < up->end_len)
+    {
+        int ret = upload_recv(req, up, end + got, up->end_len - got);
+        if (ret <= 0)
+        {
+            return ret < 0 ? ret : HTTPD_SOCK_ERR_FAIL;
+        }
+        got += ret;
+    }
+    return memcmp(end, up->end, up->end_len) == 0;
+}
+
 /* Handler to upload a file onto the server */
-static esp_err_t upload_post_handler(httpd_req_t *req)
+static esp_err_t upload_ota(httpd_req_t *req)
 {
     char filepath[FILE_PATH_MAX];
     uint32_t total_size = 0;
 
-    if(config_server_get_ble_config())
-    {
-    	ble_disable();
-    }
-    for(int bus = 0; bus < CAN_BUS_COUNT; bus++)
-    {
-        can_disable(bus);
-    }
     /* Skip leading "/upload" from URI to get filename */
     /* Note sizeof() counts NULL termination hence the -1 */
     const char *filename = get_path_from_uri(filepath, ((struct file_server_data *)req->user_ctx)->base_path,
@@ -1315,12 +1775,24 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     ESP_LOGI(TAG, "Receiving file : %s...", filename);
 
     /* Retrieve the pointer to scratch buffer for temporary storage */
-    char *buf = ((struct file_server_data *)req->user_ctx)->scratch;
-    int received = 0;
+    char *scratch = ((struct file_server_data *)req->user_ctx)->scratch;
+    upload_t up;
 
-    /* Content length of the request gives
-     * the size of the file being uploaded */
-    int remaining = req->content_len;
+    /* Before touching the OTA partition, which esp_ota_begin() erases */
+    int got = upload_recv_start(req, scratch, &up);
+    if (got <= 0)
+    {
+        if (got == 0)
+        {
+            ESP_LOGE(TAG, "Malformed upload");
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Malformed upload");
+        }
+        else
+        {
+            upload_recv_failed(req, got);
+        }
+        return ESP_FAIL;
+    }
 
     ///
     esp_err_t err;
@@ -1345,7 +1817,16 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     assert(update_partition != NULL);
     ESP_LOGI(TAG, "Writing to partition subtype %d at offset 0x%lx",
              update_partition->subtype, update_partition->address);
-    err = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &update_handle);
+    if ((uint32_t)up.file_len > update_partition->size)
+    {
+        ESP_LOGE(TAG, "Firmware too large: %d bytes, partition %lu", up.file_len, update_partition->size);
+        httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, "Firmware too large for this board");
+        return ESP_FAIL;
+    }
+    /* Each flash erase stops the CPU's flash cache. Erasing only the image's
+     * size up front (rounded up to 4 KB), not the whole partition, shortens
+     * the update: the upload turns BLE and CAN off when it starts. */
+    err = esp_ota_begin(update_partition, up.file_len, &update_handle);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "esp_ota_begin failed (%s)", esp_err_to_name(err));
@@ -1353,56 +1834,16 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-	char *ret = 0;
-	char *boundary_start = 0;
-	char *boundary_end = 0;
-	uint8_t count = 0;
+    /* The file's start came in with the part headers; receive the rest at
+     * the start of scratch, part by part */
+    char *buf = scratch + up.file_off;
+    int received = MIN(got - up.file_off, up.file_len);
 
-    while (remaining > 0)
+    while (1)
     {
-//        ESP_LOGI(TAG, "Remaining size : %d", remaining);
-        /* Receive the file part by part into a buffer */
-        if ((received = httpd_req_recv(req, buf, MIN(remaining, SCRATCH_BUFSIZE))) <= 0)
-        {
-            if (received == HTTPD_SOCK_ERR_TIMEOUT)
-            {
-                /* Retry if timeout occurred */
-                continue;
-            }
-
-
-            ESP_LOGE(TAG, "File reception failed!");
-            /* Respond with 500 Internal Server Error */
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive file");
-            return ESP_FAIL;
-        }
-
-        if(boundary_start == 0)
-        {
-        	boundary_start = buf;
-        	ret = memchr(boundary_start, '\n', 200);
-        	boundary_end = ret + 1;
-        	remaining -= ((boundary_end - boundary_start) + 1 + 2 + 1);//ignore boundary at end of file
-        	//TODO: Better way to do this ??
-        	while(1)
-        	{
-        		if(((ret[0] == 'T') && (ret[1] == 'y') && (ret[2] == 'p') && (ret[3] == 'e') &&
-        		        			(ret[4] == ':')))
-        		{
-        			break;
-        		}
-        		ret++;
-        	}
-    		ret = memchr(ret, '\n', 200);
-    		buf = ret + 3;
-    		remaining -= (buf - boundary_start);
-    		ESP_LOGI(TAG, "Real Remaining size : %d", remaining);
-    		
-    		received -= (buf - boundary_start);
-        }
         total_size += received;
         /* Write buffer content to file on storage */
-        if (received && (ESP_OK != esp_ota_write( update_handle, (const void *)buf, received)))
+        if (received > 0 && (ESP_OK != esp_ota_write( update_handle, (const void *)buf, received)))
         {
             ESP_LOGE(TAG, "File write failed!");
             esp_ota_abort(update_handle);
@@ -1410,28 +1851,40 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to write file to storage");
             return ESP_FAIL;
         }
-
-        if(count < 3)
+        if (total_size >= up.file_len)
         {
-        	count++;
+            break;
         }
-        /* Keep track of remaining size of
-         * the file left to be uploaded */
-        remaining -= received;
         vTaskDelay(5 / portTICK_PERIOD_MS);
+
+        buf = scratch;
+        if ((received = upload_recv(req, &up, buf, MIN(up.file_len - total_size, SCRATCH_BUFSIZE))) <= 0)
+        {
+            esp_ota_abort(update_handle);
+            upload_recv_failed(req, received);
+            return ESP_FAIL;
+        }
     }
 
     /* Close file upon upload completion */
     ESP_LOGI(TAG, "File reception complete: %lu", total_size);
 
-    if ((received = httpd_req_recv(req, buf, SCRATCH_BUFSIZE)) <= 0)
+    int tail = got - up.file_off - up.file_len;
+    int end = upload_recv_end(req, &up, tail > 0 ? scratch + up.file_off + up.file_len : NULL, MAX(tail, 0));
+    if (end != 1)
     {
-        ESP_LOGE(TAG, "File reception failed!");
         esp_ota_abort(update_handle);
-        /* Respond with 500 Internal Server Error */
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive file");
+        if (end < 0)
+        {
+            upload_recv_failed(req, end);
+        }
+        else
+        {
+            ESP_LOGE(TAG, "Upload doesn't end with its closing boundary");
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Malformed upload");
+        }
         return ESP_FAIL;
-     }
+    }
 
     err = esp_ota_end(update_handle);
     if (err != ESP_OK)
@@ -1465,136 +1918,130 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t upload_post_handler(httpd_req_t *req)
+{
+    // BLE also goes off while a client is on the AP (wifi_network.c)
+    bool ble_off = config_server_get_ble_config() &&
+                   esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED;
+    bool can_off = false;
+
+    if (config_server_get_ble_config())
+    {
+        ble_disable();
+    }
+    for (int bus = 0; bus < CAN_BUS_COUNT; bus++)
+    {
+        can_off |= can_is_enabled((can_bus_t)bus);
+        can_disable((can_bus_t)bus);
+    }
+
+    esp_err_t ret = upload_ota(req);
+
+    /* A successful update reboots into the new image. After a failure, bring
+     * back what was turned off above: BLE directly, CAN by rebooting into this
+     * image (still selected). Not when no bus was on: then bringing back BLE
+     * is enough. Never while asleep, which would wake the device. */
+    if (ret != ESP_OK && !dev_status_is_sleeping())
+    {
+        if (can_off)
+        {
+            ESP_LOGW(TAG, "OTA failed, restarting to bring back CAN");
+            if (xTimerStart(xrestartTimer, 0) != pdPASS)
+            {
+                ESP_LOGE(TAG, "Couldn't start the restart timer");
+            }
+        }
+        // Unless a client leaving the AP has brought it back already
+        else if (ble_off && esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_IDLE)
+        {
+            ble_enable();
+        }
+    }
+    return ret;
+}
+
 static esp_err_t upload_car_data_handler(httpd_req_t *req)
 {
-    char filepath[FILE_PATH_MAX];
-    uint32_t total_size = 0;
-
-    /* Skip leading "/upload" from URI to get filename */
-    /* Note sizeof() counts NULL termination hence the -1 */
-    const char *filename = get_path_from_uri(filepath, ((struct file_server_data *)req->user_ctx)->base_path,
-                                             req->uri + sizeof("/upload") - 1, sizeof(filepath));
-    if (!filename) {
-        /* Respond with 500 Internal Server Error */
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Filename too long");
-        return ESP_FAIL;
-    }
-
-    /* Filename cannot have a trailing '/' */
-    if (filename[strlen(filename) - 1] == '/') {
-        ESP_LOGE(TAG, "Invalid filename : %s", filename);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Invalid filename");
-        return ESP_FAIL;
-    }
-
-    /* File cannot be larger than a limit */
-    if (req->content_len > MAX_FILE_SIZE)
+    /* The file plus its multipart framing */
+    if (req->content_len > CAR_DATA_MAX_LEN + SCRATCH_BUFSIZE)
     {
-        ESP_LOGE(TAG, "File too large : %d bytes", req->content_len);
-        /* Respond with 400 Bad Request */
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                            "File size must be less than "
-                            MAX_FILE_SIZE_STR "!");
+        ESP_LOGE(TAG, "Car data too large: %d bytes", req->content_len);
+        httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, "Car data too large");
         /* Return failure to close underlying connection else the
          * incoming file content will keep the socket busy */
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "Receiving file : %s...", filename);
-
     /* Retrieve the pointer to scratch buffer for temporary storage */
-    char *buf = ((struct file_server_data *)req->user_ctx)->scratch;
-    int received = 0;
+    char *scratch = ((struct file_server_data *)req->user_ctx)->scratch;
+    upload_t up;
 
-    /* Content length of the request gives
-     * the size of the file being uploaded */
-    int remaining = req->content_len;
-	char *ret = 0;
-	char *boundary_start = 0;
-	char *boundary_end = 0;
-	uint8_t count = 0;
-
-
-	FILE *fd = fopen(filepath, "w");
-    if (fd == NULL)
+    int got = upload_recv_start(req, scratch, &up);
+    if (got <= 0)
     {
-        ESP_LOGE(TAG, "Failed to create file : %s", filepath);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to create file");
+        if (got == 0)
+        {
+            ESP_LOGE(TAG, "Malformed upload");
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Malformed upload");
+        }
+        else
+        {
+            upload_recv_failed(req, got);
+        }
         return ESP_FAIL;
     }
-	// remaining
-    while (remaining > 0)
+    if (up.file_len > CAR_DATA_MAX_LEN)
     {
-//        ESP_LOGI(TAG, "Remaining size : %d", remaining);
-        /* Receive the file part by part into a buffer */
-        if ((received = httpd_req_recv(req, buf, MIN(remaining, SCRATCH_BUFSIZE))) <= 0)
-        {
-            if (received == HTTPD_SOCK_ERR_TIMEOUT)
-            {
-                /* Retry if timeout occurred */
-                continue;
-            }
-
-
-            ESP_LOGE(TAG, "File reception failed!");
-            fclose(fd);
-            unlink(filepath);
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive file");
-            return ESP_FAIL;
-        }
-
-        if(boundary_start == 0)
-        {
-        	boundary_start = buf;
-        	ret = memchr(boundary_start, '\n', 200);
-        	boundary_end = ret + 1;
-        	remaining -= ((boundary_end - boundary_start) + 1 + 2 + 1);//ignore boundary at end of file
-        	//TODO: Better way to do this ??
-        	while(1)
-        	{
-        		if(((ret[0] == 'T') && (ret[1] == 'y') && (ret[2] == 'p') && (ret[3] == 'e') &&
-        		        			(ret[4] == ':')))
-        		{
-        			break;
-        		}
-        		ret++;
-        	}
-    		ret = memchr(ret, '\n', 200);
-    		buf = ret + 3;
-    		remaining -= (buf - boundary_start);
-    		ESP_LOGI(TAG, "Real Remaining size : %d", remaining);
-    		
-    		received -= (buf - boundary_start);
-        }
-        total_size += received;
-        /* Write buffer content to file on storage */
-        if (received > 0)
-        {
-            if (fwrite(buf, 1, received, fd) != received)
-            {
-                ESP_LOGE(TAG, "File write failed!");
-                fclose(fd);
-                unlink(filepath);
-                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to write file to storage");
-                return ESP_FAIL;
-            }
-        }
-
-        if(count < 3)
-        {
-        	count++;
-        }
-        /* Keep track of remaining size of
-         * the file left to be uploaded */
-        remaining -= received;
-        vTaskDelay(5 / portTICK_PERIOD_MS);
+        ESP_LOGE(TAG, "Car data too large: %d bytes", up.file_len);
+        httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, "Car data too large");
+        return ESP_FAIL;
     }
 
+    /* Receive and check the whole file before replacing car_data.json, so
+     * a failed upload leaves it as it was */
+    char *buf = malloc(up.file_len + 1);
+    if (buf == NULL)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        return ESP_FAIL;
+    }
+    /* The file's start came in with the part headers */
+    int received = MIN(got - up.file_off, up.file_len);
+    memcpy(buf, scratch + up.file_off, received);
 
-    fclose(fd);
+    while (received < up.file_len)
+    {
+        int ret = upload_recv(req, &up, buf + received, up.file_len - received);
+        if (ret <= 0)
+        {
+            free(buf);
+            upload_recv_failed(req, ret);
+            return ESP_FAIL;
+        }
+        received += ret;
+    }
 
-    ESP_LOGI(TAG, "File reception complete: %lu", total_size);
-    httpd_resp_sendstr(req, "File uploaded successfully");
+    int tail = got - up.file_off - up.file_len;
+    int end = upload_recv_end(req, &up, tail > 0 ? scratch + up.file_off + up.file_len : NULL, MAX(tail, 0));
+    if (end != 1)
+    {
+        free(buf);
+        if (end < 0)
+        {
+            upload_recv_failed(req, end);
+        }
+        else
+        {
+            ESP_LOGE(TAG, "Upload doesn't end with its closing boundary");
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Malformed upload");
+        }
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "File reception complete: %d", up.file_len);
+    buf[up.file_len] = 0;
+    save_car_data(req, buf, up.file_len, "File uploaded successfully");
+    free(buf);
     return ESP_OK;
 }
 
@@ -1803,334 +2250,233 @@ static const httpd_uri_t scan_available_pids_uri = {
     .handler   = scan_available_pids_handler,
     .user_ctx  = NULL
 };
-static void config_server_load_cfg(char *cfg)
+/* Load device_config from the JSON in cfg. false if cfg is not a config to
+ * run on (device_config is then partly filled and must be reloaded). */
+static bool config_server_load_cfg(char *cfg)
 {
 	cJSON * root, *key = 0;
 	root   = cJSON_Parse(cfg);
-    struct stat st;
 
-	key = cJSON_GetObjectItem(root,"wifi_mode");
-	if(key == 0)
+	if(!CFG_GET(root, wifi_mode))
 	{
 		goto config_error;
 	}
-	strcpy(device_config.wifi_mode, key->valuestring);
 	ESP_LOGI(TAG, "device_config.wifi_mode: %s", device_config.wifi_mode);
 
-	key = cJSON_GetObjectItem(root,"ap_ch");
-	if(key == 0)
+	if(!CFG_GET(root, ap_ch))
 	{
 		goto config_error;
 	}
-	strcpy(device_config.ap_ch, key->valuestring);
 	ESP_LOGI(TAG, "device_config.ap_ch: %s", device_config.ap_ch);
 
-	key = cJSON_GetObjectItem(root,"sta_ssid");
-	if(key == 0)
+	if(!CFG_GET(root, sta_ssid))
 	{
 		goto config_error;
 	}
-	if(strlen(key->valuestring) == 0 || strlen(key->valuestring) > 32)
-	{
-		goto config_error;
-	}
-	strcpy(device_config.sta_ssid, key->valuestring);
 	ESP_LOGI(TAG, "device_config.sta_ssid: %s", device_config.sta_ssid);
 
-	key = cJSON_GetObjectItem(root,"sta_pass");
-	if(key == 0)
+	if(!CFG_GET(root, sta_pass))
 	{
 		goto config_error;
 	}
-	if(strlen(key->valuestring) < 8 || strlen(key->valuestring) > 64)
-	{
-		goto config_error;
-	}
-	strcpy(device_config.sta_pass, key->valuestring);
 	ESP_LOGI(TAG, "device_config.sta_pass: %s", device_config.sta_pass);
 
-	key = cJSON_GetObjectItem(root,"can_datarate");
-	if(key == 0)
+	if(!CFG_GET(root, can_datarate))
 	{
 		goto config_error;
 	}
-	strcpy(device_config.can_datarate, key->valuestring);
 	ESP_LOGI(TAG, "device_config.can_datarate: %s", device_config.can_datarate);
 
-	key = cJSON_GetObjectItem(root,"can_mode");
-	if(key == 0)
+	if(!CFG_GET(root, can_mode))
 	{
 		goto config_error;
 	}
-	strcpy(device_config.can_mode, key->valuestring);
 	ESP_LOGI(TAG, "device_config.can_mode: %s", device_config.can_mode);
 
-	key = cJSON_GetObjectItem(root,"port_type");
-	if(key == 0)
+	if(!CFG_GET(root, port_type))
 	{
 		goto config_error;
 	}
-	strcpy(device_config.port_type, key->valuestring);
 	ESP_LOGI(TAG, "device_config.port_type: %s", device_config.port_type);
 
-	key = cJSON_GetObjectItem(root,"port");
-	if(key == 0)
+	if(!CFG_GET(root, port))
 	{
 		goto config_error;
 	}
-	strcpy(device_config.port, key->valuestring);
 	ESP_LOGI(TAG, "device_config.port: %s", device_config.port);
 
 
-	key = cJSON_GetObjectItem(root,"ap_pass");
-	if(key == 0)
+	if(!CFG_GET(root, ap_pass))
 	{
 		goto config_error;
 	}
-	if(strlen(key->valuestring) < 8 || strlen(key->valuestring) > 64)
-	{
-		goto config_error;
-	}
-	strcpy(device_config.ap_pass, key->valuestring);
 	ESP_LOGE(TAG, "device_config.ap_pass: %s", device_config.ap_pass);
 
-	key = cJSON_GetObjectItem(root,"protocol");
-	if(key == 0)
+	if(!CFG_GET(root, protocol))
 	{
 		goto config_error;
 	}
-	if(strlen(key->valuestring) < 2 || strlen(key->valuestring) > 64)
-	{
-		goto config_error;
-	}
-	strcpy(device_config.protocol, key->valuestring);
 	ESP_LOGE(TAG, "device_config.protocol: %s", device_config.protocol);
 
-	key = cJSON_GetObjectItem(root,"ble_pass");
-	if(key == 0)
+	if(!CFG_GET(root, ble_pass))
 	{
 		goto config_error;
 	}
-	if(strlen(key->valuestring) < 4 || strlen(key->valuestring) > 16)
-	{
-		goto config_error;
-	}
-	strcpy(device_config.ble_pass, key->valuestring);
 	ESP_LOGE(TAG, "device_config.ble_pass: %s", device_config.ble_pass);
 
-	key = cJSON_GetObjectItem(root,"sleep_status");
-	if(key == 0)
+	if(!CFG_GET(root, sleep_status))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.sleep_status, key->valuestring);
 	ESP_LOGE(TAG, "device_config.sleep_status: %s", device_config.sleep_status);
 
-	key = cJSON_GetObjectItem(root,"ble_status");
-	if(key == 0)
+	if(!CFG_GET(root, ble_status))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.ble_status, key->valuestring);
 	ESP_LOGE(TAG, "device_config.ble_status: %s", device_config.ble_status);
 
-	key = cJSON_GetObjectItem(root,"sleep_volt");
-	if(key == 0)
+	if(!CFG_GET(root, sleep_volt))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.sleep_volt, key->valuestring);
 	ESP_LOGE(TAG, "device_config.sleep_volt: %s", device_config.sleep_volt);
 
 	//*****
-	key = cJSON_GetObjectItem(root,"batt_alert");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.batt_alert)))
+	if(!CFG_GET(root, batt_alert))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.batt_alert, key->valuestring);
 	ESP_LOGE(TAG, "device_config.batt_alert: %s", device_config.batt_alert);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"batt_alert_ssid");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.batt_alert_ssid)))
+	if(!CFG_GET(root, batt_alert_ssid))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.batt_alert_ssid, key->valuestring);
 	ESP_LOGE(TAG, "device_config.batt_alert_ssid: %s", device_config.batt_alert_ssid);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"batt_alert_pass");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.batt_alert_pass)))
+	if(!CFG_GET(root, batt_alert_pass))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.batt_alert_pass, key->valuestring);
 	ESP_LOGE(TAG, "device_config.batt_alert_pass: %s", device_config.batt_alert_pass);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"batt_alert_volt");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.batt_alert_volt)))
+	if(!CFG_GET(root, batt_alert_volt))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.batt_alert_volt, key->valuestring);
 	ESP_LOGE(TAG, "device_config.batt_alert_volt: %s", device_config.batt_alert_volt);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"batt_alert_protocol");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.batt_alert_protocol)))
+	if(!CFG_GET(root, batt_alert_protocol))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.batt_alert_protocol, key->valuestring);
 	ESP_LOGE(TAG, "device_config.batt_alert_protocol: %s", device_config.batt_alert_protocol);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"batt_alert_url");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.batt_alert_url)))
+	if(!CFG_GET(root, batt_alert_url))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.batt_alert_url, key->valuestring);
 	ESP_LOGE(TAG, "device_config.batt_alert_url: %s", device_config.batt_alert_url);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"batt_alert_port");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.batt_alert_port)))
+	if(!CFG_GET(root, batt_alert_port))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.batt_alert_port, key->valuestring);
 	ESP_LOGE(TAG, "device_config.batt_alert_port: %s", device_config.batt_alert_port);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"batt_alert_topic");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.batt_alert_topic)))
+	if(!CFG_GET(root, batt_alert_topic))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.batt_alert_topic, key->valuestring);
 	ESP_LOGE(TAG, "device_config.batt_alert_topic: %s", device_config.batt_alert_topic);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"batt_mqtt_user");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.batt_mqtt_user)))
+	if(!CFG_GET(root, batt_mqtt_user))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.batt_mqtt_user, key->valuestring);
 	ESP_LOGE(TAG, "device_config.batt_mqtt_user: %s", device_config.batt_mqtt_user);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"batt_mqtt_pass");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.batt_mqtt_pass)))
+	if(!CFG_GET(root, batt_mqtt_pass))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.batt_mqtt_pass, key->valuestring);
 	ESP_LOGE(TAG, "device_config.batt_mqtt_pass: %s", device_config.batt_mqtt_pass);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"batt_alert_time");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.batt_alert_time)))
+	if(!CFG_GET(root, batt_alert_time))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.batt_alert_time, key->valuestring);
 	ESP_LOGE(TAG, "device_config.batt_alert_time: %s", device_config.batt_alert_time);
 	//*****
 
 
 
 	//*****
-	key = cJSON_GetObjectItem(root,"mqtt_en");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.mqtt_en)))
+	if(!CFG_GET(root, mqtt_en))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.mqtt_en, key->valuestring);
 	ESP_LOGE(TAG, "device_config.mqtt_en: %s", device_config.mqtt_en);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"mqtt_url");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.mqtt_url)))
+	if(!CFG_GET(root, mqtt_url))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.mqtt_url, key->valuestring);
 	ESP_LOGE(TAG, "device_config.mqtt_url: %s", device_config.mqtt_url);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"mqtt_port");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.mqtt_port)))
+	if(!CFG_GET(root, mqtt_port))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.mqtt_port, key->valuestring);
 	ESP_LOGE(TAG, "device_config.mqtt_port: %s", device_config.mqtt_port);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"mqtt_user");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.mqtt_user)))
+	if(!CFG_GET(root, mqtt_user))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.mqtt_user, key->valuestring);
 	ESP_LOGE(TAG, "device_config.mqtt_user: %s", device_config.mqtt_user);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"mqtt_pass");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.mqtt_pass)))
+	if(!CFG_GET(root, mqtt_pass))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.mqtt_pass, key->valuestring);
 	ESP_LOGE(TAG, "device_config.mqtt_pass: %s", device_config.mqtt_pass);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"mqtt_elm327_log");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.mqtt_elm327_log)))
+	if(!CFG_GET(root, mqtt_elm327_log))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.mqtt_elm327_log, key->valuestring);
 	ESP_LOGE(TAG, "device_config.mqtt_elm327_log: %s", device_config.mqtt_elm327_log);
 	//*****
 
@@ -2158,146 +2504,95 @@ static void config_server_load_cfg(char *cfg)
 	ESP_LOGE(TAG, "device_config.egmp_car_model: %s", device_config.egmp_car_model);
 	//*****
 
-	key = cJSON_GetObjectItem(root,"precon_mode");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.precon_mode)))
+	if(!CFG_GET(root, precon_mode))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.precon_mode, key->valuestring);
 	ESP_LOGE(TAG, "device_config.precon_mode: %s", device_config.precon_mode);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"precon_button");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.precon_button)))
+	if(!CFG_GET(root, precon_button))
 	{
 		goto config_error;
 	}
-
-	strcpy(device_config.precon_button, key->valuestring);
 	ESP_LOGE(TAG, "device_config.precon_button: %s", device_config.precon_button);
 	//*****
 
 	//*****
 	// key added after initial release; missing means a config saved by older
 	// firmware, so fall back to the default rather than rejecting the config
-	key = cJSON_GetObjectItem(root,"precon_press");
-	if(key == 0)
+	if(!CFG_GET(root, precon_press))
 	{
 		strcpy(device_config.precon_press, "short");
-	}
-	else if(strlen(key->valuestring) > sizeof(device_config.precon_press))
-	{
-		goto config_error;
-	}
-	else
-	{
-		strcpy(device_config.precon_press, key->valuestring);
 	}
 	ESP_LOGE(TAG, "device_config.precon_press: %s", device_config.precon_press);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"mqtt_tx_topic");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.mqtt_tx_topic)))
+	if(!CFG_GET(root, mqtt_tx_topic))
 	{
 		goto config_error;
 	}
-	if(strlen(key->valuestring) == 0)
+	if(strlen(device_config.mqtt_tx_topic) == 0)
 	{
-		sprintf(device_config.mqtt_tx_topic, "wican/%s/can/tx", device_id);
+		snprintf(device_config.mqtt_tx_topic, sizeof(device_config.mqtt_tx_topic), "wican/%s/can/tx", device_id);
 	}
-	else
-	{
-		strcpy(device_config.mqtt_tx_topic, key->valuestring);
-	}
-	
+
 	ESP_LOGE(TAG, "device_config.mqtt_tx_topic: %s", device_config.mqtt_tx_topic);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"mqtt_tx_en");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.mqtt_tx_en)))
+	if(!CFG_GET(root, mqtt_tx_en))
 	{
 		strcpy(device_config.mqtt_tx_en,"disable");
 	}
-	else
-	{
-		strcpy(device_config.mqtt_tx_en, key->valuestring);
-	}
-	
+
 	ESP_LOGE(TAG, "device_config.mqtt_tx_en: %s", device_config.mqtt_tx_en);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"mqtt_rx_en");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.mqtt_rx_en)))
+	if(!CFG_GET(root, mqtt_rx_en))
 	{
 		strcpy(device_config.mqtt_rx_en,"disable");
-	}
-	else
-	{
-		strcpy(device_config.mqtt_rx_en, key->valuestring);
 	}
 
 	ESP_LOGE(TAG, "device_config.mqtt_rx_en: %s", device_config.mqtt_rx_en);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"mqtt_rx_topic");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.mqtt_rx_topic)) || strlen(key->valuestring) == 0)
+	if(!CFG_GET(root, mqtt_rx_topic))
 	{
 		goto config_error;
 	}
-	strcpy(device_config.mqtt_rx_topic, key->valuestring);
 
-	
+
 	ESP_LOGE(TAG, "device_config.mqtt_rx_topic: %s", device_config.mqtt_rx_topic);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"mqtt_status_topic");
-	if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.mqtt_status_topic)) || strlen(key->valuestring) == 0)
+	if(!CFG_GET(root, mqtt_status_topic))
 	{
 		goto config_error;
 	}
-	strcpy(device_config.mqtt_status_topic, key->valuestring);
 
-	
+
 	ESP_LOGE(TAG, "device_config.mqtt_status_topic: %s", device_config.mqtt_status_topic);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"wakeup_volt");
-	if(key == 0)
+	if(!CFG_GET(root, wakeup_volt))
 	{
 		strcpy(device_config.wakeup_volt, "13.5");
-	}
-	else
-	{
-		strcpy(device_config.wakeup_volt, key->valuestring);
 	}
 
 	ESP_LOGE(TAG, "device_config.wakeup_volt: %s", device_config.wakeup_volt);
 	//*****
-	
+
 	//*****
-	key = cJSON_GetObjectItem(root,"sleep_time");
-	if(key == 0)
+	if(!CFG_GET(root, sleep_time))
 	{
 		strcpy(device_config.sleep_time, "2");
-	}
-	else
-	{
-		uint32_t sleep_time = atoi(device_config.sleep_time);
-
-		if(sleep_time > 30 && sleep_time < 1)
-		{
-			strcpy(device_config.sleep_time, "2");
-		}
-
-		strcpy(device_config.sleep_time, key->valuestring);
 	}
 
 	ESP_LOGE(TAG, "device_config.sleep_time: %s", device_config.sleep_time);
@@ -2357,49 +2652,27 @@ static void config_server_load_cfg(char *cfg)
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"sta_security");
-	if(key == 0)
+	if(!CFG_GET(root, sta_security))
 	{
 		strcpy(device_config.sta_security, "wpa3");
-	}
-	else
-	{
-		strcpy(device_config.sta_security, key->valuestring);
 	}
 
 	ESP_LOGE(TAG, "device_config.sta_security: %s", device_config.wakeup_volt);
 	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"ap_auto_disable");
-	if(key == 0)
+	if(!CFG_GET(root, ap_auto_disable))
 	{
 		strcpy(device_config.ap_auto_disable, "disable");
 	}
-	else
-	{
-		strcpy(device_config.ap_auto_disable, key->valuestring);
-	}
 
 	ESP_LOGE(TAG, "device_config.ap_auto_disable: %s", device_config.ap_auto_disable);
-	//*****	
+	//*****
 
 	//*****
-	key = cJSON_GetObjectItem(root,"keep_alive");
-	if(key == 0)
+	if(!CFG_GET(root, keep_alive))
 	{
 		strcpy(device_config.keep_alive, "30");
-	}
-	else
-	{
-		uint32_t keep_alive = atoi(device_config.keep_alive);
-
-		if(keep_alive > 120 && keep_alive < 1)
-		{
-			strcpy(device_config.keep_alive, "30");
-		}
-
-		strcpy(device_config.keep_alive, key->valuestring);
 	}
 
 	ESP_LOGE(TAG, "device_config.keep_alive: %s", device_config.keep_alive);
@@ -2423,25 +2696,86 @@ static void config_server_load_cfg(char *cfg)
 	//*****
 
 	cJSON_Delete(root);
-	return;
+	return true;
 
 
 config_error:
-    // Check if destination file exists before renaming
-
-    if (stat(FS_MOUNT_POINT"/config.json", &st) == 0)
-    {
-    	ESP_LOGE(TAG, "config.json file error, restoring default");
-        // Delete it if it exists
-        unlink(FS_MOUNT_POINT"/config.json");
-		FILE* f = fopen(FS_MOUNT_POINT"/config.json", "w");
-		// sprintf(device_config_default, device_id, device_id);
-		fprintf(f, device_config_default, (char*)device_id, (char*)device_id, (char*)device_id);
-		fclose(f);
-		vTaskDelay(3000 / portTICK_PERIOD_MS);
-		esp_restart();
-    }
 	cJSON_Delete(root);
+	return false;
+}
+
+/* device_config_default for this device, malloc'd; NULL if out of memory */
+static char *config_default_json(void)
+{
+	int len = snprintf(NULL, 0, device_config_default, device_id, device_id, device_id);
+	char *buf = len < 0 ? NULL : malloc(len + 1);
+	if (buf != NULL)
+	{
+		snprintf(buf, len + 1, device_config_default, device_id, device_id, device_id);
+	}
+	return buf;
+}
+
+/* Set when device_config_file holds defaults that are not what's on disk,
+ * so config_server_set_ble_config() must not save it over config.json. */
+static bool device_config_file_unsaved = false;
+
+/* Run on the default config, and save it as config.json if save is set.
+ * Never restarts: if the default can't be saved, this boot still gets it,
+ * where restarting would only fail again on every boot. */
+static void config_server_load_default(bool save)
+{
+	char *def = config_default_json();
+	if (def == NULL)
+	{
+		ESP_LOGE(TAG, "No memory for the default config");
+		esp_restart();
+	}
+	if (save && !save_file_atomic(FS_MOUNT_POINT"/config.json", def, strlen(def)))
+	{
+		ESP_LOGE(TAG, "Couldn't save the default config, running on it anyway");
+		save = false;
+	}
+	device_config_file_unsaved = !save;
+	free(device_config_file);
+	device_config_file = def;
+	if (!config_server_load_cfg(device_config_file))
+	{
+		ESP_LOGE(TAG, "Default config rejected");
+	}
+}
+
+/* The whole file at path as a malloc'd C string; NULL if it can't be read. */
+static char *read_file(const char *path)
+{
+	FILE *f = fopen(path, "r");
+	if (f == NULL)
+	{
+		return NULL;
+	}
+	char *buf = NULL;
+	long size = -1;
+	if (fseek(f, 0, SEEK_END) == 0)
+	{
+		size = ftell(f);
+	}
+	if (size >= 0 && fseek(f, 0, SEEK_SET) == 0)
+	{
+		buf = malloc(size + 1);
+	}
+	if (buf != NULL && fread(buf, 1, size, f) == (size_t)size)
+	{
+		buf[size] = 0;
+		ESP_LOGI(TAG, "%s: %ld bytes", path, size);
+	}
+	else
+	{
+		ESP_LOGE(TAG, "Can't read %s (size %ld, errno %d)", path, size, errno);
+		free(buf);
+		buf = NULL;
+	}
+	fclose(f);
+	return buf;
 }
 
 void config_server_wifi_connected(bool flag)
@@ -2525,45 +2859,29 @@ static httpd_handle_t config_server_init(void)
     {
 		filesystem_init();
 
-		// Use POSIX and C standard library functions to work with files.
-		// First create a file.
-		ESP_LOGI(TAG, "Opening file");
-		FILE* f = fopen(FS_MOUNT_POINT"/config.json", "r");
-		if (f == NULL)
+		device_config_file = read_file(FS_MOUNT_POINT"/config.json");
+		if (device_config_file == NULL)
 		{
-			ESP_LOGI(TAG, "Config file does not exist, load default");
-			f = fopen(FS_MOUNT_POINT"/config.json", "w");
-//			fwrite(device_config_default , 1 , sizeof(device_config_default) , f );
-			fprintf(f, device_config_default, (char*)device_id, (char*)device_id, (char*)device_id);
-			fclose(f);
-			f = fopen(FS_MOUNT_POINT"/config.json", "r");
+			// Only replace a config.json that isn't there: one that is there
+			// but couldn't be read may still be good
+			struct stat st;
+			bool missing = stat(FS_MOUNT_POINT"/config.json", &st) != 0;
+			ESP_LOGW(TAG, "%s, load default", missing ? "Config file does not exist" : "Can't read config file");
+			config_server_load_default(missing);
 		}
-		fseek(f, 0, SEEK_END);
-		int filesize = ftell(f);
-		fseek(f, 0, SEEK_SET);
-
-		device_config_file = malloc(filesize+1);
-		ESP_LOGI(__func__, "File size: %d", filesize);
-		fseek(f, 0, SEEK_SET);
-		fread(device_config_file, sizeof(char), filesize, f);
-		device_config_file[filesize] = 0;
-		fseek(f, 0, SEEK_SET);
-		ESP_LOGI(TAG, "config.json: %s", device_config_file);
-		config_server_load_cfg(device_config_file);
-		
-		FILE* f1 = fopen(FS_MOUNT_POINT"/mqtt_canfilt.json", "r");
-		if (f1 != NULL)
+		else
 		{
-			fseek(f1, 0, SEEK_END);
-			filesize = ftell(f1);
-			fseek(f1, 0, SEEK_SET);
-			mqtt_canflt_file = malloc(filesize+1);
-			ESP_LOGI(__func__, "mqtt_canflt_file File size: %d", filesize);
-			fseek(f1, 0, SEEK_SET);
-			fread(mqtt_canflt_file, sizeof(char), filesize, f1);
-			mqtt_canflt_file[filesize] = 0;
-			fseek(f1, 0, SEEK_SET);
-			fclose(f1);
+			ESP_LOGI(TAG, "config.json: %s", device_config_file);
+			if (!config_server_load_cfg(device_config_file))
+			{
+				ESP_LOGE(TAG, "config.json file error, restoring default");
+				config_server_load_default(true);
+			}
+		}
+
+		mqtt_canflt_file = read_file(FS_MOUNT_POINT"/mqtt_canfilt.json");
+		if (mqtt_canflt_file != NULL)
+		{
 			ESP_LOGI(TAG, "mqtt_canfilt.json: %s", mqtt_canflt_file);
 		}
 
@@ -3074,27 +3392,51 @@ int8_t config_server_get_ap_auto_disable(void)
 
 void config_server_set_ble_config(uint8_t b)
 {
-	cJSON * root;
-	root = cJSON_Parse(device_config_file);
-	if(b == 1)
+	if (b > 1)
 	{
-		cJSON_SetValuestring(cJSON_GetObjectItem(root,"ble_status"), "enable");
+		return;
 	}
-	else if(b==0)
+	// device_config_file is the config read at boot: once a save has started
+	// the restart timer, it may no longer be what's on disk.
+	if (xTimerIsTimerActive(xrestartTimer))
 	{
-		cJSON_SetValuestring(cJSON_GetObjectItem(root,"ble_status"), "disable");
+		ESP_LOGW(TAG, "Restart pending, BLE setting not saved");
+		return;
 	}
-	const char *resp_str = cJSON_Print(root);
+	// Saving the defaults this boot runs on would replace a config.json
+	// that couldn't be read but may still be good
+	if (device_config_file_unsaved)
+	{
+		ESP_LOGW(TAG, "Running on unsaved defaults, BLE setting not saved");
+		return;
+	}
+	const char *status = b ? "enable" : "disable";
+	if (strcmp(device_config.ble_status, status) == 0)
+	{
+		return;
+	}
+
+	cJSON *root = cJSON_Parse(device_config_file);
+	if (root == NULL || cJSON_SetValuestring(cJSON_GetObjectItem(root, "ble_status"), status) == NULL)
+	{
+		ESP_LOGE(TAG, "Failed to update ble_status");
+		cJSON_Delete(root);
+		return;
+	}
+	char *resp_str = cJSON_Print(root);
+	cJSON_Delete(root);
+	if (resp_str == NULL)
+	{
+		ESP_LOGE(TAG, "Failed to print config");
+		return;
+	}
 	ESP_LOGI(TAG, "resp_str:%s", resp_str);
-	FILE* f = fopen(FS_MOUNT_POINT"/config.json", "w");
-	if (f != NULL)
+	bool saved = save_file_atomic(FS_MOUNT_POINT"/config.json", resp_str, strlen(resp_str));
+	free(resp_str);
+	if (saved && xTimerStart(xrestartTimer, 0) != pdPASS)
 	{
-		fprintf(f, resp_str);
-		fclose(f);
+		ESP_LOGE(TAG, "Couldn't start the restart timer");
 	}
-	xTimerStart( xrestartTimer, 0 );
-	free((void *)resp_str);
-    cJSON_Delete(root);
 }
 
 int8_t config_server_precon_button(void)

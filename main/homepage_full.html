@@ -2324,18 +2324,6 @@ function loadAutoTable(jsonData) {
                 });
             }
             
-            fetch('/store_car_data', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({ cars: [carData] })
-            }).then(response => response.text())
-            .then(data => console.log('Success:', data))
-            .catch(error => console.error('Error:', error));
-
-
-
             if (!cycleField.disabled && (!/^\d+$/.test(cycleValue) || parseInt(cycleValue) < 1000)) {
                 showNotification("Cycle must be a number greater than 1000", "red");
                 return false;
@@ -2416,24 +2404,31 @@ function loadAutoTable(jsonData) {
                 ecu_protocol: ecu_protocolValue
             };
 
-            // Send to server
-            await fetch('store_auto_data', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify(jsonData)
-            })
-            .then(response => response.text())
-            .then(result => {
-                showNotification("Settings saved successfully", "green");
-                document.querySelector(".store").disabled = true;
-                document.getElementById("custom_pid_store").disabled = true;
-            })
-            .catch(error => {
-                showNotification("Error saving settings: " + error.message, "red");
-                return false;
-            });
+            // Send to server. A failure throws with the server's reason, so
+            // the catch below reports it and postConfig() stops.
+            const postJSON = async (url, data, what) => {
+                let response, text;
+                try {
+                    response = await fetch(url, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify(data)
+                    });
+                    text = await response.text();
+                } catch (error) {
+                    throw new Error("Error saving " + what + ": " + error.message);
+                }
+                if (!response.ok) {
+                    throw new Error("Error saving " + what + ": " + (text || response.status));
+                }
+            };
+            await postJSON('/store_car_data', { cars: [carData] }, "car data");
+            await postJSON('store_auto_data', jsonData, "settings");
+            showNotification("Settings saved successfully", "green");
+            document.querySelector(".store").disabled = true;
+            document.getElementById("custom_pid_store").disabled = true;
 
             return true;
 
@@ -2967,8 +2962,18 @@ function loadAutoTable(jsonData) {
 		var canfltJSON = JSON.stringify(obj);
 		const xhttp = new XMLHttpRequest();
 		xhttp.onload = function() {
-            showNotification(this.responseText, "green");
+			// First: submit_enable() can post its own notice.
 			submit_enable();
+			if (this.status >= 200 && this.status < 300) {
+				showNotification(this.responseText, "green");
+			} else {
+				showNotification(this.responseText || "Failed to save CAN filters", "red");
+				document.getElementById("store_canflt_button").disabled = false;
+			}
+		};
+		xhttp.onerror = function() {
+			showNotification("Failed to save CAN filters", "red");
+			document.getElementById("store_canflt_button").disabled = false;
 		};
 		xhttp.open("POST", "/store_canflt");
 		xhttp.send(canfltJSON);
@@ -3054,8 +3059,12 @@ function loadAutoTable(jsonData) {
         }
 		const xhttp = new XMLHttpRequest();
 		xhttp.onload = function() {
-            showNotification(this.responseText, "green");
-            document.getElementById("submit_button").disabled = true;
+			if (this.status >= 200 && this.status < 300) {
+				showNotification(this.responseText, "green");
+				document.getElementById("submit_button").disabled = true;
+			} else {
+				showNotification(this.responseText || "Failed to save configuration", "red");
+			}
 		};
         xhttp.onerror = function() {
             showNotification("Failed to save configuration", "red");
@@ -3627,12 +3636,14 @@ function loadAutoTable(jsonData) {
 			alert("cycle must be between 100 and 10000");
 			return;
 		}
-		if(name.length < 1 || name.length > 16) {
-			alert("Name must be between 1 and 16 characters in length.");
+		// Bytes as stored, not UTF-16 units: the firmware skips longer rows
+		var utf8Length = (s) => new TextEncoder().encode(s).length;
+		if(name.length < 1 || utf8Length(name) > 16) {
+			alert("Name must be between 1 and 16 characters (bytes) in length.");
 			return;
 		}
-		if(expression.length < 1 || expression.length > 64) {
-			alert("Expression must be between 1 and 64 characters in length.");
+		if(expression.length < 1 || utf8Length(expression) > 64) {
+			alert("Expression must be between 1 and 64 characters (bytes) in length.");
 			return;
 		}
 		if(isNaN(pid) || pid < -1 || pid > 255) {
