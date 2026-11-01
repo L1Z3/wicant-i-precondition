@@ -440,6 +440,73 @@ static esp_err_t index_handler(httpd_req_t *req)
     return (ret == ESP_OK) ? ESP_OK : ESP_FAIL;
 }
 
+// Passwords never leave the device, following the WiCAN v6 rule: reads
+// (/load_config, /check_status) return each password as "", and a save
+// (/store_config) that sends "" for one keeps the stored value. Like v6, the
+// BLE passkey is not treated as a password.
+static const char *const CONFIG_SECRET_KEYS[] = {
+	"sta_pass",
+	"ap_pass",
+	"batt_alert_pass",
+	"batt_mqtt_pass",
+	"mqtt_pass",
+};
+
+#define CONFIG_SECRET_KEY_COUNT (sizeof(CONFIG_SECRET_KEYS) / sizeof(CONFIG_SECRET_KEYS[0]))
+
+static const char *config_secret_stored(const char *key)
+{
+	if (strcmp(key, "sta_pass") == 0)        return device_config.sta_pass;
+	if (strcmp(key, "ap_pass") == 0)         return device_config.ap_pass;
+	if (strcmp(key, "batt_alert_pass") == 0) return device_config.batt_alert_pass;
+	if (strcmp(key, "batt_mqtt_pass") == 0)  return device_config.batt_mqtt_pass;
+	if (strcmp(key, "mqtt_pass") == 0)       return device_config.mqtt_pass;
+	return NULL;
+}
+
+// Replace every password present in obj with "".
+static void config_redact_secrets(cJSON *obj)
+{
+	for (size_t i = 0; i < CONFIG_SECRET_KEY_COUNT; i++)
+	{
+		if (cJSON_GetObjectItem(obj, CONFIG_SECRET_KEYS[i]) != NULL)
+		{
+			cJSON_ReplaceItemInObject(obj, CONFIG_SECRET_KEYS[i], cJSON_CreateString(""));
+		}
+	}
+}
+
+// Put the stored value back for any password the page sent as "". Returns a
+// newly allocated config to write, or NULL to write the body unchanged.
+static char *config_keep_stored_secrets(const char *body, size_t len)
+{
+	cJSON *incoming = cJSON_ParseWithLength(body, len);
+	if (incoming == NULL)
+	{
+		return NULL;
+	}
+
+	bool changed = false;
+	for (size_t i = 0; i < CONFIG_SECRET_KEY_COUNT; i++)
+	{
+		cJSON *item = cJSON_GetObjectItem(incoming, CONFIG_SECRET_KEYS[i]);
+		if (!cJSON_IsString(item) || item->valuestring[0] != 0)
+		{
+			continue;
+		}
+
+		const char *stored = config_secret_stored(CONFIG_SECRET_KEYS[i]);
+		if (stored != NULL && stored[0] != 0)
+		{
+			cJSON_ReplaceItemInObject(incoming, CONFIG_SECRET_KEYS[i], cJSON_CreateString(stored));
+			changed = true;
+		}
+	}
+
+	char *out = changed ? cJSON_PrintUnformatted(incoming) : NULL;
+	cJSON_Delete(incoming);
+	return out;
+}
 
 static esp_err_t store_config_handler(httpd_req_t *req)
 {
@@ -472,16 +539,22 @@ static esp_err_t store_config_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
+    char *kept = config_keep_stored_secrets(buf, ret);
+    const char *to_write = kept ? kept : buf;
+    size_t to_write_len = kept ? strlen(kept) : buf_size;
+
     FILE *f = fopen(FS_MOUNT_POINT"/config.json", "w");
     if (f)
     {
         // Write the received data into the file
-        fwrite(buf, 1, buf_size, f);
+        fwrite(to_write, 1, to_write_len, f);
         fclose(f);
+        free(kept);
     }
     else
     {
         // Handle file open error
+        free(kept);
         free(buf);
         return ESP_FAIL;
     }
@@ -696,10 +769,26 @@ static esp_err_t load_pid_auto_config_handler(httpd_req_t *req)
 
 static esp_err_t load_config_handler(httpd_req_t *req)
 {
-    const char* resp_str = (const char*)device_config_file;
 	httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, (const char*)resp_str, HTTPD_RESP_USE_STRLEN);
-    ESP_LOGI(TAG, "device_config_file: %s", device_config_file);
+
+	cJSON *cfg = device_config_file ? cJSON_Parse(device_config_file) : NULL;
+	if (cfg == NULL)
+	{
+		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "config unavailable");
+		return ESP_FAIL;
+	}
+
+	config_redact_secrets(cfg);
+	char *redacted = cJSON_PrintUnformatted(cfg);
+	cJSON_Delete(cfg);
+	if (redacted == NULL)
+	{
+		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "config unavailable");
+		return ESP_FAIL;
+	}
+
+	httpd_resp_send(req, redacted, HTTPD_RESP_USE_STRLEN);
+	free(redacted);
 	UBaseType_t stack_high_watermark = uxTaskGetStackHighWaterMark(NULL);
 	ESP_LOGI(TAG, "Task stack high watermark: %u words", stack_high_watermark);
     return ESP_OK;
@@ -1143,6 +1232,7 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 		cJSON_AddNumberToObject(root, "timestamp", (double)now);
 	}
 
+	config_redact_secrets(root);
 	char *resp_str = cJSON_PrintUnformatted(root);
 	cJSON_Delete(root);
 	return resp_str;
@@ -1847,7 +1937,6 @@ static void config_server_load_cfg(char *cfg)
 		goto config_error;
 	}
 	strcpy(device_config.sta_pass, key->valuestring);
-	ESP_LOGI(TAG, "device_config.sta_pass: %s", device_config.sta_pass);
 
 	key = cJSON_GetObjectItem(root,"can_datarate");
 	if(key == 0)
@@ -1892,7 +1981,6 @@ static void config_server_load_cfg(char *cfg)
 		goto config_error;
 	}
 	strcpy(device_config.ap_pass, key->valuestring);
-	ESP_LOGE(TAG, "device_config.ap_pass: %s", device_config.ap_pass);
 
 	key = cJSON_GetObjectItem(root,"protocol");
 	if(key == 0)
@@ -1975,7 +2063,6 @@ static void config_server_load_cfg(char *cfg)
 	}
 
 	strcpy(device_config.batt_alert_pass, key->valuestring);
-	ESP_LOGE(TAG, "device_config.batt_alert_pass: %s", device_config.batt_alert_pass);
 	//*****
 
 	//*****
@@ -2052,7 +2139,6 @@ static void config_server_load_cfg(char *cfg)
 	}
 
 	strcpy(device_config.batt_mqtt_pass, key->valuestring);
-	ESP_LOGE(TAG, "device_config.batt_mqtt_pass: %s", device_config.batt_mqtt_pass);
 	//*****
 
 	//*****
@@ -2120,7 +2206,6 @@ static void config_server_load_cfg(char *cfg)
 	}
 
 	strcpy(device_config.mqtt_pass, key->valuestring);
-	ESP_LOGE(TAG, "device_config.mqtt_pass: %s", device_config.mqtt_pass);
 	//*****
 
 	//*****
@@ -2548,7 +2633,6 @@ static httpd_handle_t config_server_init(void)
 		fread(device_config_file, sizeof(char), filesize, f);
 		device_config_file[filesize] = 0;
 		fseek(f, 0, SEEK_SET);
-		ESP_LOGI(TAG, "config.json: %s", device_config_file);
 		config_server_load_cfg(device_config_file);
 		
 		FILE* f1 = fopen(FS_MOUNT_POINT"/mqtt_canfilt.json", "r");
