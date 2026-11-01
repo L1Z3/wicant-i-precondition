@@ -1361,11 +1361,12 @@
                 <tr>
                     <td>Preconditioning Mode:</td>
                     <td>
-                        <select id="precon_mode" name="precon_mode" onchange="submit_enable();">
+                        <select id="precon_mode" name="precon_mode" onchange="updatePreconModeHelp(); submit_enable();">
                             <option value="persistent">Persistent</option>
                             <option value="continuous">Continuous</option>
                             <option value="once">Once</option>
                         </select>
+                        <div id="precon_mode_help" style="font-size: 0.85rem; color: #555; margin-top: 4px;"></div>
                     </td>
                 </tr>
                 <tr>
@@ -1490,6 +1491,18 @@
             return carModel === null
                 || carClasses.length === 0
                 || carClasses.includes(`precon_button_car_${carModel}`);
+        }
+
+        const PRECON_MODE_HELP = {
+            once: "Runs one session.",
+            continuous: "Keeps it running until you turn it off or the car turns off.",
+            persistent: "Keeps it running until you turn it off, even across drives.",
+        };
+
+        // Show what the selected preconditioning mode does.
+        function updatePreconModeHelp() {
+            const mode = document.getElementById("precon_mode").value;
+            document.getElementById("precon_mode_help").textContent = PRECON_MODE_HELP[mode] || "";
         }
 
         // Client-side only: recompute which preconditioning button options
@@ -3413,6 +3426,7 @@ function loadAutoTable(jsonData) {
 			document.getElementById("mqtt_elm327_log").value = obj.mqtt_elm327_log;
             document.getElementById("battery_temp_unit").value = obj.battery_temp_unit === "f" ? "f" : "c";
             document.getElementById("precon_mode").value = obj.precon_mode;
+            updatePreconModeHelp();
             document.getElementById("precon_button").value = obj.precon_button;
             // config saved by older firmware has no precon_press key
             document.getElementById("precon_press").value = obj.precon_press || "short";
