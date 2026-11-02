@@ -16,13 +16,15 @@ typedef struct {
     uint32_t spi_clock_hz;                  // At most 0.85 * oscillator_hz / 2
     uint32_t oscillator_hz;                 // SYSCLK; the PLL is not used
     twai_timing_basic_config_t bit_timing;
+    twai_timing_basic_config_t bit_timing_data;  // used only when enable_fd
     struct {
         uint32_t enable_loopback: 1;        // External loopback: frames also go to the bus
         uint32_t enable_listen_only: 1;
+        uint32_t enable_fd: 1;              // Mixed CAN 2.0B/CAN-FD mode
     } flags;
 } twai_mcp251xfd_node_config_t;
 
-// Classical CAN TWAI node on an MCP2518FD, using Zephyr's driver.
+// CAN 2.0B/CAN-FD TWAI node on an MCP2517FD/MCP2518FD, using Zephyr's driver.
 //
 // The caller initializes the SPI bus without DMA and installs the GPIO ISR
 // service. The node reserves the SPI bus for itself.

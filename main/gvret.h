@@ -43,7 +43,9 @@ enum STATE {
     SET_SINGLEWIRE_MODE,
     SET_SYSTYPE,
     ECHO_CAN_FRAME,
-    SETUP_EXT_BUSES
+    SETUP_EXT_BUSES,
+    SETUP_FD,
+    BUILD_FD_FRAME
 };
 
 enum GVRET_PROTOCOL
@@ -62,7 +64,9 @@ enum GVRET_PROTOCOL
     PROTO_ECHO_CAN_FRAME = 11,
     PROTO_GET_NUMBUSES = 12,
     PROTO_GET_EXT_BUSES = 13,
-    PROTO_SET_EXT_BUSES = 14
+    PROTO_SET_EXT_BUSES = 14,
+    PROTO_SETUP_FD = 21,
+    PROTO_GET_FD = 22
 };
 typedef struct  {
     uint32_t CAN0Speed;
@@ -115,5 +119,6 @@ typedef struct  {
 void gvret_parse(uint8_t *buf, uint8_t len, twai_message_t *frame, QueueHandle_t *q);
 void gvret_init(void (*send_to_host)(char*, uint32_t, QueueHandle_t *q));
 int8_t gvret_parse_can_frame(uint8_t *buf, twai_message_t *frame, can_bus_t bus);
+int8_t gvret_parse_can_frame_fd(uint8_t *buf, const can_fd_message_t *frame, can_bus_t bus);
 
 #endif
