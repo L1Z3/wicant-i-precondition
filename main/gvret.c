@@ -340,6 +340,11 @@ void gvret_parse(uint8_t *buf, uint8_t len, twai_message_t *frame, QueueHandle_t
 				step = 0;
 				buff[0] = 0xF1;
 				break;
+			case PROTO_BUILD_FD_FRAME:
+				state = BUILD_FD_FRAME;
+				step = 0;
+				buff[0] = 0xF1;
+				break;
 			case PROTO_SETUP_FD:
 				state = SETUP_FD;
 				step = 0;
