@@ -102,6 +102,8 @@ typedef struct _device_config
 	char can1_datarate[65];
 	char can1_mode[65];
 	char can1_en[10];
+	char can1_fd[10];
+	char can1_fd_datarate[8];
 	char can_fwd_mode[10];
 	char port_type[65];
 	char port[65];
@@ -158,6 +160,8 @@ int8_t config_server_get_can_mode(void);
 int8_t config_server_get_can1_rate(void);
 int8_t config_server_get_can1_mode(void);
 int8_t config_server_get_can1_en(void);
+int8_t config_server_get_can1_fd_enable(void);
+uint32_t config_server_get_can1_fd_bitrate(void);
 int8_t config_server_get_fwd_en(void);
 int8_t config_server_get_port_type(void);
 int32_t config_server_get_port(void);

@@ -50,9 +50,26 @@ typedef struct {
 	uint8_t loopback;
 	uint8_t auto_tx;
 	uint8_t rate;
+	uint8_t fd_enabled;
+	uint32_t fd_data_rate;
 	uint32_t filter;
 	uint32_t mask;
 }can_cfg_t;
+
+#define CAN_FD_MAX_DLC		15
+#define CAN_FD_MAX_DATA		64
+#define CAN_FD_FLAG_IDE		0x01
+#define CAN_FD_FLAG_BRS		0x02
+#define CAN_FD_FLAG_ESI		0x04
+
+// CAN-FD frame used by the host/GVRET path. FDF is implicit; RTR is not
+// valid in CAN-FD.
+typedef struct {
+	uint32_t id;
+	uint8_t dlc;
+	uint8_t flags;
+	uint8_t data[CAN_FD_MAX_DATA];
+} can_fd_message_t;
 
 void can_init(void);
 void can_enable(can_bus_t bus);
@@ -82,8 +99,15 @@ void can_set_auto_retransmit(can_bus_t bus, uint8_t flag);
 void can_set_filter(can_bus_t bus, uint32_t f);
 void can_set_mask(can_bus_t bus, uint32_t m);
 void can_set_bitrate(can_bus_t bus, uint8_t rate);
+void can_set_fd(can_bus_t bus, uint8_t enabled, uint32_t data_rate);
+bool can_is_fd_enabled(can_bus_t bus);
+uint32_t can_get_fd_bitrate(can_bus_t bus);
+uint8_t can_fd_dlc_to_len(uint8_t dlc);
+uint8_t can_fd_len_to_dlc(uint8_t len);
 esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_wait);
+esp_err_t can_send_fd(can_bus_t bus, const can_fd_message_t *message, TickType_t ticks_to_wait);
 esp_err_t can_receive(twai_message_t *message, can_bus_t *bus, TickType_t ticks_to_wait);
+esp_err_t can_receive_fd(can_fd_message_t *message, can_bus_t *bus, TickType_t ticks_to_wait);
 uint8_t can_is_silent(can_bus_t bus);
 bool can_is_enabled(can_bus_t bus);
 bool can_is_forwardable(can_bus_t bus);

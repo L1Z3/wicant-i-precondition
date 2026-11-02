@@ -562,6 +562,39 @@ static void can_rx_task(void *pvParameters)
 	}
 }
 
+// CAN-FD is a separate, host-only path: no forwarding, no preconditioning,
+// and no MQTT/BLE replication. It only has a GVRET encoder on TCP.
+static void can_fd_rx_task(void *pvParameters)
+{
+	while (1)
+	{
+		can_fd_message_t rx_msg;
+		can_bus_t rx_bus;
+
+		dev_status_wait_for_bits(DEV_AWAKE_BIT, portMAX_DELAY);
+		if (can_receive_fd(&rx_msg, &rx_bus, portMAX_DELAY) != ESP_OK)
+		{
+			continue;
+		}
+		if (protocol != SAVVYCAN || !tcp_port_open())
+		{
+			continue;
+		}
+		xdev_buffer tx_buffer = {0};
+		tx_buffer.usLen = gvret_parse_can_frame_fd(tx_buffer.ucElement, &rx_msg, rx_bus);
+		if (tx_buffer.usLen != 0 &&
+		    xQueueSend(xMsg_Tx_Queue, &tx_buffer, pdMS_TO_TICKS(0)) != pdTRUE)
+		{
+			static uint32_t fd_host_drop_cnt = 0;
+			if ((++fd_host_drop_cnt % 64U) == 1U)
+			{
+				ESP_LOGW(TAG, "host stream: %lu FD frames dropped (TX queue full)",
+					 (unsigned long)fd_host_drop_cnt);
+			}
+		}
+	}
+}
+
 static void temperature_proxy_task(void *arg)
 {
 	temperature_sensor_handle_t sensor = (temperature_sensor_handle_t)arg;
@@ -674,6 +707,9 @@ void app_main(void)
 	// instead of timeslicing with them. Safe only because can_rx_task blocks
 	// in can_receive() when idle (see the receive loop).
 	xTaskCreate(can_rx_task, "can_rx_task", 1024*3, (void*)AF_INET, 7, NULL);
+#if HW_HAS_MCP2518FD
+	xTaskCreate(can_fd_rx_task, "can_fd_rx", 1024*4, NULL, 5, NULL);
+#endif
 
 	if(can_datarate != -1)
 	{
@@ -715,6 +751,9 @@ void app_main(void)
 	{
 		can_set_silent(CAN_BUS_1, 1);
 	}
+
+	can_set_fd(CAN_BUS_1, config_server_get_can1_fd_enable(),
+		   config_server_get_can1_fd_bitrate());
 
 	if(config_server_get_can1_en())
 	{

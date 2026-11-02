@@ -752,6 +752,26 @@
                             </select>
                         </td>
                     </tr>
+                    <tr class="can1_row" style="display:none">
+                        <td>CAN1 FD:</td>
+                        <td>
+                            <select name="can1_fd" id="can1_fd">
+                                <option value="disable" selected="selected">Disable</option>
+                                <option value="enable">Enable</option>
+                            </select>
+                        </td>
+                    </tr>
+                    <tr class="can1_row" style="display:none">
+                        <td>CAN1 FD Data Rate:</td>
+                        <td>
+                            <select name="can1_fd_datarate" id="can1_fd_datarate">
+                                <option value="1M">1 Mbps</option>
+                                <option value="2M" selected="selected">2 Mbps</option>
+                                <option value="4M">4 Mbps</option>
+                                <option value="5M">5 Mbps</option>
+                            </select>
+                        </td>
+                    </tr>
                     <tr>
                         <td>Port Type:</td>
                         <td>
@@ -2690,6 +2710,12 @@ function loadAutoTable(jsonData) {
 				if (obj.can1_en) {
 					document.getElementById("can1_en").value = obj.can1_en;
 				}
+				if (obj.can1_fd) {
+					document.getElementById("can1_fd").value = obj.can1_fd;
+				}
+				if (obj.can1_fd_datarate) {
+					document.getElementById("can1_fd_datarate").value = obj.can1_fd_datarate;
+				}
 				if (obj.can_fwd_mode) {
 					document.getElementById("can_fwd_mode").value = obj.can_fwd_mode;
 				}
@@ -3010,6 +3036,8 @@ function loadAutoTable(jsonData) {
 		obj["can1_datarate"] = document.getElementById("can1_datarate").value;
 		obj["can1_mode"] = document.getElementById("can1_mode").value;
 		obj["can1_en"] = document.getElementById("can1_en").value;
+		obj["can1_fd"] = document.getElementById("can1_fd").value;
+		obj["can1_fd_datarate"] = document.getElementById("can1_fd_datarate").value;
 		obj["can_fwd_mode"] = document.getElementById("can_fwd_mode").value;
 		obj["port_type"] = document.getElementById("port_type").value;
 		obj["port"] = document.getElementById("tcp_port_value").value;

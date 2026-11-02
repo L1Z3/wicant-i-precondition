@@ -3,10 +3,12 @@
 // Kconfig values for the vendored Zephyr sources, which Zephyr normally
 // generates as autoconf.h and preincludes. CMakeLists.txt does the same here.
 
-// TX FIFO and TEF depth, i.e. frames in flight. Matches WiCAN's 32 TX slots.
-#define CONFIG_CAN_MCP251XFD_MAX_TX_QUEUE          32
-// RAM: TEF 32x8 + TX 32x16 + RX 32x16 = 1280 of 2048 bytes.
-#define CONFIG_CAN_MCP251XFD_RX_FIFO_ITEMS         32
+// CAN FD changes the message RAM per object from 16 to 72 bytes (8-byte
+// header + 64-byte payload), so the total must stay within the MCP2518FD's
+// 2 KB. 8 TX + 8 RX fits: TEF 8x8 + TX 8x72 + RX 8x72 = 1216 bytes.
+#define CONFIG_CAN_FD_MODE                         1
+#define CONFIG_CAN_MCP251XFD_MAX_TX_QUEUE          8
+#define CONFIG_CAN_MCP251XFD_RX_FIFO_ITEMS         8
 #define CONFIG_CAN_MCP251XFD_MAX_FILTERS           16
 #define CONFIG_CAN_MCP251XFD_READ_CRC_RETRIES      5
 // Bytes, as FreeRTOS counts them on ESP-IDF. WiCAN's callbacks run here.

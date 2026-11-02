@@ -154,6 +154,8 @@ void gvret_parse(uint8_t *buf, uint8_t len, twai_message_t *frame, QueueHandle_t
 	static uint8_t buff[20];
 	static uint8_t out_bus = 0;
 	static uint32_t busSpeed = 0;
+	static can_fd_message_t build_fd_frame;
+	static uint8_t build_fd_length = 0;
 	static uint32_t now = 0;
 	static uint8_t temp8, in_byte;
 	static uint16_t temp16, i;
@@ -338,6 +340,33 @@ void gvret_parse(uint8_t *buf, uint8_t len, twai_message_t *frame, QueueHandle_t
 				step = 0;
 				buff[0] = 0xF1;
 				break;
+			case PROTO_SETUP_FD:
+				state = SETUP_FD;
+				step = 0;
+				buff[0] = 0xF1;
+				break;
+			case PROTO_GET_FD:
+				transmitBuffer[transmitBufferLength++] = 0xF1;
+				transmitBuffer[transmitBufferLength++] = 22;
+				transmitBuffer[transmitBufferLength++] = CAN_BUS_COUNT;
+				for (uint8_t b = 0; b < CAN_BUS_COUNT; b++)
+				{
+					uint8_t flags = 0;
+#if HW_HAS_MCP2518FD
+					if (b == CAN_BUS_1) flags |= 0x01;
+#endif
+					if (can_is_fd_enabled((can_bus_t)b)) flags |= 0x02;
+					uint32_t rate = can_get_fd_bitrate((can_bus_t)b);
+					transmitBuffer[transmitBufferLength++] = flags;
+					transmitBuffer[transmitBufferLength++] = (uint8_t)(rate & 0xFF);
+					transmitBuffer[transmitBufferLength++] = (uint8_t)(rate >> 8);
+					transmitBuffer[transmitBufferLength++] = (uint8_t)(rate >> 16);
+					transmitBuffer[transmitBufferLength++] = (uint8_t)(rate >> 24);
+				}
+				gvret_response((char*)transmitBuffer, transmitBufferLength, q);
+				transmitBufferLength = 0;
+				state = IDLE;
+				break;
 			}
 			break;
 		case BUILD_CAN_FRAME:
@@ -428,6 +457,67 @@ void gvret_parse(uint8_t *buf, uint8_t len, twai_message_t *frame, QueueHandle_t
 						}
 					}
 					break;
+			}
+			step++;
+			break;
+			case BUILD_FD_FRAME:
+			switch(step)
+			{
+				case 0:
+					build_fd_frame.id = in_byte;
+					build_fd_frame.flags = 0;
+					break;
+				case 1:
+					build_fd_frame.id |= (uint32_t)in_byte << 8;
+					break;
+				case 2:
+					build_fd_frame.id |= (uint32_t)in_byte << 16;
+					break;
+				case 3:
+					build_fd_frame.id |= (uint32_t)in_byte << 24;
+					if (build_fd_frame.id & (1u << 31))
+					{
+						build_fd_frame.flags |= CAN_FD_FLAG_IDE;
+						build_fd_frame.id &= 0x1FFFFFFF;
+					}
+					break;
+				case 4:
+					out_bus = in_byte & 3;
+					break;
+				case 5:
+					build_fd_length = in_byte & 0x7F;
+					if (build_fd_length > CAN_FD_MAX_DATA) build_fd_length = CAN_FD_MAX_DATA;
+					build_fd_frame.dlc = can_fd_len_to_dlc(build_fd_length);
+					if (in_byte & 0x80) build_fd_frame.flags |= CAN_FD_FLAG_BRS;
+					break;
+				default:
+				{
+					uint8_t data_index = (uint8_t)(step - 6);
+					if (data_index < build_fd_length)
+					{
+						build_fd_frame.data[data_index] = in_byte;
+					}
+					else
+					{
+						// Trailing byte; the data count is authoritative, not DLC.
+						state = IDLE;
+						if (out_bus < CAN_BUS_COUNT)
+						{
+							esp_err_t err = can_send_fd((can_bus_t)out_bus, &build_fd_frame,
+										    pdMS_TO_TICKS(20));
+							if (err != ESP_OK)
+							{
+								ESP_LOGW(__func__, "FD TX dropped on bus %u: %s", out_bus,
+									 esp_err_to_name(err));
+							}
+						}
+						else
+						{
+							ESP_LOGW(__func__, "FD TX dropped: no bus %u", out_bus);
+						}
+					}
+					break;
+				}
 			}
 			step++;
 			break;
@@ -677,6 +767,43 @@ void gvret_parse(uint8_t *buf, uint8_t len, twai_message_t *frame, QueueHandle_t
 				}
 			step++;
 			break;
+			case SETUP_FD:
+				switch(step)
+				{
+					case 0:
+						out_bus = in_byte & 3;
+						build_int = 0;
+						break;
+					case 1:
+						build_int = in_byte;
+						break;
+					case 2:
+						busSpeed = in_byte;
+						break;
+					case 3:
+						busSpeed |= (uint32_t)in_byte << 8;
+						break;
+					case 4:
+						busSpeed |= (uint32_t)in_byte << 16;
+						break;
+					case 5:
+						busSpeed |= (uint32_t)in_byte << 24;
+						if (out_bus < CAN_BUS_COUNT)
+						{
+							bool was_enabled = can_is_enabled((can_bus_t)out_bus);
+							can_disable((can_bus_t)out_bus);
+							can_set_fd((can_bus_t)out_bus, (build_int & 0x02) != 0,
+								   busSpeed ? busSpeed : can_get_fd_bitrate((can_bus_t)out_bus));
+							if (was_enabled)
+							{
+								can_enable((can_bus_t)out_bus);
+							}
+						}
+						state = IDLE;
+						break;
+				}
+				step++;
+				break;
 		}
     }
 }
@@ -709,6 +836,38 @@ int8_t gvret_parse_can_frame(uint8_t *buf, twai_message_t *frame, can_bus_t bus)
     buf[length++] = temp;
 
     return (int8_t)length;
+}
+
+// CAN-FD frame format used by SavvyCAN's GVRET client and GVRET devices:
+// 0xF1, opcode 20, ID[4] LSB (bit 31 = extended), bus, length|BRS<<7,
+// data[length], trailing 0. No timestamp and no checksum.
+int8_t gvret_parse_can_frame_fd(uint8_t *buf, const can_fd_message_t *frame, can_bus_t bus)
+{
+	uint8_t length = 0;
+	uint32_t id = frame->id & 0x1FFFFFFF;
+	if (frame->flags & CAN_FD_FLAG_IDE)
+	{
+		id |= 1u << 31;
+	}
+	uint8_t data_len = can_fd_dlc_to_len(frame->dlc);
+	if (data_len > CAN_FD_MAX_DATA)
+	{
+		data_len = CAN_FD_MAX_DATA;
+	}
+	buf[length++] = 0xF1;
+	buf[length++] = 20;
+	buf[length++] = (uint8_t)(id & 0xFF);
+	buf[length++] = (uint8_t)(id >> 8);
+	buf[length++] = (uint8_t)(id >> 16);
+	buf[length++] = (uint8_t)(id >> 24);
+	buf[length++] = (uint8_t)bus;
+	buf[length++] = data_len | ((frame->flags & CAN_FD_FLAG_BRS) ? 0x80 : 0);
+	for (int c = 0; c < data_len; c++)
+	{
+		buf[length++] = frame->data[c];
+	}
+	buf[length++] = 0;
+	return (int8_t)length;
 }
 
 

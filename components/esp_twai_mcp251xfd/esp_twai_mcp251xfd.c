@@ -399,16 +399,31 @@ static esp_err_t transmit(twai_node_handle_t handle, const twai_frame_t *frame, 
 	mcp251xfd_node_t *node = node_of(handle);
 
 	// The driver writes over SPI under a mutex. Listen-only frames never complete.
-	if (xPortInIsrContext() || node->listen_only || frame->header.fdf) {
+	if (xPortInIsrContext() || node->listen_only) {
 		return ESP_ERR_NOT_SUPPORTED;
 	}
-	if (frame->header.dlc > CAN_MAX_DLC || (frame->buffer_len && !frame->buffer)) {
+	uint8_t max_dlc = frame->header.fdf ? CANFD_MAX_DLC : CAN_MAX_DLC;
+	size_t max_len = frame->header.fdf ? CAN_MAX_DLEN : TWAI_FRAME_MAX_LEN;
+	size_t expected_len = frame->header.rtr ? 0 : can_dlc_to_bytes(frame->header.dlc);
+	// The Zephyr driver transmits zeroes for any bytes the caller did not
+	// supply, so reject a short or oversized buffer instead of silently
+	// padding or truncating the frame.
+	if (frame->header.fdf && !(node->data.common.mode & CAN_MODE_FD)) {
+		return ESP_ERR_NOT_SUPPORTED;
+	}
+	if (frame->header.dlc > max_dlc || frame->buffer_len > max_len ||
+	    (frame->buffer_len && !frame->buffer) ||
+	    (frame->header.dlc && frame->buffer_len && expected_len != frame->buffer_len)) {
 		return ESP_ERR_INVALID_ARG;
 	}
 	struct can_frame message = {
 		.id = frame->header.id,
 		.dlc = frame->header.dlc,
-		.flags = (frame->header.ide ? CAN_FRAME_IDE : 0) | (frame->header.rtr ? CAN_FRAME_RTR : 0),
+		.flags = (frame->header.ide ? CAN_FRAME_IDE : 0) |
+			 (frame->header.rtr ? CAN_FRAME_RTR : 0) |
+			 (frame->header.fdf ? CAN_FRAME_FDF : 0) |
+			 (frame->header.brs ? CAN_FRAME_BRS : 0) |
+			 (frame->header.esi ? CAN_FRAME_ESI : 0),
 	};
 	if (!frame->header.rtr && frame->buffer_len) {
 		memcpy(message.data, frame->buffer, MIN(frame->buffer_len, sizeof(message.data)));
@@ -439,6 +454,9 @@ static esp_err_t receive_isr(twai_node_handle_t handle, twai_frame_t *out)
 		.dlc = frame->dlc,
 		.ide = (frame->flags & CAN_FRAME_IDE) != 0,
 		.rtr = rtr,
+		.fdf = (frame->flags & CAN_FRAME_FDF) != 0,
+		.brs = (frame->flags & CAN_FRAME_BRS) != 0,
+		.esi = (frame->flags & CAN_FRAME_ESI) != 0,
 	};
 	if (len) {
 		memcpy(out->buffer, frame->data, len);
@@ -452,12 +470,22 @@ static esp_err_t configure(mcp251xfd_node_t *node, const twai_mcp251xfd_node_con
 {
 	struct can_timing timing = {0};
 	can_mode_t mode = (config->flags.enable_listen_only ? CAN_MODE_LISTENONLY : 0) |
-			  (config->flags.enable_loopback ? CAN_MODE_LOOPBACK : 0);
+			  (config->flags.enable_loopback ? CAN_MODE_LOOPBACK : 0) |
+			  (config->flags.enable_fd ? CAN_MODE_FD : 0);
 	int ret = can_calc_timing(&node->dev, &timing, config->bit_timing.bitrate,
 				  config->bit_timing.sp_permill);
 
 	if (ret >= 0) {
 		ret = can_set_timing(&node->dev, &timing);
+	}
+	if (ret >= 0 && config->flags.enable_fd) {
+		struct can_timing data_timing = {0};
+		ret = can_calc_timing_data(&node->dev, &data_timing,
+					   config->bit_timing_data.bitrate,
+					   config->bit_timing_data.sp_permill);
+		if (ret >= 0) {
+			ret = can_set_timing_data(&node->dev, &data_timing);
+		}
 	}
 	if (ret >= 0) {
 		ret = can_set_mode(&node->dev, mode);
@@ -498,7 +526,8 @@ static esp_err_t create(spi_host_device_t host, const twai_mcp251xfd_node_config
 	// bitrate here is only for mcp251xfd_init(); configure() applies the
 	// requested one.
 	const struct mcp251xfd_config driver_config = {
-		.common = {.max_bitrate = 1000000, .bitrate = 500000},
+		.common = {.max_bitrate = 8000000, .bitrate = config->bit_timing.bitrate,
+			   .bitrate_data = config->bit_timing_data.bitrate},
 		.bus = {.bus = &node->dev, .device = node->spi},
 		.int_gpio_dt = {.pin = config->io_cfg.int_gpio, .dt_flags = GPIO_ACTIVE_LOW | GPIO_PULL_UP},
 		.osc_freq = config->oscillator_hz,

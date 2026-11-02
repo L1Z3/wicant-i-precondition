@@ -56,7 +56,7 @@ enum bus_state
 
 typedef struct {
 	twai_frame_t frame;
-	uint8_t data[TWAI_FRAME_MAX_LEN];
+	uint8_t data[CAN_FD_MAX_DATA];
 	int64_t queued_us;	// when can_send() claimed the slot, for stall detection
 	int8_t wire_slot;	// our own frame's wire_tx slot to restamp when sent, or -1
 } can_tx_slot_t;
@@ -66,6 +66,11 @@ typedef struct {
 	can_bus_t bus;
 	int64_t us;		// received (from the driver), for the shared-wire guard
 } can_rx_item_t;
+
+typedef struct {
+	can_fd_message_t msg;
+	can_bus_t bus;
+} can_fd_rx_item_t;
 
 // Indexed by the CAN_5K..CAN_1000K rate codes in can.h
 static const uint32_t can_bitrate_bps[] = {
@@ -83,8 +88,11 @@ static SemaphoreHandle_t node_lock[CAN_BUS_COUNT];
 // holding node_lock across it. can_disable() takes this before node_lock, so
 // an in-flight send can never outlive its node.
 static SemaphoreHandle_t tx_lock[CAN_BUS_COUNT];
-// One queue shared by all buses; can_receive() returns the bus tag.
+// One classic queue shared by all buses; can_receive() returns the bus tag.
 static QueueHandle_t can_rx_queue = NULL;
+// FD frames are host-only (no forwarding/preconditioning), so they get a
+// separate queue and never enter can_rx_queue.
+static QueueHandle_t can_fd_rx_queue = NULL;
 // Per-bus "enabled" bits (BIT(bus)). These are state flags, not events:
 // set by can_enable(), cleared by can_disable(), never consumed by waiters.
 // can_receive() parks on wait-any until some bus is up (keeps can_rx_task
@@ -104,6 +112,13 @@ static EventGroupHandle_t s_can_event_group = NULL;
 // absorption at 500 kbit/s -- the legacy 8-deep queue (~2 ms) overflowed on
 // ordinary vehicle-bus burst clusters.
 #define CAN_TX_SLOT_COUNT	32
+#if HW_HAS_MCP2518FD
+// The MCP2518FD's 2 KB message RAM holds 8 TX + 8 RX FD objects. (The
+// Zephyr driver's queue depth is compile-time; see compat/autoconf.h.)
+#define CAN_BUS1_TX_SLOTS	8
+#else
+#define CAN_BUS1_TX_SLOTS	CAN_TX_SLOT_COUNT
+#endif
 static can_tx_slot_t tx_slot[CAN_BUS_COUNT][CAN_TX_SLOT_COUNT];
 // Counting semaphore whose count == number of free TX slots
 // can_send() takes it with the caller's timeout.
@@ -128,6 +143,10 @@ static int64_t rx_drop_log_us[CAN_BUS_COUNT];
 static uint32_t rx_overflow_logged;
 static int64_t rx_overflow_log_us;
 #endif
+// FD frames lost because the host-only FD queue was full.
+static volatile uint32_t fd_rx_drop_count[CAN_BUS_COUNT];
+static uint32_t fd_rx_drop_logged[CAN_BUS_COUNT];
+static int64_t fd_rx_drop_log_us[CAN_BUS_COUNT];
 // Frames bus 0's controller lost to a full RX FIFO, counted in
 // __wrap_twai_hal_read_rx_fifo() and logged like the above
 static volatile uint32_t bus0_rx_overruns;
@@ -290,12 +309,13 @@ static CAN_ISR_ATTR bool can_on_rx_done(twai_node_handle_t handle, const twai_rx
 {
 	(void)edata;
 	// Bus id was registered as the callback's user_ctx in can_enable()
-	can_rx_item_t item = { .bus = (can_bus_t)(uintptr_t)user_ctx, .us = esp_timer_get_time() };
-	// Point the driver's output buffer directly at the queue item's payload
-	// array, so the data lands in its final place with no second copy
+	can_bus_t bus = (can_bus_t)(uintptr_t)user_ctx;
+	uint8_t rx_data[CAN_FD_MAX_DATA];
+	// Read into a 64-byte scratch buffer; the frame's FDF flag tells us
+	// whether to enqueue it as classic or FD after the read.
 	twai_frame_t rx_frame = {
-		.buffer = item.msg.data,
-		.buffer_len = sizeof(item.msg.data),
+		.buffer = rx_data,
+		.buffer_len = sizeof(rx_data),
 	};
 
 	// Only legal inside this callback; pulls the pending frame from hardware
@@ -304,6 +324,33 @@ static CAN_ISR_ATTR bool can_on_rx_done(twai_node_handle_t handle, const twai_rx
 		return false;
 	}
 
+	BaseType_t task_woken = pdFALSE;
+	if (rx_frame.header.fdf)
+	{
+		can_fd_rx_item_t fd_item = { .bus = bus };
+		fd_item.msg.id = rx_frame.header.id;
+		fd_item.msg.dlc = (rx_frame.header.dlc > CAN_FD_MAX_DLC) ? CAN_FD_MAX_DLC : rx_frame.header.dlc;
+		fd_item.msg.flags = (rx_frame.header.ide ? CAN_FD_FLAG_IDE : 0) |
+				    (rx_frame.header.brs ? CAN_FD_FLAG_BRS : 0) |
+				    (rx_frame.header.esi ? CAN_FD_FLAG_ESI : 0);
+		size_t len = can_fd_dlc_to_len(fd_item.msg.dlc);
+		if (len > rx_frame.buffer_len)
+		{
+			len = rx_frame.buffer_len;
+		}
+		memcpy(fd_item.msg.data, rx_data, len);
+		BaseType_t sent = xPortInIsrContext()
+			? xQueueSendFromISR(can_fd_rx_queue, &fd_item, &task_woken)
+			: xQueueSend(can_fd_rx_queue, &fd_item, 0);
+		if (sent != pdTRUE)
+		{
+			fd_rx_drop_count[bus]++;
+		}
+		return (task_woken == pdTRUE);
+	}
+
+	// Stamp the arrival: the MITM wire guard compares arrival timestamps
+	can_rx_item_t item = { .bus = bus, .us = esp_timer_get_time() };
 	// Convert new twai_frame_t api that the MCP2515 driver uses to the legacy
 	// twai_message_t that the rest of the firmware uses.
 	// ss/self have no equivalent in the twai_frame_t api
@@ -311,14 +358,15 @@ static CAN_ISR_ATTR bool can_on_rx_done(twai_node_handle_t handle, const twai_rx
 	item.msg.identifier = rx_frame.header.id;
 	item.msg.extd = rx_frame.header.ide;
 	item.msg.rtr = rx_frame.header.rtr;
-	// For classic CAN, dlc==len. This will need to be updated if we ever support FD
+	// For classic CAN, dlc==len.
 	item.msg.data_length_code =
 			(rx_frame.header.dlc > TWAI_FRAME_MAX_DLC) ? TWAI_FRAME_MAX_DLC : rx_frame.header.dlc;
+	memcpy(item.msg.data, rx_data,
+	       item.msg.rtr ? 0 : item.msg.data_length_code);
 
 	// Queue full = frame dropped: count it here, log it from task context
 	// task_woken -> tell the driver to context-switch on ISR exit if this
 	// send unblocked a higher-priority task (i.e. can_rx_task).
-	BaseType_t task_woken = pdFALSE;
 	BaseType_t sent = xPortInIsrContext() ? xQueueSendFromISR(can_rx_queue, &item, &task_woken)
 										  : xQueueSend(can_rx_queue, &item, 0);
 	if (sent != pdTRUE)
@@ -565,6 +613,11 @@ static void can_recovery_task(void *arg)
 	}
 }
 
+static inline int can_tx_slot_limit(can_bus_t bus)
+{
+	return bus == CAN_BUS_1 ? CAN_BUS1_TX_SLOTS : CAN_TX_SLOT_COUNT;
+}
+
 // Reset TX slot accounting to "all free". Only call with the bus node torn
 // down (or never created).
 static void can_tx_slots_reset(can_bus_t bus)
@@ -573,10 +626,12 @@ static void can_tx_slots_reset(can_bus_t bus)
 	tx_slot_used[bus] = 0;
 	portEXIT_CRITICAL(&tx_slot_mux);
 	bus_err_passive[bus] = false;
-	// Frames still queued in the driver at disable time are dropped without 
+	// Frames still queued in the driver at disable time are dropped without
 	// an on_tx_done callback, so the semaphore must be refilled by hand.
-	while (xSemaphoreGive(tx_slot_sem[bus]) == pdTRUE)
+	int limit = can_tx_slot_limit(bus);
+	for (int i = 0; i < limit; i++)
 	{
+		xSemaphoreGive(tx_slot_sem[bus]);
 	}
 }
 
@@ -694,7 +749,7 @@ static esp_err_t can_bus1_create_node(void)
 		// MCP2515 hardware supports exactly -1 (auto retry) / 0 (one-shot)
 		.fail_retry_cnt = can_cfg[CAN_BUS_1].auto_tx ? -1 : 0,
 		.timestamp_resolution_hz = 0,
-		.tx_queue_depth = CAN_TX_SLOT_COUNT,
+		.tx_queue_depth = CAN_BUS1_TX_SLOTS,
 		.flags = {
 			// MCP2515 loopback is internal (no ACK needed)
 			.enable_loopback = can_cfg[CAN_BUS_1].loopback ? 1 : 0,
@@ -769,10 +824,15 @@ static esp_err_t can_bus1_create_node(void)
 			.bitrate = can_bitrate_bps[can_cfg[CAN_BUS_1].rate],
 			.sp_permill = CAN_SAMPLE_POINT_PERMILL,
 		},
+		.bit_timing_data = {
+			.bitrate = can_cfg[CAN_BUS_1].fd_data_rate,
+			.sp_permill = CAN_SAMPLE_POINT_PERMILL,
+		},
 		.flags = {
 			// External loopback: frames also go out on the bus
 			.enable_loopback = can_cfg[CAN_BUS_1].loopback ? 1 : 0,
 			.enable_listen_only = can_cfg[CAN_BUS_1].silent ? 1 : 0,
+			.enable_fd = can_cfg[CAN_BUS_1].fd_enabled ? 1 : 0,
 		},
 	};
 
@@ -897,9 +957,15 @@ void can_enable(can_bus_t bus)
 		// enable, so this bus's own first frames survive. The other bus's
 		// bit is read without its lock: a race only drops a few frames as
 		// the old unconditional flush did, or keeps a few ms-old ones.
+		// The FD stream is host-only, so it has no other bus to protect:
+		// clear it with the classic queue when every bus was down.
 		if (!(xEventGroupGetBits(s_can_event_group) & CAN_ENABLE_BIT_ANY))
 		{
 			xQueueReset(can_rx_queue);
+			if (can_fd_rx_queue != NULL)
+			{
+				xQueueReset(can_fd_rx_queue);
+			}
 		}
 		// The new node starts in the active state; do not inherit a stale
 		// error state from the previous node (recovery), or forwarding could
@@ -1142,6 +1208,71 @@ uint8_t can_get_bitrate(can_bus_t bus)
 	return can_cfg[bus].rate;
 }
 
+// CAN-FD is bus-1-only and latched into the node at the next can_enable().
+// Values are raw bits/second so GVRET's SETUP_FD can pass through whatever
+// data rate the host negotiated.
+void can_set_fd(can_bus_t bus, uint8_t enabled, uint32_t data_rate)
+{
+	if (bus != CAN_BUS_1 || can_cfg[bus].bus_state == ON_BUS)
+	{
+		return;
+	}
+	if (data_rate < 100000 || data_rate > 8000000)
+	{
+		data_rate = 2000000;
+	}
+	can_cfg[bus].fd_enabled = enabled ? 1 : 0;
+	can_cfg[bus].fd_data_rate = data_rate;
+}
+
+bool can_is_fd_enabled(can_bus_t bus)
+{
+	return bus == CAN_BUS_1 && can_cfg[bus].fd_enabled;
+}
+
+uint32_t can_get_fd_bitrate(can_bus_t bus)
+{
+	if (bus != CAN_BUS_1)
+	{
+		return 0;
+	}
+	return can_cfg[bus].fd_data_rate;
+}
+
+uint8_t can_fd_dlc_to_len(uint8_t dlc)
+{
+	if (dlc <= 8)
+	{
+		return dlc;
+	}
+	switch (dlc)
+	{
+	case 9: return 12;
+	case 10: return 16;
+	case 11: return 20;
+	case 12: return 24;
+	case 13: return 32;
+	case 14: return 48;
+	case 15: return 64;
+	default: return 64;
+	}
+}
+
+uint8_t can_fd_len_to_dlc(uint8_t len)
+{
+	if (len <= 8)
+	{
+		return len;
+	}
+	if (len <= 12) return 9;
+	if (len <= 16) return 10;
+	if (len <= 20) return 11;
+	if (len <= 24) return 12;
+	if (len <= 32) return 13;
+	if (len <= 48) return 14;
+	return 15;
+}
+
 // One-time OS-resource setup; touches no hardware (per-bus bring-up is
 // can_enable()). Idempotent so a stray second call can't leak the handles.
 void can_init(void)
@@ -1156,17 +1287,22 @@ void can_init(void)
 	// delivers ~4 frames/ms, so 256 rides out multi-ms scheduling stalls of
 	// can_rx_task under TCP streaming load instead of silently dropping RX.
 	can_rx_queue = xQueueCreate(256, sizeof(can_rx_item_t));
+	// FD is host-only; 32 frames is enough to absorb a GVRET/TCP scheduling
+	// stall without competing with the classic path for queue depth.
+	can_fd_rx_queue = xQueueCreate(32, sizeof(can_fd_rx_item_t));
 	xTaskCreate(can_recovery_task, "can_recovery", 3072, NULL, 6, &can_recovery_task_handle);
 
 	for (int bus = 0; bus < CAN_BUS_COUNT; bus++)
 	{
 		node_lock[bus] = xSemaphoreCreateMutex();
 		tx_lock[bus] = xSemaphoreCreateMutex();
-		tx_slot_sem[bus] = xSemaphoreCreateCounting(CAN_TX_SLOT_COUNT, CAN_TX_SLOT_COUNT);
+		tx_slot_sem[bus] = xSemaphoreCreateCounting(can_tx_slot_limit((can_bus_t)bus),
+							    can_tx_slot_limit((can_bus_t)bus));
 		can_cfg[bus] = (can_cfg_t){
 			.bus_state = OFF_BUS,
 			.auto_tx = 1,
 			.rate = CAN_500K,
+			.fd_data_rate = 2000000,
 			.filter = 0,
 			.mask = 0xFFFFFFFF,
 		};
@@ -1388,26 +1524,72 @@ bool can_bridge_shared_wire(void)
 	return wire_shared;
 }
 
-static esp_err_t can_send_frame(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_wait, bool ours);
+static esp_err_t can_send_frame(can_bus_t bus, const twai_frame_header_t *header,
+				const uint8_t *data, size_t buffer_len, TickType_t ticks_to_wait,
+				bool ours);
+
+// Pop the next CAN-FD frame from the host-only queue; *bus reports the
+// source. This path deliberately bypasses forwarding and preconditioning.
+esp_err_t can_receive_fd(can_fd_message_t *message, can_bus_t *bus, TickType_t ticks_to_wait)
+{
+	if (s_can_event_group == NULL || can_fd_rx_queue == NULL)
+	{
+		return ESP_ERR_INVALID_STATE;
+	}
+
+	xEventGroupWaitBits(s_can_event_group, CAN_ENABLE_BIT_ANY, pdFALSE, pdFALSE, portMAX_DELAY);
+
+	for (int b = 0; b < CAN_BUS_COUNT; b++)
+	{
+		uint32_t dropped = fd_rx_drop_count[b];
+		if (dropped != fd_rx_drop_logged[b])
+		{
+			int64_t now = esp_timer_get_time();
+			if (now - fd_rx_drop_log_us[b] > 1000000)
+			{
+				fd_rx_drop_log_us[b] = now;
+				fd_rx_drop_logged[b] = dropped;
+				ESP_LOGW(TAG, "bus %d: fd rx queue full, %lu frames dropped total", b, dropped);
+			}
+		}
+	}
+
+	can_fd_rx_item_t item;
+	if (xQueueReceive(can_fd_rx_queue, &item, ticks_to_wait) != pdTRUE)
+	{
+		return ESP_ERR_TIMEOUT;
+	}
+
+	*message = item.msg;
+	if (bus != NULL)
+	{
+		*bus = item.bus;
+	}
+	return ESP_OK;
+}
 
 // Queue a frame for transmission. Fire-and-forget: the message is copied
 // into a pool slot the driver transmits from later, so ticks_to_wait is
 // spent waiting for a free slot--not for the frame to reach the wire.
-esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_wait)
+static esp_err_t can_send_frame(can_bus_t bus, const twai_frame_header_t *header,
+				const uint8_t *data, size_t buffer_len, TickType_t ticks_to_wait,
+				bool ours)
 {
-	return can_send_frame(bus, message, ticks_to_wait, true);
-}
-
-esp_err_t can_bridge_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_wait)
-{
-	return can_send_frame(bus, message, ticks_to_wait, false);
-}
-
-static esp_err_t can_send_frame(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_wait, bool ours)
-{
-	if (bus >= CAN_BUS_COUNT || s_can_event_group == NULL)
+	if (bus >= CAN_BUS_COUNT || s_can_event_group == NULL || header == NULL)
 	{
 		return ESP_ERR_INVALID_STATE;
+	}
+	if (header->fdf && (bus != CAN_BUS_1 || !can_cfg[bus].fd_enabled))
+	{
+		return ESP_ERR_NOT_SUPPORTED;
+	}
+	size_t max_len = header->fdf ? CAN_FD_MAX_DATA : TWAI_FRAME_MAX_LEN;
+	uint8_t max_dlc = header->fdf ? CAN_FD_MAX_DLC : TWAI_FRAME_MAX_DLC;
+	size_t expected_len = header->rtr ? 0 : (header->fdf ? can_fd_dlc_to_len(header->dlc) : header->dlc);
+	if (header->dlc > max_dlc || buffer_len > max_len || expected_len != buffer_len ||
+	    (header->fdf && header->rtr) || (buffer_len && data == NULL))
+	{
+		return ESP_ERR_INVALID_ARG;
 	}
 
 	// Advisory fast-fail so "bus not open" returns instantly without
@@ -1489,31 +1671,39 @@ static esp_err_t can_send_frame(can_bus_t bus, twai_message_t *message, TickType
 		return ESP_ERR_TIMEOUT;
 	}
 
-	// Copy legacy twai_message_t -> the slot's stable twai_frame_t + data
-	// (the driver only keeps a pointer, hence the copy into pool storage).
-	// RTR frames carry no payload: buffer_len must be 0 or the driver
-	// rejects the dlc/len mismatch. ss/self have no node-API equivalent.
-	uint8_t dlc = (message->data_length_code > TWAI_FRAME_MAX_DLC)
-					  ? TWAI_FRAME_MAX_DLC : message->data_length_code;
+	// Copy the caller's header and payload into the slot's stable storage
+	// (the driver only keeps pointers until the transfer completes).
 	memset(&slot->frame, 0, sizeof(slot->frame));
-	slot->frame.header.id = message->identifier;
-	slot->frame.header.dlc = dlc;
-	slot->frame.header.ide = message->extd;
-	slot->frame.header.rtr = message->rtr;
-	memcpy(slot->data, message->data, dlc);
+	slot->frame.header = *header;
+	slot->frame.header.dlc = header->dlc;
+	if (buffer_len)
+	{
+		memcpy(slot->data, data, buffer_len);
+	}
 	slot->frame.buffer = slot->data;
-	slot->frame.buffer_len = message->rtr ? 0 : dlc;
+	slot->frame.buffer_len = buffer_len;
 	slot->wire_slot = -1;
 #if CAN_BUS_COUNT > 1
-	if (ours && bridge_locked && !wire_shared)
+	if (ours && bridge_locked && !wire_shared && !header->fdf)
 	{
-		// RTR frames carry no payload and go in with dlc 0, so they match the
-		// way can_bridge_check() hashes and compares arrivals
-		uint8_t wire_dlc = message->rtr ? 0 : dlc;
-		uint32_t wslot = wire_slot(message, wire_dlc);
+		// Classic frames only. RTR frames carry no payload and go in with
+		// dlc 0, so they match the way can_bridge_check() hashes and
+		// compares arrivals.
+		twai_message_t wm = {
+			.identifier = header->id,
+			.extd = header->ide ? 1 : 0,
+			.rtr = header->rtr ? 1 : 0,
+			.data_length_code = header->dlc,
+		};
+		uint8_t wire_dlc = header->rtr ? 0 : header->dlc;
+		if (wire_dlc)
+		{
+			memcpy(wm.data, data, wire_dlc);
+		}
+		uint32_t wslot = wire_slot(&wm, wire_dlc);
 		slot->wire_slot = (int8_t)wslot;
 		portENTER_CRITICAL(&wire_tx_mux);
-		wire_store(&wire_tx[bus][wslot], message, wire_dlc, now);
+		wire_store(&wire_tx[bus][wslot], &wm, wire_dlc, now);
 		portEXIT_CRITICAL(&wire_tx_mux);
 	}
 #else
@@ -1545,6 +1735,69 @@ static esp_err_t can_send_frame(can_bus_t bus, twai_message_t *message, TickType
 
 	xSemaphoreGive(tx_lock[bus]);
 	return err;
+}
+
+esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_wait)
+{
+	if (message == NULL)
+	{
+		return ESP_ERR_INVALID_ARG;
+	}
+	twai_frame_header_t header = {
+		.id = message->identifier,
+		.dlc = (message->data_length_code > TWAI_FRAME_MAX_DLC)
+			       ? TWAI_FRAME_MAX_DLC : message->data_length_code,
+		.ide = message->extd,
+		.rtr = message->rtr,
+		.fdf = 0,
+		.brs = 0,
+		.esi = 0,
+	};
+	size_t len = message->rtr ? 0 : header.dlc;
+	return can_send_frame(bus, &header, message->data, len, ticks_to_wait, true);
+}
+
+// Forwarded frame: identical to can_send() except that the MITM wire guard
+// must not treat it as one of ours (its echo on the far bus is the frame the
+// guard is looking for, not a duplicate to suppress).
+esp_err_t can_bridge_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_wait)
+{
+	if (message == NULL)
+	{
+		return ESP_ERR_INVALID_ARG;
+	}
+	twai_frame_header_t header = {
+		.id = message->identifier,
+		.dlc = (message->data_length_code > TWAI_FRAME_MAX_DLC)
+			       ? TWAI_FRAME_MAX_DLC : message->data_length_code,
+		.ide = message->extd,
+		.rtr = message->rtr,
+		.fdf = 0,
+		.brs = 0,
+		.esi = 0,
+	};
+	size_t len = message->rtr ? 0 : header.dlc;
+	return can_send_frame(bus, &header, message->data, len, ticks_to_wait, false);
+}
+
+esp_err_t can_send_fd(can_bus_t bus, const can_fd_message_t *message, TickType_t ticks_to_wait)
+{
+	if (message == NULL)
+	{
+		return ESP_ERR_INVALID_ARG;
+	}
+	twai_frame_header_t header = {
+		.id = message->id,
+		.dlc = (message->dlc > CAN_FD_MAX_DLC) ? CAN_FD_MAX_DLC : message->dlc,
+		.ide = (message->flags & CAN_FD_FLAG_IDE) ? 1 : 0,
+		.rtr = 0,
+		.fdf = 1,
+		.brs = (message->flags & CAN_FD_FLAG_BRS) ? 1 : 0,
+		.esi = (message->flags & CAN_FD_FLAG_ESI) ? 1 : 0,
+	};
+	size_t len = can_fd_dlc_to_len(header.dlc);
+	// FD is host-only and never forwarded, so it never needs the wire guard.
+	return can_send_frame(bus, &header, message->data, len, ticks_to_wait, false);
 }
 
 bool can_is_enabled(can_bus_t bus)

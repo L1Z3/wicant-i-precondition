@@ -9,6 +9,8 @@
 // Implemented in can_common.c.
 int z_impl_can_calc_timing(const struct device *dev, struct can_timing *res, uint32_t bitrate,
 			   uint16_t sample_pnt);
+int z_impl_can_calc_timing_data(const struct device *dev, struct can_timing *res, uint32_t bitrate,
+				uint16_t sample_pnt);
 int z_impl_can_set_timing(const struct device *dev, const struct can_timing *timing);
 int z_impl_can_set_bitrate(const struct device *dev, uint32_t bitrate);
 int z_impl_can_send(const struct device *dev, const struct can_frame *frame, k_timeout_t timeout,
