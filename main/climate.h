@@ -1,47 +1,42 @@
-#ifndef __CLIMATE_H__
-#define __CLIMATE_H__
+#pragma once
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include "esp_err.h"
 #include "hsm.h"
 
-// Remote climate start (prototype, second-bus hardware only).
+// Remote commands off the head unit's own bus (M-CAN), replayed by the kit.
 //
-// Replays the head unit's own remote-climate activation on the car bus and
-// blocks the head unit's copies of the two frames that carry it while the
-// replay runs. Driven from the precondition machine's global hooks; the
-// sequence itself is single-writer on the precondition task.
+// The commands are the ones observed in the Dual_* captures: two climate
+// starts with extra functions, the plain climate start, the climate stop, and
+// the door lock/unlock. The charge-limit commands also live on M-CAN (0x4C5)
+// but are deliberately not implemented here.
 //
-// The replay follows the dual-bus capture of a real Bluelink press: the 0x4F1
-// wake burst, 0x4A2 request/apply, the optional 0x0C7 opcode, then eight
-// seconds of session frames. The head unit sends its 0x39B session heartbeat
-// on I-CAN only; this build sends it on the car bus as an experiment.
+// Every one of these commands opens a session on the head unit's second bus
+// (I-CAN) where the telematics unit emits 0x39B with a class byte: 0x01
+// lock/unlock, 0x02 charge limit, 0x03 climate. The car's command parameters
+// live on M-CAN, but a M-CAN-only replay of the climate start was ignored by
+// the car in every test so far, so which of these actually work without the
+// I-CAN session is exactly what these buttons are for.
 
-// Drive the sequence from the precondition machine's global tick hook.
-void climate_tick(void);
+// 0 = climate start, 1 = start + front defrost, 2 = start + rear/side
+// defrost, 3 = start + steering wheel heat, 4 = climate stop, 5 = lock,
+// 6 = unlock.
+esp_err_t climate_request_start(uint8_t command);
 
-// Block the head unit's 0x4A2/0x4F1 copies on their way to the car while a
-// request is queued or a sequence is running.
-fwd_result_t climate_fwd_hook(twai_message_t *msg, can_bus_t fwd_bus);
+uint8_t climate_command_count(void);
+const char *climate_command_label(uint8_t command);
 
-// Queue a remote climate start. Returns ESP_ERR_NOT_SUPPORTED on hardware
-// without the second bus and ESP_ERR_INVALID_STATE while one is already
-// running. Blocking starts as soon as this returns ESP_OK, not when the
-// precondition task picks the request up.
-esp_err_t climate_request_start(void);
-
-// Whether a start is queued or running; the web UI disables its button.
 bool climate_is_active(void);
 
-// Feed every received frame in so the module can log what the car answers.
-// Cheap for the frames it does not track, safe to call from the CAN task.
+// Called from the precondition tick (40 ms) and from the CAN receive path.
+void climate_tick(void);
 void climate_rx_hook(const twai_message_t *msg, can_bus_t rx_bus);
 
-// One line for the Status tab: what the replay is doing and the last frame
-// that looked like a response, e.g.
-//   "idle; 0x4EB 80 hu +1.2 s"
-// Returns false on hardware without the second bus (nothing is written then).
-bool climate_get_status(char *out, size_t len);
+// Blocks the head unit's copies of the command frames while a replay runs, so
+// the car sees one command and not two interleaved ones.
+fwd_result_t climate_fwd_hook(twai_message_t *msg, can_bus_t fwd_bus);
 
-#endif
+// One line for the Status tab: phase plus the last frame the car answered with.
+bool climate_get_status(char *out, size_t len);

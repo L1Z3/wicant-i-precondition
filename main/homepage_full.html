@@ -1428,10 +1428,22 @@
                     </td>
                 </tr>
                 <tr class="can1_row" style="display:none">
-                    <td>Start Remote Climate:</td>
+                    <td>Remote Commands:</td>
                     <td>
-                        <input id="remote_climate_button" name="remote_climate_button" type="button"
-                            onclick="remoteClimateStart()" value="Start Climate" />
+                        <input id="remote_command_0" name="remote_command_0" type="button"
+                            onclick="remoteCommand(0)" title="Climate start, exactly as the head unit sends it" value="Climate" />
+                        <input id="remote_command_1" name="remote_command_1" type="button"
+                            onclick="remoteCommand(1)" title="Climate start with front defrost" value="+Front" />
+                        <input id="remote_command_2" name="remote_command_2" type="button"
+                            onclick="remoteCommand(2)" title="Climate start with rear/side defrost" value="+Rear" />
+                        <input id="remote_command_3" name="remote_command_3" type="button"
+                            onclick="remoteCommand(3)" title="Climate start with steering wheel heat" value="+Wheel" />
+                        <input id="remote_command_4" name="remote_command_4" type="button"
+                            onclick="remoteCommand(4)" title="Climate stop" value="Stop" />
+                        <input id="remote_command_5" name="remote_command_5" type="button"
+                            onclick="remoteCommand(5)" title="Door lock" value="Lock" />
+                        <input id="remote_command_6" name="remote_command_6" type="button"
+                            onclick="remoteCommand(6)" title="Door unlock" value="Unlock" />
                     </td>
                 </tr>
                 <tr>
@@ -2733,12 +2745,8 @@ function loadAutoTable(jsonData) {
 			// doing and the last frame that looked like the car answering
 			document.getElementById("remote_climate_status").textContent =
 				obj.remote_climate_status || "Not available";
-			// hidden on single-bus boards, and disabled while it runs
-			const climateButton = document.getElementById("remote_climate_button");
-			if (climateButton) {
-				climateButton.disabled = !!obj.remote_climate_active;
-				climateButton.value = obj.remote_climate_active ? "Starting..." : "Start Climate";
-			}
+			// hidden on single-bus boards, and disabled while one runs
+			setRemoteCommandButtonsDisabled(!!obj.remote_climate_active);
 			// car identified from CAN; the button filter uses it when the
 			// vehicle setting is "auto"
 			const carSelect = document.getElementById("egmp_car_model");
@@ -3123,23 +3131,35 @@ function loadAutoTable(jsonData) {
 		xhttp.send();
 	}
 
-	// Remote climate prototype: the device replays the head unit's own
-	// activation sequence and blocks the head unit's copies while it runs.
-	function remoteClimateStart() {
-		const button = document.getElementById("remote_climate_button");
+	// Remote command prototype: the device replays one of the head unit's own
+	// sequences and blocks the head unit's copies while it runs.
+	const remoteCommandButtons = ["remote_command_0", "remote_command_1",
+		"remote_command_2", "remote_command_3", "remote_command_4",
+		"remote_command_5", "remote_command_6"];
+
+	function setRemoteCommandButtonsDisabled(disabled) {
+		for (const id of remoteCommandButtons) {
+			const button = document.getElementById(id);
+			if (button) {
+				button.disabled = disabled;
+			}
+		}
+	}
+
+	function remoteCommand(command) {
 		const xhttp = new XMLHttpRequest();
-		button.disabled = true;
+		setRemoteCommandButtonsDisabled(true);
 		xhttp.onload = function() {
             showNotification(this.responseText, "green");
             // the sequence takes a few seconds; checkStatus re-enables the
-            // button once the device reports it finished
+            // buttons once the device reports it finished
             setTimeout(checkStatus, 200);
 		};
         xhttp.onerror = function() {
-            button.disabled = false;
-            showNotification("Failed to start remote climate", "red");
+            setRemoteCommandButtonsDisabled(false);
+            showNotification("Failed to send the remote command", "red");
         };
-		xhttp.open("POST", "/precondition_climate_start");
+		xhttp.open("POST", "/precondition_climate_start?c=" + command);
 		xhttp.send();
 	}
 

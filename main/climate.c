@@ -14,48 +14,60 @@
 
 // ********************* what the head unit sends *********************
 //
-// Reverse-engineered from a real Bluelink press, logged on M-CAN while the
-// head unit's second bus (I-CAN) was captured in parallel:
+// Reverse-engineered from real Bluelink presses, logged on M-CAN with the head
+// unit's second bus (I-CAN) captured in parallel:
 //
-//   WiCAN_MITM/Dual_M-CAN_MITM_I-CAN_parallel_climate_start_stop.csv
+//   WiCAN_MITM/Dual_M-CAN_MITM_I-CAN_parallel_*.csv
 //
-// A remote climate start is:
+// Every remote command looks the same on M-CAN:
 //
-//   t+0.000s  0x4F1  00 D0 00 00 00 00 00 00   wake/session bit, x3
-//   t+1.036s  0x4A2  00 00 0F 03 00 00 00 00   request (climate), x3
-//   t+1.160s  0x4A2  00 00 FF 03 FF FF 00 00   apply, x3
-//             0x0C7  00 00 00 01 00 00 00 00   climate opcode, x3, paired
-//   t+1.272s  0x0C7  00 00 00 00 00 00 00 00   trailer, x3
-//   ...       0x4F1  00 D0 ...                held for ~8 s at 1 Hz
-//   t+8.100s  0x4F1  00 C0 ...                session closed, x3
+//   t+0.000s  0x4F1  00 D0 00 00 00 00 00 00   session bit, x3
+//   t+1.03s   0x4A2  <request payload>        request, x3
+//   t+1.15s   0x4A2  <apply payload>          apply, x3
+//             0x0C7  00 00 00 01 00 00 00 00   remote command opcode, x3
+//   t+1.27s   0x0C7  00 00 00 00 00 00 00 00   trailer, x3
+//   ...       0x4F1  00 D0 ...                held ~8 s at 1 Hz
+//   t+8.10s   0x4F1  00 C0 ...                session closed, x3
 //
-// The car answers ~0.6 s after the apply burst: 0x2AD moves to its running
-// state and 0x380 becomes 3A 85 00 06 06 06 06 01 (DATC up), then 0x037
-// reports the HV system engaged. The stop direction carries no 0x4A2 at all,
-// just 0x4F1 00 D0 and the car dropping out of the running state.
+// The 0x4A2 payload carries the command:
 //
-// 0x0C7 byte 3 = 0x01 is optional: one press sent it, two others did not and
-// still started climate. It is replayed here because the dual-bus capture has
-// it, and its effect (if any) is unknown.
+//   start             00 00 0F 03 00 00 00 00  -> 00 00 FF 03 FF FF 00 00
+//   + front defrost   00 00 0F C3 00 00 F0 00  -> 00 00 FF C3 FF FF F0 00
+//   + rear/side       00 00 7F C3 00 00 F0 00  -> 00 00 FF C3 FF FF F0 00
+//   + steering heat   00 00 DF C3 00 00 F0 00  -> 00 00 FF C3 FF FF F0 00
+//   lock              00 00 F3 43 00 00 C0 00  -> 00 00 F3 C3 00 00 40 00
+//   unlock            00 00 F3 43 00 00 C0 00  -> 00 00 F3 C3 00 00 D0 00
+//
+// The car answers ~0.6-1.2 s later: 0x2AD moves to its running state, 0x380
+// becomes 3A 85 00 06 06 06 06 01 (DATC up) and 0x037 reports the HV system
+// engaged. The stop direction carries no 0x4A2 at all, just 0x4F1 00 D0.
+//
+// 0x0C7 byte 3 = 0x01 is optional: some presses sent it, others did not and
+// still started climate. It is replayed here because most captures have it.
 //
 // The head unit's second bus carries the session heartbeat 0x39B
 // (`50 06 00 XX 00 03 10 00`, XX counting 00, 04 .. 3C at 2 Hz, byte 0 = 0x50
-// while running, 0x40 as it closes). It is not transmitted on M-CAN. This
-// build sends it on M-CAN anyway: if anything on the car side listens for it
-// through the gateway, this is where it would show up, and if nothing does it
-// is six harmless bytes every 200 ms for eight seconds.
+// while climate runs, 0x40 as it closes, byte 5 = command class). It is not
+// transmitted on M-CAN. This build sends it on M-CAN anyway: if anything on
+// the car side listens for it through the gateway, this is where it would show
+// up, and if nothing does it is a few harmless bytes every 200 ms.
 //
 // None of these frames carries authentication, a counter, or a seed/key
 // exchange: 0x4A2 bytes 0-1 are 0x00 in every payload ever captured, the
 // payloads are byte-identical across model years and head units, and no 0x7xx
-// diagnostic traffic appears in any remote-climate capture. The three-frame
+// diagnostic traffic appears in any remote-command capture. The three-frame
 // repetition is the same latch the 0x0C7 preconditioning commands use.
 //
-// ********************* what the car answers *********************
+// ********************* why there are several buttons *********************
 //
-// The captures also show which frames move when the car accepts the request.
-// The Status tab reports the last one it sees, because none of them is
-// documented and their exact meaning is still being worked out:
+// The climate replay was tried byte-for-byte and the car ignored it, while the
+// head unit's own frames work. The captures show no difference on M-CAN, so
+// the suspicion is the I-CAN session: the telematics unit opens it before the
+// head unit sends its 0x4A2 burst. Lock and unlock are the interesting control
+// case, because their M-CAN request/apply payloads are identical and only the
+// follow-up state nibble differs (0x40 vs 0xD0).
+//
+// ********************* what the car answers *********************
 //
 //   0x037  byte 0          vehicle power state. 0x00 while off, 0x22/0x23 once
 //                          the HV system engages, which follows a successful
@@ -67,8 +79,8 @@
 //   0x4DD  byte 2          state bit. 0xFE -> 0x00 at the 0x4A2 apply.
 //   0x4EB  byte 4 bit 7    head unit's active flag.
 //   0x4A2  bytes 2..3      the request itself, seen on either bus.
-//   0x0C7  bytes 3..4      the climate opcode and its trailer, echoed back.
-//   0x4F1  byte 1          the wake bit, on while a remote session is open.
+//   0x0C7  bytes 3..4      the remote opcode and its trailer, echoed back.
+//   0x4F1  byte 1          the session bit, on while a remote session is open.
 //   0x39B  byte 0          I-CAN session heartbeat (not received on M-CAN).
 
 #define CLIMATE_CAR_BUS CAN_BUS_0
@@ -82,7 +94,7 @@
 // burst helper in precondition.c.
 #define CLIMATE_BURST_TICKS 3U
 
-// The head unit holds the wake bit for ~1.04 s before it sends 0x4A2.
+// The head unit holds the session bit for ~1.04 s before it sends 0x4A2.
 #define CLIMATE_WAKE_LEAD_TICKS 26U
 
 // 0x39B and 0x4DD run at 5 Hz during the session, 0x4F1 at 1 Hz.
@@ -99,6 +111,57 @@
 #define CLIMATE_SEQUENCE_TICKS (CLIMATE_SESSION_TICK + CLIMATE_SESSION_TICKS)
 #define CLIMATE_CLEAR_TICKS (CLIMATE_SEQUENCE_TICKS + CLIMATE_BURST_TICKS)
 
+// ********************* the command table *********************
+
+typedef struct {
+    const char *label;
+    // 0x39B byte 5: 0x01 lock/unlock, 0x03 climate.
+    uint8_t tmu_class;
+    // 0x39B byte 0 while the command is running: 0x50 climate, 0x40 closing,
+    // 0x00 for lock/unlock.
+    uint8_t tmu_state;
+    // Tick at which tmu_state replaces 0x00 in the heartbeat.
+    uint8_t state_tick;
+    bool send_request;
+    bool send_opcode;
+    uint8_t request[8];
+    uint8_t apply[8];
+} climate_command_t;
+
+#define CLIMATE_COMMAND_COUNT \
+    ((uint8_t)(sizeof(climate_commands) / sizeof(climate_commands[0])))
+
+static const climate_command_t climate_commands[] = {
+    {"start",
+     0x03U, 0x50U, (uint8_t)CLIMATE_WAKE_LEAD_TICKS + CLIMATE_BURST_TICKS, true, true,
+     {0x00U, 0x00U, 0x0FU, 0x03U, 0x00U, 0x00U, 0x00U, 0x00U},
+     {0x00U, 0x00U, 0xFFU, 0x03U, 0xFFU, 0xFFU, 0x00U, 0x00U}},
+    {"front defrost",
+     0x03U, 0x50U, (uint8_t)CLIMATE_WAKE_LEAD_TICKS + CLIMATE_BURST_TICKS, true, true,
+     {0x00U, 0x00U, 0x0FU, 0xC3U, 0x00U, 0x00U, 0xF0U, 0x00U},
+     {0x00U, 0x00U, 0xFFU, 0xC3U, 0xFFU, 0xFFU, 0xF0U, 0x00U}},
+    {"rear/side defrost",
+     0x03U, 0x50U, (uint8_t)CLIMATE_WAKE_LEAD_TICKS + CLIMATE_BURST_TICKS, true, true,
+     {0x00U, 0x00U, 0x7FU, 0xC3U, 0x00U, 0x00U, 0xF0U, 0x00U},
+     {0x00U, 0x00U, 0xFFU, 0xC3U, 0xFFU, 0xFFU, 0xF0U, 0x00U}},
+    {"steering wheel",
+     0x03U, 0x50U, (uint8_t)CLIMATE_WAKE_LEAD_TICKS + CLIMATE_BURST_TICKS, true, true,
+     {0x00U, 0x00U, 0xDFU, 0xC3U, 0x00U, 0x00U, 0xF0U, 0x00U},
+     {0x00U, 0x00U, 0xFFU, 0xC3U, 0xFFU, 0xFFU, 0xF0U, 0x00U}},
+    {"stop",
+     0x03U, 0x40U, (uint8_t)CLIMATE_WAKE_LEAD_TICKS, false, false,
+     {0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U},
+     {0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U}},
+    {"lock",
+     0x01U, 0x00U, (uint8_t)CLIMATE_WAKE_LEAD_TICKS + CLIMATE_BURST_TICKS, true, true,
+     {0x00U, 0x00U, 0xF3U, 0x43U, 0x00U, 0x00U, 0xC0U, 0x00U},
+     {0x00U, 0x00U, 0xF3U, 0xC3U, 0x00U, 0x00U, 0x40U, 0x00U}},
+    {"unlock",
+     0x01U, 0x00U, (uint8_t)CLIMATE_WAKE_LEAD_TICKS + CLIMATE_BURST_TICKS, true, true,
+     {0x00U, 0x00U, 0xF3U, 0x43U, 0x00U, 0x00U, 0xC0U, 0x00U},
+     {0x00U, 0x00U, 0xF3U, 0xC3U, 0x00U, 0x00U, 0xD0U, 0x00U}},
+};
+
 // ********************* sequence storage *********************
 
 typedef struct {
@@ -106,6 +169,7 @@ typedef struct {
     // Blocking keys off this too, so the request takes effect immediately.
     _Atomic bool requested;
     _Atomic bool active;
+    _Atomic uint8_t command;
     // Ticks since the sequence started; owned by the precondition task.
     _Atomic uint32_t tick;
     // Free-running 40 ms counter, so a received frame can be timestamped
@@ -134,10 +198,6 @@ static const uint8_t wake_data[8] = {0x00U, 0xD0U, 0x00U, 0x00U,
                                      0x00U, 0x00U, 0x00U, 0x00U};
 static const uint8_t idle_data[8] = {0x00U, 0xC0U, 0x00U, 0x00U,
                                      0x00U, 0x00U, 0x00U, 0x00U};
-static const uint8_t request_data[8] = {0x00U, 0x00U, 0x0FU, 0x03U,
-                                        0x00U, 0x00U, 0x00U, 0x00U};
-static const uint8_t apply_data[8] = {0x00U, 0x00U, 0xFFU, 0x03U,
-                                      0xFFU, 0xFFU, 0x00U, 0x00U};
 static const uint8_t opcode_data[8] = {0x00U, 0x00U, 0x00U, 0x01U,
                                        0x00U, 0x00U, 0x00U, 0x00U};
 static const uint8_t trailer_data[8] = {0x00U, 0x00U, 0x00U, 0x00U,
@@ -163,33 +223,22 @@ static void send_idle_frame(void) {
     send_climate_frame(CLIMATE_WAKE_FRAME_ID, idle_data);
 }
 
-static void send_request_frame(void) {
-    send_climate_frame(CLIMATE_REQUEST_FRAME_ID, request_data);
-}
-
-static void send_apply_frames(void) {
-    send_climate_frame(CLIMATE_REQUEST_FRAME_ID, apply_data);
-    send_climate_frame(CLIMATE_OPCODE_FRAME_ID, opcode_data);
-}
-
-static void send_trailer_frame(void) {
-    send_climate_frame(CLIMATE_OPCODE_FRAME_ID, trailer_data);
-}
-
 // The I-CAN session heartbeat, sent here on the car bus as an experiment.
-static void send_tmu_frame(bool running) {
-    uint8_t data[8] = {(uint8_t)(running ? 0x50U : 0x00U), 0x06U, 0x00U,
-                       climate.session_counter, 0x00U, 0x03U, 0x10U, 0x00U};
+static void send_tmu_frame(const climate_command_t *command, bool running) {
+    uint8_t data[8] = {(uint8_t)(running ? command->tmu_state : 0x00U), 0x06U,
+                       0x00U, climate.session_counter, 0x00U, command->tmu_class,
+                       0x10U, 0x00U};
     climate.session_counter = (uint8_t)((climate.session_counter + 4U) & 0x3FU);
     send_climate_frame(CLIMATE_TMU_FRAME_ID, data);
 }
 
 // Keeps the session alive: the heartbeat and the state frame at 5 Hz, the
-// wake bit at 1 Hz, on their own offsets inside a 200 ms period.
-static void send_session_frames(uint32_t tick, bool running) {
+// session bit at 1 Hz, on their own offsets inside a 200 ms period.
+static void send_session_frames(const climate_command_t *command, uint32_t tick) {
+    const bool running = tick >= command->state_tick;
     const uint32_t phase = tick % CLIMATE_SESSION_PERIOD_TICKS;
     if (phase == 3U) {
-        send_tmu_frame(running);
+        send_tmu_frame(command, running);
     } else if (phase == 4U) {
         send_climate_frame(0x4DDU, state_data);
     }
@@ -200,8 +249,8 @@ static void send_session_frames(uint32_t tick, bool running) {
 
 // ********************* response log *********************
 
-// Only a couple of bytes per frame say anything about climate; the rest is a
-// counter, a clock or a checksum. These are the ones seen moving in the
+// Only a couple of bytes per frame say anything about the command; the rest is
+// a counter, a clock or a checksum. These are the ones seen moving in the
 // captures (see the header comment).
 typedef struct {
     uint32_t id;
@@ -210,7 +259,7 @@ typedef struct {
 } climate_watch_t;
 
 static const climate_watch_t climate_watch[] = {
-    {CLIMATE_WAKE_FRAME_ID, 1U, 0U},      // wake bit, stay-alive byte
+    {CLIMATE_WAKE_FRAME_ID, 1U, 0U},      // session bit, stay-alive byte
     {CLIMATE_REQUEST_FRAME_ID, 2U, 3U},   // request mask, command byte
     {CLIMATE_OPCODE_FRAME_ID, 3U, 4U},    // opcode, its trailer
     {CLIMATE_TMU_FRAME_ID, 0U, 3U},       // I-CAN session heartbeat
@@ -302,33 +351,47 @@ void climate_tick(void) {
         atomic_store_explicit(&climate.start_tick, now, memory_order_relaxed);
         atomic_store_explicit(&climate.started, true, memory_order_relaxed);
         climate.session_counter = 0U;
-        ESP_LOGI(TAG, "remote climate start: replaying head unit sequence");
+        ESP_LOGI(TAG, "remote command: replaying %s",
+                 climate_commands[atomic_load_explicit(&climate.command,
+                                                       memory_order_relaxed)].label);
     }
+
+    const uint8_t index = atomic_load_explicit(&climate.command, memory_order_relaxed);
+    const climate_command_t *command = &climate_commands[index];
 
     const uint32_t tick = atomic_fetch_add_explicit(
         &climate.tick, 1U, memory_order_relaxed);
     if (tick < CLIMATE_BURST_TICKS) {
         send_wake_frame();
     } else if (tick < CLIMATE_WAKE_LEAD_TICKS) {
-        send_session_frames(tick, false);
+        send_session_frames(command, tick);
     } else if (tick < CLIMATE_WAKE_LEAD_TICKS + CLIMATE_BURST_TICKS) {
-        send_request_frame();
-        send_session_frames(tick, false);
+        if (command->send_request) {
+            send_climate_frame(CLIMATE_REQUEST_FRAME_ID, command->request);
+        }
+        send_session_frames(command, tick);
     } else if (tick < CLIMATE_WAKE_LEAD_TICKS + 2U * CLIMATE_BURST_TICKS) {
-        send_apply_frames();
-        send_session_frames(tick, true);
+        if (command->send_request) {
+            send_climate_frame(CLIMATE_REQUEST_FRAME_ID, command->apply);
+        }
+        if (command->send_opcode) {
+            send_climate_frame(CLIMATE_OPCODE_FRAME_ID, opcode_data);
+        }
+        send_session_frames(command, tick);
     } else if (tick < CLIMATE_SESSION_TICK) {
-        send_trailer_frame();
-        send_session_frames(tick, true);
+        if (command->send_opcode) {
+            send_climate_frame(CLIMATE_OPCODE_FRAME_ID, trailer_data);
+        }
+        send_session_frames(command, tick);
     } else if (tick < CLIMATE_SEQUENCE_TICKS) {
-        send_session_frames(tick, true);
+        send_session_frames(command, tick);
     } else if (tick < CLIMATE_CLEAR_TICKS) {
         // close the session the way the head unit does, so the car does not
         // think a remote request is still open
         send_idle_frame();
     } else {
         atomic_store_explicit(&climate.active, false, memory_order_relaxed);
-        ESP_LOGI(TAG, "remote climate start: sequence finished");
+        ESP_LOGI(TAG, "remote command: %s sequence finished", command->label);
     }
 }
 
@@ -338,24 +401,39 @@ fwd_result_t climate_fwd_hook(twai_message_t *msg, can_bus_t fwd_bus) {
     }
     if (msg->identifier == CLIMATE_REQUEST_FRAME_ID
             || msg->identifier == CLIMATE_WAKE_FRAME_ID) {
-        // The head unit starts the same remote climate on its own as soon as
+        // The head unit starts the same remote command on its own as soon as
         // the request reaches it; let only our replay through to the car.
         return FWD_BLOCK;
     }
     return FWD_PASSTHROUGH;
 }
 
-esp_err_t climate_request_start(void) {
+esp_err_t climate_request_start(uint8_t command) {
+    if (command >= CLIMATE_COMMAND_COUNT) {
+        return ESP_ERR_INVALID_ARG;
+    }
     // A request that is still waiting for the tick to pick it up counts as
-    // busy too: the UI disables its button on climate_is_active(), which is
+    // busy too: the UI disables its buttons on climate_is_active(), which is
     // exactly this condition.
     if (climate_blocking()) {
         return ESP_ERR_INVALID_STATE;
     }
     // Block the head unit's copies from here, before the precondition task
     // gets a chance to start the sequence.
+    atomic_store_explicit(&climate.command, command, memory_order_relaxed);
     atomic_store_explicit(&climate.requested, true, memory_order_relaxed);
     return ESP_OK;
+}
+
+uint8_t climate_command_count(void) {
+    return CLIMATE_COMMAND_COUNT;
+}
+
+const char *climate_command_label(uint8_t command) {
+    if (command >= CLIMATE_COMMAND_COUNT) {
+        return "unknown";
+    }
+    return climate_commands[command].label;
 }
 
 bool climate_is_active(void) {
@@ -373,19 +451,21 @@ bool climate_get_status(char *out, size_t len) {
     const bool started = atomic_load_explicit(&climate.started, memory_order_relaxed);
     const uint32_t start_tick = atomic_load_explicit(&climate.start_tick, memory_order_relaxed);
     const uint32_t tick = atomic_load_explicit(&climate.tick, memory_order_relaxed);
+    const char *label = climate_commands[atomic_load_explicit(
+        &climate.command, memory_order_relaxed)].label;
 
     // one tick is 40 ms, so tick * 4 / 10 is tenths of a second. The buffer
     // is sized for the worst case the compiler assumes (ten digits per %u),
     // not for the 8.3 s the sequence actually takes.
-    char phase[40];
+    char phase[48];
     if (active) {
         const uint32_t elapsed = tick * 4U / 10U;
         const uint32_t total = (uint32_t)CLIMATE_CLEAR_TICKS * 4U / 10U;
-        snprintf(phase, sizeof(phase), "replaying %u.%u/%u.%u s",
+        snprintf(phase, sizeof(phase), "replaying %s %u.%u/%u.%u s", label,
                  (unsigned)(elapsed / 10U), (unsigned)(elapsed % 10U),
                  (unsigned)(total / 10U), (unsigned)(total % 10U));
     } else if (queued) {
-        snprintf(phase, sizeof(phase), "queued");
+        snprintf(phase, sizeof(phase), "queued %s", label);
     } else {
         snprintf(phase, sizeof(phase), "idle");
     }
@@ -436,8 +516,18 @@ fwd_result_t climate_fwd_hook(twai_message_t *msg, can_bus_t fwd_bus) {
     return FWD_PASSTHROUGH;
 }
 
-esp_err_t climate_request_start(void) {
+esp_err_t climate_request_start(uint8_t command) {
+    (void)command;
     return ESP_ERR_NOT_SUPPORTED;
+}
+
+uint8_t climate_command_count(void) {
+    return 0U;
+}
+
+const char *climate_command_label(uint8_t command) {
+    (void)command;
+    return "unknown";
 }
 
 bool climate_is_active(void) {

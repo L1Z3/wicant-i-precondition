@@ -743,16 +743,32 @@ static esp_err_t precondition_toggle_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-// Remote climate prototype: replays the head unit's own activation sequence.
-// Always 200 like the preconditioning toggle; the body says what happened.
+// Remote command prototype: replays one of the head unit's own sequences.
+// The command index comes in as ?c=N, see climate.h for the list. Always 200
+// like the preconditioning toggle; the body says what happened.
 static esp_err_t precondition_climate_start_handler(httpd_req_t *req)
 {
-	const char *resp_str = "Remote climate start requested";
-	esp_err_t err = climate_request_start();
+	char query[24];
+	char value[8];
+	unsigned command = 0;
+	if (httpd_req_get_url_query_len(req) > 0
+			&& httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK
+			&& httpd_query_key_value(query, "c", value, sizeof(value)) == ESP_OK
+			&& value[0] >= '0' && value[0] <= '9') {
+		command = (unsigned)(value[0] - '0');
+	}
+
+	char resp_str[80];
+	esp_err_t err = climate_request_start((uint8_t)command);
 	if (err == ESP_ERR_NOT_SUPPORTED) {
-		resp_str = "Remote climate start needs the head-unit bus";
+		snprintf(resp_str, sizeof(resp_str), "Remote commands need the head-unit bus");
+	} else if (err == ESP_ERR_INVALID_ARG) {
+		snprintf(resp_str, sizeof(resp_str), "Unknown remote command %u", command);
 	} else if (err != ESP_OK) {
-		resp_str = "Remote climate start already running";
+		snprintf(resp_str, sizeof(resp_str), "Remote command already running");
+	} else {
+		snprintf(resp_str, sizeof(resp_str), "Remote command requested: %s",
+				 climate_command_label((uint8_t)command));
 	}
 	httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
 	return ESP_OK;
