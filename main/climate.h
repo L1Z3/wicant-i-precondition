@@ -12,6 +12,11 @@
 // blocks the head unit's copies of the two frames that carry it while the
 // replay runs. Driven from the precondition machine's global hooks; the
 // sequence itself is single-writer on the precondition task.
+//
+// The replay follows the dual-bus capture of a real Bluelink press: the 0x4F1
+// wake burst, 0x4A2 request/apply, the optional 0x0C7 opcode, then eight
+// seconds of session frames. The head unit sends its 0x39B session heartbeat
+// on I-CAN only; this build sends it on the car bus as an experiment.
 
 // Drive the sequence from the precondition machine's global tick hook.
 void climate_tick(void);
