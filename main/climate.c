@@ -226,6 +226,13 @@ typedef struct {
     uint8_t setpoint_raw;
     // CLIMATE_OPTION_* bits for a climate start, written with the setpoint.
     uint8_t options;
+    // Last climate state the car reported on 0x2AD: 0 unknown since the
+    // sequence started, 1 on, 2 off. A sequence that ends with the car
+    // disagreeing is retried once (see the end of climate_tick).
+    _Atomic uint8_t car_climate;
+    // Retries already spent on the running sequence.
+    uint8_t retries;
+
 } climate_state_t;
 
 static climate_state_t climate;
@@ -369,6 +376,9 @@ static void send_tmu_telegram(uint8_t tmu_class, uint8_t phase) {
 // Stop telegram schedule, in 40 ms ticks from the 0x4F1 00 D0 burst: a
 // class 0x01 phase 0x10 preamble, then class 0x03 phase 0x10, then the
 // class 0x03 phase 0x14 that the car applies.
+// How many times a command whose result the car contradicted is re-sent.
+#define CLIMATE_RETRIES 1U
+
 #define CLIMATE_STOP_PREAMBLE_TICK 5U
 #define CLIMATE_STOP_PREAMBLE_END 80U
 #define CLIMATE_STOP_CLIMATE_END 105U
@@ -464,10 +474,28 @@ static void log_event(uint32_t event) {
     }
 }
 
+// 0x2AD byte 0/1: 04 01 = climate on, 00 02 = off (byte 3 is a sub-state and
+// must not be part of the test).
+static void note_climate_state(const twai_message_t *msg) {
+    if (msg->identifier != 0x2ADU || msg->data_length_code < 2U) {
+        return;
+    }
+    uint8_t state = 0U;
+    if (msg->data[0] == 0x04U && msg->data[1] == 0x01U) {
+        state = 1U;
+    } else if (msg->data[0] == 0x00U && msg->data[1] == 0x02U) {
+        state = 2U;
+    }
+    if (state != 0U) {
+        atomic_store_explicit(&climate.car_climate, state, memory_order_relaxed);
+    }
+}
+
 void climate_rx_hook(const twai_message_t *msg, can_bus_t rx_bus) {
     if (msg == NULL || msg->data_length_code < 8U) {
         return;
     }
+    note_climate_state(msg);
     for (size_t i = 0; i < sizeof(climate_watch) / sizeof(climate_watch[0]); i++) {
         if (msg->identifier != climate_watch[i].id) {
             continue;
@@ -507,6 +535,8 @@ void climate_tick(void) {
         atomic_store_explicit(&climate.tick, 0U, memory_order_relaxed);
         atomic_store_explicit(&climate.start_tick, now, memory_order_relaxed);
         atomic_store_explicit(&climate.started, true, memory_order_relaxed);
+        atomic_store_explicit(&climate.car_climate, 0U, memory_order_relaxed);
+        climate.retries = 0U;
         climate.session_counter = 0U;
         ESP_LOGI(TAG, "remote command: replaying %s",
                  climate_commands[atomic_load_explicit(&climate.command,
@@ -578,6 +608,23 @@ void climate_tick(void) {
         // think a remote request is still open
         send_idle_frame();
     } else {
+        // The car answers 0x2AD on every bus, so if it told us a state during
+        // the run we can check the result: a start that left the climate off (or
+        // a stop that left it on) is retried once, which is what makes the
+        // command reliable in practice -- the first attempt after a long idle
+        // is sometimes ignored by the car.
+        const uint8_t reported = atomic_load_explicit(&climate.car_climate,
+                                                      memory_order_relaxed);
+        const uint8_t want = command->climate_start ? 1U : (command->tmu_off ? 2U : 0U);
+        if (want != 0U && reported != 0U && reported != want
+                && climate.retries < CLIMATE_RETRIES) {
+            climate.retries++;
+            ESP_LOGW(TAG, "remote command: %s not applied, retrying (%u)",
+                     command->label, (unsigned)climate.retries);
+            climate.tick = 0U;
+            atomic_store_explicit(&climate.car_climate, 0U, memory_order_relaxed);
+            return;
+        }
         atomic_store_explicit(&climate.active, false, memory_order_relaxed);
         ESP_LOGI(TAG, "remote command: %s sequence finished", command->label);
     }
