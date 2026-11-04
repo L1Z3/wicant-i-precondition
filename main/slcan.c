@@ -151,83 +151,117 @@ static uint8_t ascii_to_num(uint8_t a)
 	return x;
 }
 
+static uint8_t slcan_frame_index = 0;
+static uint8_t slcan_frame_id[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+static uint8_t slcan_frame_data = 0;
+static uint8_t slcan_frame_dlc = 0;
+static uint8_t slcan_frame_state = SL_FRAME_ID;
+
+// Forget a half-received frame. The idle reset in slcan_parse_str has to clear
+// this as well: it only reset the command parser, so a command that arrived
+// after a pause was fed into the tail of the abandoned frame and came out as a
+// bogus copy of the previous CAN frame instead of being sent.
+static void slcan_reset_frame(void)
+{
+	slcan_frame_index = 0;
+	slcan_frame_data = 0;
+	slcan_frame_dlc = 0;
+	slcan_frame_state = SL_FRAME_ID;
+	memset(slcan_frame_id, 0, sizeof(slcan_frame_id));
+}
+
 static uint8_t slcan_set_frame(uint8_t byte, twai_message_t *frame, uint8_t msg_type)
 {
-	static uint8_t index = 0;
-	static uint8_t id[8] = {0,0,0,0,0,0,0,0};
-	static uint8_t data = 0;
-	static uint8_t frame_state = SL_FRAME_ID;
-
-	switch(frame_state)
+	switch(slcan_frame_state)
 	{
 		case SL_FRAME_ID:
 		{
 			if(msg_type == SL_DATA_EXT || msg_type == SL_REMOTE_EXT)
 			{
-				id[index++] = ascii_to_num(byte);
+				slcan_frame_id[slcan_frame_index++] = ascii_to_num(byte);
 
-				if(index == 8)
+				if(slcan_frame_index == 8)
 				{
 					frame->extd = 1;
-					frame->identifier = (((id[6]<<4)+id[7]) & 0xFF) |
-							((((id[4]<<4)+id[5]) << 8) & 0x0000FF00) |
-							((((id[2]<<4)+id[3]) << 16) & 0x00FF0000) |
-							((((id[0]<<4)+id[1]) << 24) & 0xFF000000);
-					frame_state = SL_FRAME_DLC;
-					index = 0;
+					frame->identifier = (((slcan_frame_id[6]<<4)+slcan_frame_id[7]) & 0xFF) |
+							((((slcan_frame_id[4]<<4)+slcan_frame_id[5]) << 8) & 0x0000FF00) |
+							((((slcan_frame_id[2]<<4)+slcan_frame_id[3]) << 16) & 0x00FF0000) |
+							((((slcan_frame_id[0]<<4)+slcan_frame_id[1]) << 24) & 0xFF000000);
+					slcan_frame_state = SL_FRAME_DLC;
+					slcan_frame_index = 0;
 				}
 			}
 			else
 			{
-				id[index++] = ascii_to_num(byte);
+				slcan_frame_id[slcan_frame_index++] = ascii_to_num(byte);
 
-				if(index == 3)
+				if(slcan_frame_index == 3)
 				{
 					frame->extd = 0;
-					frame->identifier = (((id[1]<<4)+id[2]) & 0xFF) |
-							((id[0]<<8) & 0x00000F00) ;
-					frame_state = SL_FRAME_DLC;
-					index = 0;
+					frame->identifier = (((slcan_frame_id[1]<<4)+slcan_frame_id[2]) & 0xFF) |
+							((slcan_frame_id[0]<<8) & 0x00000F00) ;
+					slcan_frame_state = SL_FRAME_DLC;
+					slcan_frame_index = 0;
 				}
 			}
 			return 0;
 		}
 		case SL_FRAME_DLC:
 		{
-			frame->data_length_code = ascii_to_num(byte);
+			uint8_t dlc = ascii_to_num(byte);
 
-			if(msg_type == SL_REMOTE_STD || msg_type == SL_REMOTE_EXT)
+			// data[] holds 8 bytes and the body loop stops at dlc*2 nibbles, so a
+			// larger DLC walks past the end of the frame; a zero DLC never satisfies
+			// that test, leaving slcan_frame_index unbounded. Both are reachable
+			// from a malformed line, so drop the line instead.
+			if(dlc > 8)
 			{
-				frame_state = SL_FRAME_ID;
-				index = 0;
-				data = 0;
-				memset(id, 0,sizeof(id));
+				slcan_frame_state = SL_FRAME_ID;
+				slcan_frame_index = 0;
+				slcan_frame_data = 0;
+				memset(slcan_frame_id, 0,sizeof(slcan_frame_id));
+				return 2;
+			}
+
+			// Keep the DLC here rather than in the caller's frame: a command split
+			// across two calls resumes in SL_FRAME_DATA, and can_tx_task hands the
+			// parser an uninitialised twai_message_t on every iteration, so the
+			// frame being assembled cannot depend on it.
+			slcan_frame_dlc = dlc;
+
+			if(dlc == 0 || msg_type == SL_REMOTE_STD || msg_type == SL_REMOTE_EXT)
+			{
+				slcan_frame_state = SL_FRAME_ID;
+				slcan_frame_index = 0;
+				slcan_frame_data = 0;
+				memset(slcan_frame_id, 0,sizeof(slcan_frame_id));
 				return 1;
 			}
 
-			frame_state = SL_FRAME_DATA;
+			slcan_frame_state = SL_FRAME_DATA;
 			return 0;
 		}
 		case SL_FRAME_DATA:
 		{
 
-			if((index+1)%2)
+			if((slcan_frame_index+1)%2)
 			{
-				data = ascii_to_num(byte);
+				slcan_frame_data = ascii_to_num(byte);
 			}
 			else
 			{
-				frame->data[index/2] = (data<<4)+ascii_to_num(byte);
+				frame->data[slcan_frame_index/2] = (slcan_frame_data<<4)+ascii_to_num(byte);
 			}
 
-			index++;
+			slcan_frame_index++;
 
-			if(index == frame->data_length_code*2)
+			if(slcan_frame_index == slcan_frame_dlc*2)
 			{
-				frame_state = SL_FRAME_ID;
-				index = 0;
-				data = 0;
-				memset(id, 0,sizeof(id));
+				frame->data_length_code = slcan_frame_dlc;
+				slcan_frame_state = SL_FRAME_ID;
+				slcan_frame_index = 0;
+				slcan_frame_data = 0;
+				memset(slcan_frame_id, 0,sizeof(slcan_frame_id));
 				return 1;
 			}
 
@@ -268,6 +302,7 @@ char* slcan_parse_str(uint8_t *buf, uint8_t len, twai_message_t *frame, QueueHan
 		msg_index = 0;
 		refused = 0;
 		buffer_index = 0;
+		slcan_reset_frame();
 	}
 	for(i = 0; i < len; i++)
 	{
@@ -550,7 +585,18 @@ char* slcan_parse_str(uint8_t *buf, uint8_t len, twai_message_t *frame, QueueHan
 				}
 				else
 				{
-					if(slcan_set_frame(slcan_buffer[i], frame, cmd) == 0)
+					uint8_t frame_status = slcan_set_frame(slcan_buffer[i], frame, cmd);
+
+					if(frame_status == 2)
+					{
+						// Malformed frame header: skip the rest of the line rather
+						// than send a frame assembled from it.
+						cmd = SL_NONE;
+						state = SL_END;
+						break;
+					}
+
+					if(frame_status == 0)
 					{
 //						state = SL_END;
 						break;
