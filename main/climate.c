@@ -83,21 +83,32 @@
 //   0x4F1  byte 1          the session bit, on while a remote session is open.
 //   0x39B  byte 0          I-CAN session heartbeat (not received on M-CAN).
 
-#define CLIMATE_CAR_BUS CAN_BUS_0
+// Bus wiring of the test harness (2026-11-05): the .223 WiCAN has I-CAN on
+// bus 0 and M-CAN on bus 1. The commands (0x4F1/0x4A2/0x0C7) are M-CAN and the
+// telematics heartbeat (0x39B) is I-CAN, so the two halves go out on opposite
+// buses. Override either define at build time if the harness is wired the other
+// way round.
+#ifndef CLIMATE_MCAN_BUS
+#define CLIMATE_MCAN_BUS CAN_BUS_1
+#endif
+#ifndef CLIMATE_ICAN_BUS
+#define CLIMATE_ICAN_BUS CAN_BUS_0
+#endif
+#define CLIMATE_CAR_BUS CLIMATE_MCAN_BUS
+#define CLIMATE_TMU_BUS CLIMATE_ICAN_BUS
+
 
 #define CLIMATE_WAKE_FRAME_ID 0x4F1U
 #define CLIMATE_REQUEST_FRAME_ID 0x4A2U
 #define CLIMATE_OPCODE_FRAME_ID 0x0C7U
 #define CLIMATE_TMU_FRAME_ID 0x39BU
-#define CLIMATE_SETPOINT_FRAME_ID 0x2ACU
 
 // The car announces the cabin setpoint the way its own ECUs do: the telematics
 // frame 0x39B carries it in byte 1, the VCU re-broadcasts it on M-CAN in 0x2AC
 // byte 4, and the HVAC reports the applied value in 0x380 bytes 3..6 about
 // 1.7 s after 0x39B. All three use the same code, raw = 2T - 28, i.e.
 // 0x06 = 17.0 C, 0x10 = 22.0 C, 0x16 = 25.0 C (DBC: BO_ 923, BO_ 684, BO_ 896).
-// Every replay before this one sent 0x06 (17 C) whatever the request asked for,
-// and never sent 0x2AC at all.
+// Every replay before this one sent 0x06 (17 C) whatever the request asked for.
 
 // Every command is repeated three times, matching the head unit and the 0x0C7
 // burst helper in precondition.c.
@@ -248,12 +259,17 @@ static const uint8_t trailer_data[8] = {0x00U, 0x00U, 0x00U, 0x00U,
 static const uint8_t state_data[8] = {0x00U, 0x00U, 0x00U, 0x00U,
                                       0x08U, 0x00U, 0x00U, 0x00U};
 
-static void send_climate_frame(uint32_t identifier, const uint8_t data[8]) {
+static void send_frame_on(can_bus_t bus, uint32_t identifier,
+                          const uint8_t data[8]) {
     twai_message_t packet = {0};
     packet.identifier = identifier;
     packet.data_length_code = 8U;
     memcpy(packet.data, data, 8U);
-    can_send(CLIMATE_CAR_BUS, &packet, 1);
+    can_send(bus, &packet, 1);
+}
+
+static void send_climate_frame(uint32_t identifier, const uint8_t data[8]) {
+    send_frame_on(CLIMATE_CAR_BUS, identifier, data);
 }
 
 // raw = 2T - 28, expressed in tenths of a degree so the half-degree steps the
@@ -265,16 +281,6 @@ static uint8_t setpoint_raw_from_tenths(int16_t tenths) {
         tenths = CLIMATE_SETPOINT_MAX_TENTHS;
     }
     return (uint8_t)((tenths - CLIMATE_SETPOINT_MIN_TENTHS) / 5);
-}
-
-// 0x2AC byte 4 is the VCU's copy of the same setpoint. The HVAC applies what it
-// sees here (0x380 follows it by ~1.2 s), and it appears ~0.5 s after 0x39B in
-// every capture, so we announce the temperature in the car's own order:
-// 0x39B first, 0x2AC half a second later, the 0x4A2 request after that.
-static void send_setpoint_frame(void) {
-    uint8_t data[8] = {0x00U, 0xFFU, 0xFFU, 0x40U, climate.setpoint_raw,
-                       0x40U, 0x84U, 0x50U};
-    send_climate_frame(CLIMATE_SETPOINT_FRAME_ID, data);
 }
 
 static void send_wake_frame(void) {
@@ -291,7 +297,7 @@ static void send_tmu_frame(const climate_command_t *command, bool running) {
                        climate.setpoint_raw, 0x00U, climate.session_counter, 0x00U,
                        command->tmu_class, 0x10U, 0x00U};
     climate.session_counter = (uint8_t)((climate.session_counter + 4U) & 0x3FU);
-    send_climate_frame(CLIMATE_TMU_FRAME_ID, data);
+    send_frame_on(CLIMATE_TMU_BUS, CLIMATE_TMU_FRAME_ID, data);
 }
 
 // Keeps the session alive: the heartbeat and the state frame at 5 Hz, the
@@ -299,9 +305,7 @@ static void send_tmu_frame(const climate_command_t *command, bool running) {
 static void send_session_frames(const climate_command_t *command, uint32_t tick) {
     const bool running = tick >= command->state_tick;
     const uint32_t phase = tick % CLIMATE_SESSION_PERIOD_TICKS;
-    if (phase == 0U) {
-        send_setpoint_frame();
-    } else if (phase == 3U) {
+    if (phase == 3U) {
         send_tmu_frame(command, running);
     } else if (phase == 4U) {
         send_climate_frame(0x4DDU, state_data);
@@ -439,10 +443,9 @@ void climate_tick(void) {
         const uint32_t since = t - CLIMATE_PREWAKE_TICKS;
         if (since < CLIMATE_BURST_TICKS) {
             if (since == 0U) {
-                // the setpoint goes out with the session envelope, 1 s before
-                // the climate request, as 0x39B does on a real start
+                // the I-CAN heartbeat, and with it the setpoint, opens with the
+                // session envelope, 1 s before the climate request
                 send_tmu_frame(command, false);
-                send_setpoint_frame();
             }
             send_climate_frame(CLIMATE_REQUEST_FRAME_ID, session_open_data);
             return;

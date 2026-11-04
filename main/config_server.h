@@ -102,7 +102,7 @@ typedef struct _device_config
 	char can1_datarate[65];
 	char can1_mode[65];
 	char can1_en[10];
-	char can_fwd_mode[10];
+	char can_fwd_mode[16];
 	char port_type[65];
 	char port[65];
 	char ap_pass[65];
@@ -158,6 +158,20 @@ int8_t config_server_get_can_mode(void);
 int8_t config_server_get_can1_rate(void);
 int8_t config_server_get_can1_mode(void);
 int8_t config_server_get_can1_en(void);
+// How the two CAN buses relate to each other.
+//   MITM        - bridge: every frame is forwarded to the other bus (the kit
+//                 sits in series with one bus and hides its own second port).
+//   PARALLEL    - no bridging; a modified duplicate is injected on the bus the
+//                 frame arrived on (that is what the precondition rewrite needs).
+//   INDEPENDENT - no bridging and no injection: two fully independent RX/TX
+//                 channels, e.g. M-CAN on one port and I-CAN on the other.
+typedef enum {
+	FWD_MODE_MITM = 0,
+	FWD_MODE_PARALLEL = 1,
+	FWD_MODE_INDEPENDENT = 2,
+} fwd_mode_t;
+
+int8_t config_server_get_fwd_mode(void);
 int8_t config_server_get_fwd_en(void);
 int8_t config_server_get_port_type(void);
 int32_t config_server_get_port(void);

@@ -399,11 +399,26 @@ int8_t config_server_get_can1_en(void)
 	return (strcmp(device_config.can1_en, "enable") == 0) ? 1 : 0;
 }
 
-// 1 = MITM mode (bridge/forward frames between the buses), 0 = parallel mode
-// (both buses tap the same wires; no forwarding)
+// 0 = MITM (bridge), 1 = parallel (inject modified duplicates on the bus the
+// frame arrived on), 2 = independent (no forwarding, no injection: two plain
+// RX/TX channels). Anything unrecognised falls back to MITM.
+int8_t config_server_get_fwd_mode(void)
+{
+	if (strcmp(device_config.can_fwd_mode, "parallel") == 0)
+	{
+		return FWD_MODE_PARALLEL;
+	}
+	if (strcmp(device_config.can_fwd_mode, "independent") == 0)
+	{
+		return FWD_MODE_INDEPENDENT;
+	}
+	return FWD_MODE_MITM;
+}
+
+// 1 = the two buses are bridged (MITM), 0 = they are not
 int8_t config_server_get_fwd_en(void)
 {
-	return (strcmp(device_config.can_fwd_mode, "parallel") == 0) ? 0 : 1;
+	return (config_server_get_fwd_mode() == FWD_MODE_MITM) ? 1 : 0;
 }
 
 int8_t config_server_get_port_type(void)
@@ -2432,7 +2447,10 @@ static void config_server_load_cfg(char *cfg)
 
 	//*****
 	key = cJSON_GetObjectItem(root,"can_fwd_mode");
-	if(key == 0 || !cJSON_IsString(key) || strcmp(key->valuestring, "parallel") != 0)
+	if(key == 0 || !cJSON_IsString(key) ||
+	   (strcmp(key->valuestring, "mitm") != 0 &&
+	    strcmp(key->valuestring, "parallel") != 0 &&
+	    strcmp(key->valuestring, "independent") != 0))
 	{
 		strcpy(device_config.can_fwd_mode, "mitm");
 	}

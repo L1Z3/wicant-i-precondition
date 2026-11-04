@@ -294,8 +294,12 @@ static void can_rx_task(void *pvParameters)
 	// the firmware, and the task is created after the config is loaded.
 	// Single-bus builds have nothing to bridge, so hardcode parallel there.
 #if CAN_BUS_COUNT > 1
-	const bool fwd_bridge_en = (config_server_get_fwd_en() != 0);
+	// 0 = MITM bridge, 1 = parallel (modified duplicate on the same bus),
+	// 2 = independent (no bridging and no injection at all).
+	const int8_t fwd_mode = config_server_get_fwd_mode();
+	const bool fwd_bridge_en = (fwd_mode == FWD_MODE_MITM);
 #else
+	const int8_t fwd_mode = FWD_MODE_INDEPENDENT;
 	const bool fwd_bridge_en = false;
 #endif
 //	float bvoltage = 0;
@@ -370,7 +374,7 @@ static void can_rx_task(void *pvParameters)
                     fwd_wait =
                         (esp_timer_get_time() < fwd_fastdrop_until_us[fwd_bus]) ? 0 : 2;
                 }
-                else
+                else if (fwd_mode == FWD_MODE_PARALLEL)
                 {
                     // Parallel mode (and single-bus builds): no bridging; inject
                     // a modified duplicate alongside the original, on the bus it
@@ -380,6 +384,17 @@ static void can_rx_task(void *pvParameters)
                     fwd_result = precondition_fwd_hook(&fwd_msg, fwd_bus);
                     fwd_wanted = (fwd_result == FWD_MODIFIED);
                     fwd_wait = 1;
+                }
+                else
+                {
+                    // Independent mode: the two buses are unrelated channels.
+                    // Nothing is forwarded and nothing is rewritten - a frame is
+                    // streamed to the host and injected only when the host asks
+                    // for it by CAN id on a chosen bus.
+                    fwd_bus = rx_bus;
+                    fwd_result = FWD_PASSTHROUGH;
+                    fwd_wanted = false;
+                    fwd_wait = 0;
                 }
                 if (fwd_wanted && can_send(fwd_bus, &fwd_msg, fwd_wait) != ESP_OK)
                 {

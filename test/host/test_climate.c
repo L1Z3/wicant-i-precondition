@@ -14,6 +14,7 @@
 typedef struct {
     uint32_t id;
     uint8_t data[8];
+    can_bus_t bus;
 } sent_t;
 
 static sent_t sent[MAX_SENT];
@@ -22,11 +23,13 @@ static int wrong_bus;
 
 esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_wait) {
     (void)ticks_to_wait;
-    if (bus != CAN_BUS_0) {
+    // the 0x39B heartbeat is I-CAN (bus 0 here), every command is M-CAN (bus 1)
+    if (bus != (message->identifier == 0x39BU ? CAN_BUS_0 : CAN_BUS_1)) {
         wrong_bus++;
     }
     if (sent_count < MAX_SENT) {
         sent[sent_count].id = message->identifier;
+        sent[sent_count].bus = bus;
         memcpy(sent[sent_count].data, message->data, 8U);
         sent_count++;
     }
@@ -77,14 +80,6 @@ static void tmu_payload(uint8_t state, uint8_t command_class, uint8_t counter,
     out[5] = command_class;
 }
 
-// 0x2AC byte 4 is the VCU's copy of the setpoint; everything else is fixed.
-static void setpoint_payload(uint8_t raw, uint8_t out[8]) {
-    static const uint8_t base[8] = {0x00U, 0xFFU, 0xFFU, 0x40U,
-                                    0x00U, 0x40U, 0x84U, 0x50U};
-    memcpy(out, base, 8U);
-    out[4] = raw;
-}
-
 static bool payload_is(size_t index, uint32_t id, const uint8_t expected[8]) {
     return index < sent_count
            && sent[index].id == id
@@ -109,39 +104,39 @@ static void suite_logging(void) {
     // idle session frames (bit 4 clear) are not a state change
     frame.identifier = 0x4F1U;
     frame.data[1] = 0xC0U;
-    climate_rx_hook(&frame, CAN_BUS_1);
+    climate_rx_hook(&frame, CAN_BUS_0);
     CHECK(climate_get_status(status, sizeof(status)));
     CHECK(strcmp(status, "idle") == 0);
 
     // the session bit, as the head unit sends it
     memcpy(frame.data, wake_payload, 8U);
-    climate_rx_hook(&frame, CAN_BUS_1);
+    climate_rx_hook(&frame, CAN_BUS_0);
     CHECK(climate_get_status(status, sizeof(status)));
     CHECK(strcmp(status, "idle; 0x4F1 D0 00 hu") == 0);
 
     // the car answers on its own bus with its own 0x4A2 payload
     frame.identifier = 0x4A2U;
     frame.data[2] = 0x01U;
-    climate_rx_hook(&frame, CAN_BUS_0);
+    climate_rx_hook(&frame, CAN_BUS_1);
     CHECK(climate_get_status(status, sizeof(status)));
     CHECK(strcmp(status, "idle; 0x4A2 01 00 car") == 0);
 
     // the head unit's active flag, the response the prototype watches
     frame.identifier = 0x4EBU;
     memcpy(frame.data, "\x20\xA0\x16\x01\x80\x00\x00\x00", 8U);
-    climate_rx_hook(&frame, CAN_BUS_1);
+    climate_rx_hook(&frame, CAN_BUS_0);
     CHECK(climate_get_status(status, sizeof(status)));
     CHECK(strcmp(status, "idle; 0x4EB 80 16 hu") == 0);
 
     // the vehicle power state is the clearest "it worked" edge
     frame.identifier = 0x037U;
     memcpy(frame.data, "\x22\x00\x00\x10\x00\x40\x00\x00", 8U);
-    climate_rx_hook(&frame, CAN_BUS_0);
+    climate_rx_hook(&frame, CAN_BUS_1);
     CHECK(climate_get_status(status, sizeof(status)));
     CHECK(strcmp(status, "idle; 0x037 22 00 car") == 0);
 
     // repeating the same frame must not move the reported edge
-    climate_rx_hook(&frame, CAN_BUS_0);
+    climate_rx_hook(&frame, CAN_BUS_1);
     CHECK(climate_get_status(status, sizeof(status)));
     CHECK(strcmp(status, "idle; 0x037 22 00 car") == 0);
 }
@@ -157,9 +152,9 @@ static void suite_blocking_window(void) {
     CHECK(sent_count == 0);
     CHECK(!climate_is_active());
     frame.identifier = 0x4A2U;
-    CHECK(climate_fwd_hook(&frame, CAN_BUS_0) == FWD_PASSTHROUGH);
+    CHECK(climate_fwd_hook(&frame, CAN_BUS_1) == FWD_PASSTHROUGH);
     frame.identifier = 0x4F1U;
-    CHECK(climate_fwd_hook(&frame, CAN_BUS_0) == FWD_PASSTHROUGH);
+    CHECK(climate_fwd_hook(&frame, CAN_BUS_1) == FWD_PASSTHROUGH);
 
     CHECK(climate_request_start(0) == ESP_OK);
     CHECK(climate_is_active());
@@ -167,14 +162,14 @@ static void suite_blocking_window(void) {
     CHECK(climate_command_count() == 8U);
     CHECK(strcmp(climate_command_label(7), "start (asleep)") == 0);
     frame.identifier = 0x4A2U;
-    CHECK(climate_fwd_hook(&frame, CAN_BUS_0) == FWD_BLOCK);
+    CHECK(climate_fwd_hook(&frame, CAN_BUS_1) == FWD_BLOCK);
     frame.identifier = 0x4F1U;
-    CHECK(climate_fwd_hook(&frame, CAN_BUS_0) == FWD_BLOCK);
+    CHECK(climate_fwd_hook(&frame, CAN_BUS_1) == FWD_BLOCK);
     // the head unit side is untouched, and so is every other frame
     frame.identifier = 0x4A2U;
-    CHECK(climate_fwd_hook(&frame, CAN_BUS_1) == FWD_PASSTHROUGH);
-    frame.identifier = 0x4EBU;
     CHECK(climate_fwd_hook(&frame, CAN_BUS_0) == FWD_PASSTHROUGH);
+    frame.identifier = 0x4EBU;
+    CHECK(climate_fwd_hook(&frame, CAN_BUS_1) == FWD_PASSTHROUGH);
 
     // a second request while this one is queued is refused, and off the end of
     // the table is an argument error rather than a run
@@ -227,7 +222,7 @@ static void suite_start_asleep(void) {
             }
         }
     }
-    asleep_sends = sent_count - 580U;
+    asleep_sends = sent_count - 420U;
 
     // ticks 0..2 rest burst, then 1 Hz at 25 and 50, then F3 43 at 75..77
     CHECK(c0 == 5U);
@@ -264,14 +259,13 @@ static void suite_start(void) {
     // ticks 0..2 wake burst, then the heartbeat starts two ticks later
     CHECK(per_tick[0] == 1U && per_tick[1] == 1U && per_tick[2] == 1U);
     CHECK(per_tick[3] == 1U && per_tick[4] == 1U);
-    // the setpoint mirror runs at 5 Hz alongside the heartbeat
-    CHECK(per_tick[5] == 1U && per_tick[6] == 0U && per_tick[7] == 0U);
+    CHECK(per_tick[5] == 0U && per_tick[6] == 0U && per_tick[7] == 0U);
     // 0x4F1 re-asserts once a second
     CHECK(per_tick[11] == 1U);
 
     // 26..28 request, 29..31 apply (0x4A2 and 0x0C7 together), 32..34 trailer
     CHECK(per_tick[26] == 1U && per_tick[27] == 1U && per_tick[28] == 2U);
-    CHECK(per_tick[29] == 3U && per_tick[30] == 3U && per_tick[31] == 2U);
+    CHECK(per_tick[29] == 3U && per_tick[30] == 2U && per_tick[31] == 2U);
     CHECK(per_tick[32] == 1U && per_tick[33] == 2U && per_tick[34] == 2U);
 
     // 205..207 close the session with the session bit released
@@ -290,24 +284,14 @@ static void suite_start(void) {
     tmu_payload(0x00U, 0x03U, 0x00U, tmu);
     CHECK(payload_is(index++, 0x39BU, tmu));
     CHECK(payload_is(index++, 0x4DDU, state_payload));
-    {
-        uint8_t mirror[8];
-        setpoint_payload(0x10U, mirror);
-        CHECK(payload_is(index++, 0x2ACU, mirror));
-    }
     tmu_payload(0x00U, 0x03U, 0x04U, tmu);
     CHECK(payload_is(index++, 0x39BU, tmu));
     CHECK(payload_is(index++, 0x4DDU, state_payload));
-    {
-        uint8_t mirror[8];
-        setpoint_payload(0x10U, mirror);
-        CHECK(payload_is(index++, 0x2ACU, mirror));
-    }
     CHECK(payload_is(index++, 0x4F1U, wake_payload));
 
     // payload census
     size_t wake = 0, idle = 0, request = 0, apply = 0, opcode = 0;
-    size_t trailer = 0, state = 0, setpoint = 0, tmu_count = 0, tmu_running = 0;
+    size_t trailer = 0, state = 0, tmu_count = 0, tmu_running = 0;
     uint8_t counter = 0U;
     for (size_t i = before; i < sent_count; i++) {
         if (sent[i].id == 0x4F1U) {
@@ -331,11 +315,6 @@ static void suite_start(void) {
         } else if (sent[i].id == 0x4DDU) {
             CHECK(memcmp(sent[i].data, state_payload, 8U) == 0);
             state++;
-        } else if (sent[i].id == 0x2ACU) {
-            uint8_t mirror[8];
-            setpoint_payload(0x10U, mirror);
-            CHECK(memcmp(sent[i].data, mirror, 8U) == 0);
-            setpoint++;
         } else if (sent[i].id == 0x39BU) {
             // the counter byte advances by four and wraps at 0x40
             CHECK_MSG(sent[i].data[3] == counter, "0x39B counter %02X at %u",
@@ -359,14 +338,13 @@ static void suite_start(void) {
     CHECK(state == 41U);     // 5 Hz for the whole session window
     CHECK(tmu_count == 41U);
     CHECK(tmu_running == 35U);
-    CHECK(setpoint == 40U);  // 5 Hz for the whole session window
-    CHECK(sent_count - before == 148U);
+    CHECK(sent_count - before == 108U);
 
     // the sequence releases the block when it finishes, and can run again
     CHECK(!climate_is_active());
     twai_message_t frame = {0};
     frame.identifier = 0x4A2U;
-    CHECK(climate_fwd_hook(&frame, CAN_BUS_0) == FWD_PASSTHROUGH);
+    CHECK(climate_fwd_hook(&frame, CAN_BUS_1) == FWD_PASSTHROUGH);
 }
 
 // The stop direction has no 0x4A2 and no 0x0C7 at all: it is only the session
@@ -404,8 +382,8 @@ static void suite_stop(void) {
     CHECK(tmu_count == 41U);
     CHECK(tmu_closing == 36U);
     CHECK(tmu_idle == 5U);
-    // 3 wake + 3 idle + 41 heartbeat + 41 state + 40 setpoint + 8 keepalives
-    CHECK(sent_count - before == 136U);
+    // 3 wake + 3 idle + 41 heartbeat + 41 state + 8 keepalives = 96
+    CHECK(sent_count - before == 96U);
     CHECK(!climate_is_active());
 }
 
@@ -418,7 +396,7 @@ static void suite_lock_unlock(void) {
         climate_tick();
     }
     size_t lock_frames = sent_count - before;
-    CHECK(lock_frames == 148U);
+    CHECK(lock_frames == 108U);
 
     size_t lock_request = 0, lock_apply = 0, wrong_class = 0;
     for (size_t i = before; i < sent_count; i++) {
@@ -442,7 +420,7 @@ static void suite_lock_unlock(void) {
     for (size_t tick = 0; tick < CLIMATE_TEST_TICKS; tick++) {
         climate_tick();
     }
-    CHECK(sent_count - before == 148U);
+    CHECK(sent_count - before == 108U);
     size_t unlock_request = 0, unlock_apply = 0, lock_nibble = 0;
     for (size_t i = before; i < sent_count; i++) {
         if (sent[i].id != 0x4A2U) {
@@ -477,20 +455,15 @@ static void suite_setpoint(void) {
         climate_tick();
     }
 
-    size_t tmu = 0, mirror = 0;
+    size_t tmu = 0;
     for (size_t i = before; i < sent_count; i++) {
         if (sent[i].id == 0x39BU) {
             CHECK(sent[i].data[1] == 0x11U);
+            CHECK(sent[i].bus == CAN_BUS_0);
             tmu++;
-        } else if (sent[i].id == 0x2ACU) {
-            uint8_t expected[8];
-            setpoint_payload(0x11U, expected);
-            CHECK(memcmp(sent[i].data, expected, 8U) == 0);
-            mirror++;
         }
     }
     CHECK(tmu > 0U);
-    CHECK(mirror > 0U);
 
     // off the ends of the table: 10 C clamps to 14.0 C (raw 0), 40 C to 32 C
     for (size_t tick = 0; tick < CLIMATE_TEST_TICKS && climate_is_active(); tick++) {
@@ -502,8 +475,8 @@ static void suite_setpoint(void) {
         climate_tick();
     }
     for (size_t i = before; i < sent_count; i++) {
-        if (sent[i].id == 0x39BU || sent[i].id == 0x2ACU) {
-            CHECK(sent[i].data[1] == 0x00U || sent[i].data[4] == 0x00U);
+        if (sent[i].id == 0x39BU) {
+            CHECK(sent[i].data[1] == 0x00U);
         }
     }
 }
@@ -518,8 +491,8 @@ int main(void) {
     suite_start_asleep();
 
     CHECK(wrong_bus == 0);
-    // 148 start + 136 stop + 148 lock + 148 unlock, plus the sleeping-car run
-    CHECK(sent_count == 580U + asleep_sends);
+    // 108 start + 96 stop + 108 lock + 108 unlock, plus the sleeping-car run
+    CHECK(sent_count == 420U + asleep_sends);
     suite_setpoint();
     return test_report("test_climate");
 }
