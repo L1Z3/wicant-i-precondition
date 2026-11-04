@@ -115,6 +115,10 @@
 // valid time leaves ~11 ns of MISO margin at 16 MHz through the GPIO matrix.
 #define MCP2518FD_SPI_CLOCK_HZ       16000000
 #define MCP2518FD_OSCILLATOR_HZ      40000000
+// Largest single transfer on the bus: one RX/TX message object (8 header + 64
+// payload bytes) plus its 2-byte command. Above SOC_SPI_MAXIMUM_BUFFER_SIZE
+// (64), so the bus runs with DMA for these object transfers.
+#define MCP2518FD_SPI_MAX_TRANSFER_BYTES 128
 
 #endif
 

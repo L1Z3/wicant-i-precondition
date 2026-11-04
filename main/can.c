@@ -772,15 +772,21 @@ static esp_err_t can_mcp2518fd_bus_init(void)
 		return ESP_OK;
 	}
 
+	// A CAN FD message object is 8 header bytes + up to 64 payload bytes, so
+	// reading one is a 74-byte SPI transfer: more than the 64-byte CPU-driven
+	// FIFO that a DMA-disabled bus allows. Without DMA both the IDF driver
+	// (max_transfer_sz) and the MCP2518FD compat shim reject that length, so
+	// every FD frame read would fail with -EINVAL and the 8-deep RX FIFO
+	// would overflow. Short register transfers keep using the LL path.
 	spi_bus_config_t bus_cfg = {
 		.sclk_io_num = MCP2518FD_SCLK_GPIO_NUM,
 		.mosi_io_num = MCP2518FD_MOSI_GPIO_NUM,
 		.miso_io_num = MCP2518FD_MISO_GPIO_NUM,
 		.quadwp_io_num = GPIO_NUM_NC,
 		.quadhd_io_num = GPIO_NUM_NC,
+		.max_transfer_sz = MCP2518FD_SPI_MAX_TRANSFER_BYTES,
 	};
-	// Driver transfers are at most 18 bytes, which the CPU-driven FIFO holds
-	esp_err_t err = spi_bus_initialize(MCP2518FD_SPI_HOST, &bus_cfg, SPI_DMA_DISABLED);
+	esp_err_t err = spi_bus_initialize(MCP2518FD_SPI_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
 	if (err != ESP_OK)
 	{
 		return err;
