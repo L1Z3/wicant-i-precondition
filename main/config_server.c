@@ -746,20 +746,60 @@ static esp_err_t precondition_toggle_handler(httpd_req_t *req)
 // Remote command prototype: replays one of the head unit's own sequences.
 // The command index comes in as ?c=N, see climate.h for the list. Always 200
 // like the preconditioning toggle; the body says what happened.
+// "22", "22.5" or "21,5" -> tenths of a degree, without pulling in strtod.
+static bool parse_tenths(const char *text, int16_t *out) {
+	if (text == NULL || text[0] < '0' || text[0] > '9') {
+		return false;
+	}
+	int32_t whole = 0;
+	int32_t frac = 0;
+	bool seen_dot = false;
+	bool frac_seen = false;
+	for (const char *p = text; *p != '\0'; p++) {
+		if (*p == '.' || *p == ',') {
+			if (seen_dot) {
+				return false;
+			}
+			seen_dot = true;
+		} else if (*p >= '0' && *p <= '9') {
+			if (!seen_dot) {
+				whole = whole * 10 + (*p - '0');
+				if (whole > 99) {
+					return false;
+				}
+			} else if (!frac_seen) {
+				frac = *p - '0';
+				frac_seen = true;
+			} else {
+				return false;
+			}
+		} else {
+			return false;
+		}
+	}
+	*out = (int16_t)(whole * 10 + frac);
+	return true;
+}
+
 static esp_err_t precondition_climate_start_handler(httpd_req_t *req)
 {
-	char query[24];
-	char value[8];
+	char query[40];
+	char value[12];
 	unsigned command = 0;
+	int16_t setpoint = (int16_t)CLIMATE_SETPOINT_DEFAULT_TENTHS;
 	if (httpd_req_get_url_query_len(req) > 0
-			&& httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK
-			&& httpd_query_key_value(query, "c", value, sizeof(value)) == ESP_OK
-			&& value[0] >= '0' && value[0] <= '9') {
-		command = (unsigned)(value[0] - '0');
+			&& httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+		if (httpd_query_key_value(query, "c", value, sizeof(value)) == ESP_OK
+				&& value[0] >= '0' && value[0] <= '9') {
+			command = (unsigned)(value[0] - '0');
+		}
+		if (httpd_query_key_value(query, "t", value, sizeof(value)) == ESP_OK) {
+			parse_tenths(value, &setpoint);
+		}
 	}
 
-	char resp_str[80];
-	esp_err_t err = climate_request_start((uint8_t)command);
+	char resp_str[96];
+	esp_err_t err = climate_request_start_temp((uint8_t)command, setpoint);
 	if (err == ESP_ERR_NOT_SUPPORTED) {
 		snprintf(resp_str, sizeof(resp_str), "Remote commands need the head-unit bus");
 	} else if (err == ESP_ERR_INVALID_ARG) {
@@ -767,8 +807,9 @@ static esp_err_t precondition_climate_start_handler(httpd_req_t *req)
 	} else if (err != ESP_OK) {
 		snprintf(resp_str, sizeof(resp_str), "Remote command already running");
 	} else {
-		snprintf(resp_str, sizeof(resp_str), "Remote command requested: %s",
-				 climate_command_label((uint8_t)command));
+		snprintf(resp_str, sizeof(resp_str), "Remote command requested: %s at %u.%u C",
+				 climate_command_label((uint8_t)command),
+				 (unsigned)(setpoint / 10), (unsigned)(setpoint % 10));
 	}
 	httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
 	return ESP_OK;

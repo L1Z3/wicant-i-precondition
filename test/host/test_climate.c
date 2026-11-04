@@ -9,7 +9,7 @@
 
 // ********************* recording can_send *********************
 
-#define MAX_SENT 512U
+#define MAX_SENT 1200U
 
 typedef struct {
     uint32_t id;
@@ -69,12 +69,20 @@ static const uint8_t unlock_apply_payload[8] = {0x00U, 0x00U, 0xF3U, 0xC3U,
 // 00, 04 .. 3C, byte 5 is the command class.
 static void tmu_payload(uint8_t state, uint8_t command_class, uint8_t counter,
                         uint8_t out[8]) {
-    static const uint8_t base[8] = {0x00U, 0x06U, 0x00U, 0x00U,
+    static const uint8_t base[8] = {0x00U, 0x10U, 0x00U, 0x00U,
                                     0x00U, 0x03U, 0x10U, 0x00U};
     memcpy(out, base, 8U);
     out[0] = state;
     out[3] = counter;
     out[5] = command_class;
+}
+
+// 0x2AC byte 4 is the VCU's copy of the setpoint; everything else is fixed.
+static void setpoint_payload(uint8_t raw, uint8_t out[8]) {
+    static const uint8_t base[8] = {0x00U, 0xFFU, 0xFFU, 0x40U,
+                                    0x00U, 0x40U, 0x84U, 0x50U};
+    memcpy(out, base, 8U);
+    out[4] = raw;
 }
 
 static bool payload_is(size_t index, uint32_t id, const uint8_t expected[8]) {
@@ -156,7 +164,8 @@ static void suite_blocking_window(void) {
     CHECK(climate_request_start(0) == ESP_OK);
     CHECK(climate_is_active());
     CHECK(strcmp(climate_command_label(0), "start") == 0);
-    CHECK(climate_command_count() == 7U);
+    CHECK(climate_command_count() == 8U);
+    CHECK(strcmp(climate_command_label(7), "start (asleep)") == 0);
     frame.identifier = 0x4A2U;
     CHECK(climate_fwd_hook(&frame, CAN_BUS_0) == FWD_BLOCK);
     frame.identifier = 0x4F1U;
@@ -170,12 +179,70 @@ static void suite_blocking_window(void) {
     // a second request while this one is queued is refused, and off the end of
     // the table is an argument error rather than a run
     CHECK(climate_request_start(0) == ESP_ERR_INVALID_STATE);
-    CHECK(climate_request_start(7) == ESP_ERR_INVALID_ARG);
+    CHECK(climate_request_start(8) == ESP_ERR_INVALID_ARG);
 }
 
 // The full climate start: wake bit first, a one second lead with the session
 // heartbeat already running, the two-phase 0x4A2 and the 0x0C7 opcode/trailer,
 // eight seconds of session frames, then the session bit released.
+// The sleeping-car variant: 3 s of 0x4F1 00 C0 (the rest bit), then the 0x4A2
+// F3 43 session envelope, then 0x4F1 00 D0 with F3 C3 120 ms later, then the
+// normal request at 1.04 s. Timings from the 2026-11-04 cloud capture.
+static size_t asleep_sends;
+
+static void suite_start_asleep(void) {
+    CHECK(climate_request_start(7) == ESP_OK);
+
+    size_t c0 = 0, open = 0, d0 = 0, commit = 0, request = 0;
+    size_t open_index = 0, d0_index = 0, request_tick = 0;
+    for (size_t tick = 0; tick < 130U; tick++) {
+        size_t previous = sent_count;
+        climate_tick();
+        for (size_t k = previous; k < sent_count; k++) {
+            if (sent[k].id == 0x4F1U && sent[k].data[1] == 0xC0U) {
+                c0++;
+            }
+            if (sent[k].id == 0x4A2U && sent[k].data[2] == 0xF3U
+                && sent[k].data[3] == 0x43U) {
+                if (open == 0U) {
+                    open_index = k;
+                }
+                open++;
+            }
+            if (sent[k].id == 0x4F1U && sent[k].data[1] == 0xD0U) {
+                if (d0 == 0U) {
+                    d0_index = k;
+                }
+                d0++;
+            }
+            if (sent[k].id == 0x4A2U && sent[k].data[2] == 0xF3U
+                && sent[k].data[3] == 0xC3U) {
+                commit++;
+            }
+            if (sent[k].id == 0x4A2U && sent[k].data[2] == 0x0FU) {
+                if (request == 0U) {
+                    request_tick = tick;
+                }
+                request++;
+            }
+        }
+    }
+    asleep_sends = sent_count - 580U;
+
+    // ticks 0..2 rest burst, then 1 Hz at 25 and 50, then F3 43 at 75..77
+    CHECK(c0 == 5U);
+    CHECK(open == 3U);
+    // 0x4F1 00 D0 and 0x4A2 F3 C3 arrive together, 120 ms after F3 43; the
+    // 1 Hz session keepalive below is 0x4F1 00 D0 too, so only the burst and
+    // the ordering are asserted
+    CHECK(d0 >= 3U);
+    CHECK(commit == 3U);
+    CHECK(open_index < d0_index);
+    // 3 s preamble + 6 ticks for the envelope + 26 ticks of wake lead
+    CHECK(request == 3U);
+    CHECK(request_tick == 104U);
+}
+
 static void suite_start(void) {
     size_t per_tick[CLIMATE_TEST_TICKS];
     size_t before = sent_count;
@@ -197,13 +264,14 @@ static void suite_start(void) {
     // ticks 0..2 wake burst, then the heartbeat starts two ticks later
     CHECK(per_tick[0] == 1U && per_tick[1] == 1U && per_tick[2] == 1U);
     CHECK(per_tick[3] == 1U && per_tick[4] == 1U);
-    CHECK(per_tick[5] == 0U && per_tick[6] == 0U && per_tick[7] == 0U);
+    // the setpoint mirror runs at 5 Hz alongside the heartbeat
+    CHECK(per_tick[5] == 1U && per_tick[6] == 0U && per_tick[7] == 0U);
     // 0x4F1 re-asserts once a second
     CHECK(per_tick[11] == 1U);
 
     // 26..28 request, 29..31 apply (0x4A2 and 0x0C7 together), 32..34 trailer
     CHECK(per_tick[26] == 1U && per_tick[27] == 1U && per_tick[28] == 2U);
-    CHECK(per_tick[29] == 3U && per_tick[30] == 2U && per_tick[31] == 2U);
+    CHECK(per_tick[29] == 3U && per_tick[30] == 3U && per_tick[31] == 2U);
     CHECK(per_tick[32] == 1U && per_tick[33] == 2U && per_tick[34] == 2U);
 
     // 205..207 close the session with the session bit released
@@ -222,14 +290,24 @@ static void suite_start(void) {
     tmu_payload(0x00U, 0x03U, 0x00U, tmu);
     CHECK(payload_is(index++, 0x39BU, tmu));
     CHECK(payload_is(index++, 0x4DDU, state_payload));
+    {
+        uint8_t mirror[8];
+        setpoint_payload(0x10U, mirror);
+        CHECK(payload_is(index++, 0x2ACU, mirror));
+    }
     tmu_payload(0x00U, 0x03U, 0x04U, tmu);
     CHECK(payload_is(index++, 0x39BU, tmu));
     CHECK(payload_is(index++, 0x4DDU, state_payload));
+    {
+        uint8_t mirror[8];
+        setpoint_payload(0x10U, mirror);
+        CHECK(payload_is(index++, 0x2ACU, mirror));
+    }
     CHECK(payload_is(index++, 0x4F1U, wake_payload));
 
     // payload census
     size_t wake = 0, idle = 0, request = 0, apply = 0, opcode = 0;
-    size_t trailer = 0, state = 0, tmu_count = 0, tmu_running = 0;
+    size_t trailer = 0, state = 0, setpoint = 0, tmu_count = 0, tmu_running = 0;
     uint8_t counter = 0U;
     for (size_t i = before; i < sent_count; i++) {
         if (sent[i].id == 0x4F1U) {
@@ -253,11 +331,16 @@ static void suite_start(void) {
         } else if (sent[i].id == 0x4DDU) {
             CHECK(memcmp(sent[i].data, state_payload, 8U) == 0);
             state++;
+        } else if (sent[i].id == 0x2ACU) {
+            uint8_t mirror[8];
+            setpoint_payload(0x10U, mirror);
+            CHECK(memcmp(sent[i].data, mirror, 8U) == 0);
+            setpoint++;
         } else if (sent[i].id == 0x39BU) {
             // the counter byte advances by four and wraps at 0x40
             CHECK_MSG(sent[i].data[3] == counter, "0x39B counter %02X at %u",
                       (unsigned)sent[i].data[3], (unsigned)i);
-            CHECK(sent[i].data[1] == 0x06U && sent[i].data[5] == 0x03U
+            CHECK(sent[i].data[1] == 0x10U && sent[i].data[5] == 0x03U
                   && sent[i].data[6] == 0x10U && sent[i].data[7] == 0x00U);
             CHECK(sent[i].data[0] == 0x00U || sent[i].data[0] == 0x50U);
             if (sent[i].data[0] == 0x50U) {
@@ -276,7 +359,8 @@ static void suite_start(void) {
     CHECK(state == 41U);     // 5 Hz for the whole session window
     CHECK(tmu_count == 41U);
     CHECK(tmu_running == 35U);
-    CHECK(sent_count - before == 108U);
+    CHECK(setpoint == 40U);  // 5 Hz for the whole session window
+    CHECK(sent_count - before == 148U);
 
     // the sequence releases the block when it finishes, and can run again
     CHECK(!climate_is_active());
@@ -320,8 +404,8 @@ static void suite_stop(void) {
     CHECK(tmu_count == 41U);
     CHECK(tmu_closing == 36U);
     CHECK(tmu_idle == 5U);
-    // 3 wake + 3 idle + 41 heartbeat + 41 state + 8 keepalives = 96
-    CHECK(sent_count - before == 96U);
+    // 3 wake + 3 idle + 41 heartbeat + 41 state + 40 setpoint + 8 keepalives
+    CHECK(sent_count - before == 136U);
     CHECK(!climate_is_active());
 }
 
@@ -334,7 +418,7 @@ static void suite_lock_unlock(void) {
         climate_tick();
     }
     size_t lock_frames = sent_count - before;
-    CHECK(lock_frames == 108U);
+    CHECK(lock_frames == 148U);
 
     size_t lock_request = 0, lock_apply = 0, wrong_class = 0;
     for (size_t i = before; i < sent_count; i++) {
@@ -358,7 +442,7 @@ static void suite_lock_unlock(void) {
     for (size_t tick = 0; tick < CLIMATE_TEST_TICKS; tick++) {
         climate_tick();
     }
-    CHECK(sent_count - before == 108U);
+    CHECK(sent_count - before == 148U);
     size_t unlock_request = 0, unlock_apply = 0, lock_nibble = 0;
     for (size_t i = before; i < sent_count; i++) {
         if (sent[i].id != 0x4A2U) {
@@ -378,15 +462,64 @@ static void suite_lock_unlock(void) {
     CHECK(!climate_is_active());
 }
 
+// The car takes the cabin temperature from 0x39B byte 1 and its 0x2AC mirror,
+// raw = 2T - 28, so a request for 22.5 C has to come out as 0x11 on both.
+static void suite_setpoint(void) {
+    // let the sleeping-car run finish first, so the next request is accepted
+    for (size_t tick = 0; tick < CLIMATE_TEST_TICKS && climate_is_active(); tick++) {
+        climate_tick();
+    }
+    CHECK(!climate_is_active());
+
+    size_t before = sent_count;
+    CHECK(climate_request_start_temp(0, 225) == ESP_OK);
+    for (size_t tick = 0; tick < 26U; tick++) {
+        climate_tick();
+    }
+
+    size_t tmu = 0, mirror = 0;
+    for (size_t i = before; i < sent_count; i++) {
+        if (sent[i].id == 0x39BU) {
+            CHECK(sent[i].data[1] == 0x11U);
+            tmu++;
+        } else if (sent[i].id == 0x2ACU) {
+            uint8_t expected[8];
+            setpoint_payload(0x11U, expected);
+            CHECK(memcmp(sent[i].data, expected, 8U) == 0);
+            mirror++;
+        }
+    }
+    CHECK(tmu > 0U);
+    CHECK(mirror > 0U);
+
+    // off the ends of the table: 10 C clamps to 14.0 C (raw 0), 40 C to 32 C
+    for (size_t tick = 0; tick < CLIMATE_TEST_TICKS && climate_is_active(); tick++) {
+        climate_tick();
+    }
+    before = sent_count;
+    CHECK(climate_request_start_temp(0, 100) == ESP_OK);
+    for (size_t tick = 0; tick < 26U; tick++) {
+        climate_tick();
+    }
+    for (size_t i = before; i < sent_count; i++) {
+        if (sent[i].id == 0x39BU || sent[i].id == 0x2ACU) {
+            CHECK(sent[i].data[1] == 0x00U || sent[i].data[4] == 0x00U);
+        }
+    }
+}
+
 int main(void) {
     suite_logging();
     suite_blocking_window();
     suite_start();
     suite_stop();
     suite_lock_unlock();
+    // last: leaves the sequence running, which no later suite would survive
+    suite_start_asleep();
 
     CHECK(wrong_bus == 0);
-    // 108 start + 96 stop + 108 lock + 108 unlock
-    CHECK(sent_count == 420U);
+    // 148 start + 136 stop + 148 lock + 148 unlock, plus the sleeping-car run
+    CHECK(sent_count == 580U + asleep_sends);
+    suite_setpoint();
     return test_report("test_climate");
 }

@@ -1444,6 +1444,8 @@
                             onclick="remoteCommand(5)" title="Door lock" value="Lock" />
                         <input id="remote_command_6" name="remote_command_6" type="button"
                             onclick="remoteCommand(6)" title="Door unlock" value="Unlock" />
+                        <input id="remote_command_7" name="remote_command_7" type="button"
+                            onclick="remoteCommand(7)" title="Climate start with the 3 s wake preamble (0x4F1 00 C0, 0x4A2 F3 43 / F3 C3), for a sleeping car" value="Climate (asleep)" />
                     </td>
                 </tr>
                 <tr>
@@ -3135,7 +3137,7 @@ function loadAutoTable(jsonData) {
 	// sequences and blocks the head unit's copies while it runs.
 	const remoteCommandButtons = ["remote_command_0", "remote_command_1",
 		"remote_command_2", "remote_command_3", "remote_command_4",
-		"remote_command_5", "remote_command_6"];
+		"remote_command_5", "remote_command_6", "remote_command_7"];
 
 	function setRemoteCommandButtonsDisabled(disabled) {
 		for (const id of remoteCommandButtons) {
