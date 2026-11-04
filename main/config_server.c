@@ -798,10 +798,11 @@ static bool parse_tenths(const char *text, int16_t *out) {
 
 static esp_err_t precondition_climate_start_handler(httpd_req_t *req)
 {
-	char query[40];
+	char query[64];
 	char value[12];
 	unsigned command = 0;
 	int16_t setpoint = (int16_t)CLIMATE_SETPOINT_DEFAULT_TENTHS;
+	unsigned options = 0;
 	if (httpd_req_get_url_query_len(req) > 0
 			&& httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
 		if (httpd_query_key_value(query, "c", value, sizeof(value)) == ESP_OK
@@ -811,10 +812,29 @@ static esp_err_t precondition_climate_start_handler(httpd_req_t *req)
 		if (httpd_query_key_value(query, "t", value, sizeof(value)) == ESP_OK) {
 			parse_tenths(value, &setpoint);
 		}
+		// o = OR of the climate-start options (1 front defrost, 2 rear/side,
+		// 4 steering wheel heat); the individual f/r/w flags are accepted too.
+		if (httpd_query_key_value(query, "o", value, sizeof(value)) == ESP_OK
+				&& value[0] >= '0' && value[0] <= '9') {
+			options = (unsigned)(value[0] - '0');
+		}
+		if (httpd_query_key_value(query, "f", value, sizeof(value)) == ESP_OK
+				&& value[0] == '1') {
+			options |= CLIMATE_OPTION_FRONT_DEFROST;
+		}
+		if (httpd_query_key_value(query, "r", value, sizeof(value)) == ESP_OK
+				&& value[0] == '1') {
+			options |= CLIMATE_OPTION_REAR_DEFROST;
+		}
+		if (httpd_query_key_value(query, "w", value, sizeof(value)) == ESP_OK
+				&& value[0] == '1') {
+			options |= CLIMATE_OPTION_STEERING_HEAT;
+		}
 	}
 
 	char resp_str[96];
-	esp_err_t err = climate_request_start_temp((uint8_t)command, setpoint);
+	esp_err_t err = climate_request_start_temp((uint8_t)command, setpoint,
+											   (uint8_t)options);
 	if (err == ESP_ERR_NOT_SUPPORTED) {
 		snprintf(resp_str, sizeof(resp_str), "Remote commands need the head-unit bus");
 	} else if (err == ESP_ERR_INVALID_ARG) {
@@ -822,9 +842,13 @@ static esp_err_t precondition_climate_start_handler(httpd_req_t *req)
 	} else if (err != ESP_OK) {
 		snprintf(resp_str, sizeof(resp_str), "Remote command already running");
 	} else {
-		snprintf(resp_str, sizeof(resp_str), "Remote command requested: %s at %u.%u C",
+		snprintf(resp_str, sizeof(resp_str),
+				 "Remote command requested: %s at %u.%u C%s%s%s",
 				 climate_command_label((uint8_t)command),
-				 (unsigned)(setpoint / 10), (unsigned)(setpoint % 10));
+				 (unsigned)(setpoint / 10), (unsigned)(setpoint % 10),
+				 (options & CLIMATE_OPTION_FRONT_DEFROST) ? ", front defrost" : "",
+				 (options & CLIMATE_OPTION_REAR_DEFROST) ? ", rear defrost" : "",
+				 (options & CLIMATE_OPTION_STEERING_HEAT) ? ", wheel heat" : "");
 	}
 	httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
 	return ESP_OK;

@@ -1428,24 +1428,47 @@
                     </td>
                 </tr>
                 <tr class="can1_row" style="display:none">
-                    <td>Remote Commands:</td>
+                    <td>Remote Climate:</td>
                     <td>
                         <input id="remote_command_0" name="remote_command_0" type="button"
-                            onclick="remoteCommand(0)" title="Climate start, exactly as the head unit sends it" value="Climate" />
+                            onclick="remoteCommand(0)" title="Climate start at the temperature and with the options below; wakes the car if it is asleep" value="Start" />
                         <input id="remote_command_1" name="remote_command_1" type="button"
-                            onclick="remoteCommand(1)" title="Climate start with front defrost" value="+Front" />
+                            onclick="remoteCommand(1)" title="Climate stop" value="Stop" />
+                    </td>
+                </tr>
+                <tr class="can1_row" style="display:none">
+                    <td>Climate Options:</td>
+                    <td>
+                        <label style="font-weight: normal; margin-right: 12px;">
+                            <input type="checkbox" id="climate_option_front" />
+                            Front defrost
+                        </label>
+                        <label style="font-weight: normal; margin-right: 12px;">
+                            <input type="checkbox" id="climate_option_rear" />
+                            Rear/side defrost
+                        </label>
+                        <label style="font-weight: normal;">
+                            <input type="checkbox" id="climate_option_wheel" />
+                            Steering wheel heat
+                        </label>
+                    </td>
+                </tr>
+                <tr class="can1_row" style="display:none">
+                    <td>Climate Temperature:</td>
+                    <td>
+                        <input id="climate_temp" name="climate_temp" type="number"
+                            min="14" max="32" step="0.5" value="22.0"
+                            style="width: 5em;" />
+                        &deg;C
+                    </td>
+                </tr>
+                <tr class="can1_row" style="display:none">
+                    <td>Door Locks:</td>
+                    <td>
                         <input id="remote_command_2" name="remote_command_2" type="button"
-                            onclick="remoteCommand(2)" title="Climate start with rear/side defrost" value="+Rear" />
+                            onclick="remoteCommand(2)" title="Door lock" value="Lock" />
                         <input id="remote_command_3" name="remote_command_3" type="button"
-                            onclick="remoteCommand(3)" title="Climate start with steering wheel heat" value="+Wheel" />
-                        <input id="remote_command_4" name="remote_command_4" type="button"
-                            onclick="remoteCommand(4)" title="Climate stop" value="Stop" />
-                        <input id="remote_command_5" name="remote_command_5" type="button"
-                            onclick="remoteCommand(5)" title="Door lock" value="Lock" />
-                        <input id="remote_command_6" name="remote_command_6" type="button"
-                            onclick="remoteCommand(6)" title="Door unlock" value="Unlock" />
-                        <input id="remote_command_7" name="remote_command_7" type="button"
-                            onclick="remoteCommand(7)" title="Climate start with the 3 s wake preamble (0x4F1 00 C0, 0x4A2 F3 43 / F3 C3), for a sleeping car" value="Climate (asleep)" />
+                            onclick="remoteCommand(3)" title="Door unlock" value="Unlock" />
                     </td>
                 </tr>
                 <tr>
@@ -3137,8 +3160,36 @@ function loadAutoTable(jsonData) {
 	// Remote command prototype: the device replays one of the head unit's own
 	// sequences and blocks the head unit's copies while it runs.
 	const remoteCommandButtons = ["remote_command_0", "remote_command_1",
-		"remote_command_2", "remote_command_3", "remote_command_4",
-		"remote_command_5", "remote_command_6", "remote_command_7"];
+		"remote_command_2", "remote_command_3"];
+
+	// The climate start takes the setpoint and the option checkboxes with it;
+	// lock, unlock and stop ignore both. Options are bits: 1 front defrost,
+	// 2 rear/side defrost, 4 steering wheel heat.
+	function remoteCommandQuery(command) {
+		const field = document.getElementById("climate_temp");
+		let tenths = 220;
+		if (field) {
+			const temp = parseFloat(field.value);
+			if (isFinite(temp)) {
+				tenths = Math.round(temp * 10);
+			}
+		}
+		let options = 0;
+		const front = document.getElementById("climate_option_front");
+		const rear = document.getElementById("climate_option_rear");
+		const wheel = document.getElementById("climate_option_wheel");
+		if (front && front.checked) {
+			options |= 1;
+		}
+		if (rear && rear.checked) {
+			options |= 2;
+		}
+		if (wheel && wheel.checked) {
+			options |= 4;
+		}
+		return "/precondition_climate_start?c=" + command
+			+ "&t=" + (tenths / 10).toFixed(1) + "&o=" + options;
+	}
 
 	function setRemoteCommandButtonsDisabled(disabled) {
 		for (const id of remoteCommandButtons) {
@@ -3162,7 +3213,7 @@ function loadAutoTable(jsonData) {
             setRemoteCommandButtonsDisabled(false);
             showNotification("Failed to send the remote command", "red");
         };
-		xhttp.open("POST", "/precondition_climate_start?c=" + command);
+		xhttp.open("POST", remoteCommandQuery(command));
 		xhttp.send();
 	}
 

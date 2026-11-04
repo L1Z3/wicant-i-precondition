@@ -20,16 +20,28 @@
 // 0x39B setpoint alongside it because the car applies the temperature it is
 // told, not the one in the 0x4A2 request (which carries none).
 
-// 0 = climate start, 1 = start + front defrost, 2 = start + rear/side
-// defrost, 3 = start + steering wheel heat, 4 = climate stop, 5 = lock,
-// 6 = unlock, 7 = climate start with the 3 s wake preamble for a sleeping car.
+// 0 = climate start, 1 = climate start with the 3 s wake preamble for a
+// sleeping car, 2 = climate stop, 3 = lock, 4 = unlock.
 //
-// climate_request_start() announces the default 22.0 C. The car takes the
-// setpoint from 0x39B byte 1 (raw = 2T - 28) and its mirror 0x2AC byte 4, so
-// climate_request_start_temp() is the entry point that names a temperature:
-// tenths of a degree C, 140..320, e.g. 225 = 22.5 C.
+// The extras the head unit can add to a climate start (front defrost, rear/side
+// defrost, steering wheel heat) are not separate commands: they are bits in
+// `options` that change the 0x4A2 mask of the one start burst.
+//
+// climate_request_start() announces the default 22.0 C and no options. The car
+// takes the setpoint from 0x39B byte 1 (raw = 2T - 28) and its mirror 0x2AC
+// byte 4, so climate_request_start_temp() is the entry point that names a
+// temperature: tenths of a degree C, 140..320, e.g. 225 = 22.5 C.
 esp_err_t climate_request_start(uint8_t command);
-esp_err_t climate_request_start_temp(uint8_t command, int16_t setpoint_tenths);
+esp_err_t climate_request_start_temp(uint8_t command, int16_t setpoint_tenths,
+                                     uint8_t options);
+
+// Options for a climate start, OR-ed together. Each one was captured on its own;
+// combinations are an OR of the observed bits and rear+steering has never been
+// seen on the wire.
+#define CLIMATE_OPTION_FRONT_DEFROST 0x01U
+#define CLIMATE_OPTION_REAR_DEFROST 0x02U
+#define CLIMATE_OPTION_STEERING_HEAT 0x04U
+#define CLIMATE_OPTION_ALL 0x07U
 
 #define CLIMATE_SETPOINT_MIN_TENTHS 140   // 14.0 C
 #define CLIMATE_SETPOINT_MAX_TENTHS 320   // 32.0 C

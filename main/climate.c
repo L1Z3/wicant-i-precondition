@@ -155,52 +155,48 @@ typedef struct {
     // Prepend the 3 s 0x4F1 00 C0 preamble and the 0x4A2 F3 43/F3 C3 session
     // envelope, the way the head unit does when the car has to be woken.
     bool prewake;
+    // The 0x4A2 payload is not fixed: it is built from the setpoint and the
+    // checkbox options when the burst goes out (see build_climate_payload).
+    // The request/apply arrays above are then unused and only kept readable.
+    bool climate_start;
+    // A stop has no 0x4A2 at all. The car is stopped by the telematics
+    // telegram 0x39B on the I-CAN: class 0x01 phase 0x10 for a few seconds,
+    // then class 0x03 phase 0x10, then class 0x03 phase 0x14, which the car
+    // applies within ~90 ms (captured 2026-11-04 18:2x and 19:0x).
+    bool tmu_off;
 } climate_command_t;
 
 #define CLIMATE_COMMAND_COUNT \
     ((uint8_t)(sizeof(climate_commands) / sizeof(climate_commands[0])))
 
 static const climate_command_t climate_commands[] = {
+    // Every start opens with the wake preamble: 3 s of 0x4F1 00 C0, then the
+    // 0x4A2 F3 43 / F3 C3 session envelope with 0x4F1 00 D0 120 ms later. A car
+    // that is already awake ignores it, and a sleeping car needs it, so there is
+    // no reason to guess which state the car is in.
     {"start",
      0x03U, 0x50U, (uint8_t)CLIMATE_WAKE_LEAD_TICKS + CLIMATE_BURST_TICKS, true, true,
      {0x00U, 0x00U, 0x0FU, 0x03U, 0x00U, 0x00U, 0x00U, 0x00U},
      {0x00U, 0x00U, 0xFFU, 0x03U, 0xFFU, 0xFFU, 0x00U, 0x00U},
-     false},
-    {"front defrost",
-     0x03U, 0x50U, (uint8_t)CLIMATE_WAKE_LEAD_TICKS + CLIMATE_BURST_TICKS, true, true,
-     {0x00U, 0x00U, 0x0FU, 0xC3U, 0x00U, 0x00U, 0xF0U, 0x00U},
-     {0x00U, 0x00U, 0xFFU, 0xC3U, 0xFFU, 0xFFU, 0xF0U, 0x00U},
-     false},
-    {"rear/side defrost",
-     0x03U, 0x50U, (uint8_t)CLIMATE_WAKE_LEAD_TICKS + CLIMATE_BURST_TICKS, true, true,
-     {0x00U, 0x00U, 0x7FU, 0xC3U, 0x00U, 0x00U, 0xF0U, 0x00U},
-     {0x00U, 0x00U, 0xFFU, 0xC3U, 0xFFU, 0xFFU, 0xF0U, 0x00U},
-     false},
-    {"steering wheel",
-     0x03U, 0x50U, (uint8_t)CLIMATE_WAKE_LEAD_TICKS + CLIMATE_BURST_TICKS, true, true,
-     {0x00U, 0x00U, 0xDFU, 0xC3U, 0x00U, 0x00U, 0xF0U, 0x00U},
-     {0x00U, 0x00U, 0xFFU, 0xC3U, 0xFFU, 0xFFU, 0xF0U, 0x00U},
-     false},
+     true, true, false},
+    // A stop is not a 0x4A2 command. The 0x4A2 FF 43 / FF C3 pair that older
+    // notes called the stop never stops the car when replayed; what does is
+    // the telematics telegram below, sent on the I-CAN (see tmu_off).
     {"stop",
      0x03U, 0x40U, (uint8_t)CLIMATE_WAKE_LEAD_TICKS, false, false,
-     {0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U},
-     {0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U},
-     false},
+     {0x00U, 0x00U, 0xFFU, 0x43U, 0xFFU, 0xFFU, 0x00U, 0x00U},
+     {0x00U, 0x00U, 0xFFU, 0xC3U, 0xFFU, 0xFFU, 0x00U, 0x00U},
+     false, false, true},
     {"lock",
      0x01U, 0x00U, (uint8_t)CLIMATE_WAKE_LEAD_TICKS + CLIMATE_BURST_TICKS, true, true,
      {0x00U, 0x00U, 0xF3U, 0x43U, 0x00U, 0x00U, 0xC0U, 0x00U},
      {0x00U, 0x00U, 0xF3U, 0xC3U, 0x00U, 0x00U, 0x40U, 0x00U},
-     false},
+     false, false, false},
     {"unlock",
      0x01U, 0x00U, (uint8_t)CLIMATE_WAKE_LEAD_TICKS + CLIMATE_BURST_TICKS, true, true,
      {0x00U, 0x00U, 0xF3U, 0x43U, 0x00U, 0x00U, 0xC0U, 0x00U},
      {0x00U, 0x00U, 0xF3U, 0xC3U, 0x00U, 0x00U, 0xD0U, 0x00U},
-     false},
-    {"start (asleep)",
-     0x03U, 0x50U, (uint8_t)CLIMATE_WAKE_LEAD_TICKS + CLIMATE_BURST_TICKS, true, true,
-     {0x00U, 0x00U, 0x0FU, 0x03U, 0x00U, 0x00U, 0x00U, 0x00U},
-     {0x00U, 0x00U, 0xFFU, 0x03U, 0xFFU, 0xFFU, 0x00U, 0x00U},
-     true},
+     false, false, false},
 };
 
 // ********************* sequence storage *********************
@@ -228,6 +224,8 @@ typedef struct {
     // 0x39B byte 1 and 0x2AC byte 4 agree. Written by the web handler before
     // it raises `requested`, read by the tick.
     uint8_t setpoint_raw;
+    // CLIMATE_OPTION_* bits for a climate start, written with the setpoint.
+    uint8_t options;
 } climate_state_t;
 
 static climate_state_t climate;
@@ -283,6 +281,60 @@ static uint8_t setpoint_raw_from_tenths(int16_t tenths) {
     return (uint8_t)((tenths - CLIMATE_SETPOINT_MIN_TENTHS) / 5);
 }
 
+// 0x4A2 payload for a climate start, built from the options instead of the
+// fixed arrays in the table. Without options this is the plain start
+// (00 00 0F 03 .. / 00 00 FF 03 FF FF ..). Every option turns the burst into
+// the 0xC3 form and sets byte 6 to 0xF0, and the option's bits go into the
+// request mask:
+//
+//   front defrost     0F C3 00 00 F0 00   mask unchanged
+//   rear/side defrost 7F C3 00 00 F0 00   mask 0x0F | 0x40 | 0x10 | 0x20
+//   steering heat     DF C3 00 00 F0 00   mask 0x0F | 0x40 | 0x10 | 0x80
+//
+// Only one option at a time was ever captured, so combinations are an OR of
+// the bits seen in those three: rear + steering together come out as mask
+// 0xFF, which no capture shows and which collides with the apply mask. That
+// combination has not been tested on a car and should be treated as a guess
+// until it is.
+static void build_climate_payload(uint8_t out[8], bool apply) {
+    const uint8_t options = climate.options;
+    uint8_t mask = 0x0FU;
+    uint8_t commit = 0x03U;
+    uint8_t extra = 0x00U;
+    if ((options & (CLIMATE_OPTION_REAR_DEFROST | CLIMATE_OPTION_STEERING_HEAT)) != 0U) {
+        mask |= 0x40U | 0x10U;
+    }
+    if ((options & CLIMATE_OPTION_REAR_DEFROST) != 0U) {
+        mask |= 0x20U;
+    }
+    if ((options & CLIMATE_OPTION_STEERING_HEAT) != 0U) {
+        mask |= 0x80U;
+    }
+    if (options != 0U) {
+        commit = 0xC3U;
+        extra = 0xF0U;
+    }
+    out[0] = 0x00U;
+    out[1] = 0x00U;
+    out[2] = apply ? 0xFFU : mask;
+    out[3] = commit;
+    out[4] = apply ? 0xFFU : 0x00U;
+    out[5] = apply ? 0xFFU : 0x00U;
+    out[6] = extra;
+    out[7] = 0x00U;
+}
+
+static void send_climate_burst(const climate_command_t *command, bool apply) {
+    if (command->climate_start) {
+        uint8_t payload[8];
+        build_climate_payload(payload, apply);
+        send_climate_frame(CLIMATE_REQUEST_FRAME_ID, payload);
+    } else {
+        send_climate_frame(CLIMATE_REQUEST_FRAME_ID,
+                           apply ? command->apply : command->request);
+    }
+}
+
 static void send_wake_frame(void) {
     send_climate_frame(CLIMATE_WAKE_FRAME_ID, wake_data);
 }
@@ -291,21 +343,58 @@ static void send_idle_frame(void) {
     send_climate_frame(CLIMATE_WAKE_FRAME_ID, idle_data);
 }
 
-// The I-CAN session heartbeat, sent here on the car bus as an experiment.
+// The I-CAN session heartbeat. A car whose climate is running shows
+// `50 <setpoint> 00 <counter> 00 00 00 00` at 5 Hz (read off the live bus on
+// 2026-11-04 while the cloud had the climate on): byte 5 (the command class)
+// and byte 6 (the phase) are zero except while a command is being executed.
+// Sending a permanent class 0x03 phase 0x10 here made the car treat every
+// replay as a stop, which is how the 2026-11-04 stop telegram was found.
 static void send_tmu_frame(const climate_command_t *command, bool running) {
     uint8_t data[8] = {(uint8_t)(running ? command->tmu_state : 0x00U),
                        climate.setpoint_raw, 0x00U, climate.session_counter, 0x00U,
-                       command->tmu_class, 0x10U, 0x00U};
+                       0x00U, 0x00U, 0x00U};
     climate.session_counter = (uint8_t)((climate.session_counter + 4U) & 0x3FU);
     send_frame_on(CLIMATE_TMU_BUS, CLIMATE_TMU_FRAME_ID, data);
 }
+
+// One frame of the stop telegram. The car reports "not running, no setpoint"
+// while the command executes, so bytes 0..1 are zero here.
+static void send_tmu_telegram(uint8_t tmu_class, uint8_t phase) {
+    uint8_t data[8] = {0x00U, 0x00U, 0x00U, climate.session_counter, 0x00U,
+                       tmu_class, phase, 0x00U};
+    climate.session_counter = (uint8_t)((climate.session_counter + 4U) & 0x3FU);
+    send_frame_on(CLIMATE_TMU_BUS, CLIMATE_TMU_FRAME_ID, data);
+}
+
+// Stop telegram schedule, in 40 ms ticks from the 0x4F1 00 D0 burst: a
+// class 0x01 phase 0x10 preamble, then class 0x03 phase 0x10, then the
+// class 0x03 phase 0x14 that the car applies.
+#define CLIMATE_STOP_PREAMBLE_TICK 5U
+#define CLIMATE_STOP_PREAMBLE_END 80U
+#define CLIMATE_STOP_CLIMATE_END 105U
+#define CLIMATE_STOP_APPLY_END 116U
 
 // Keeps the session alive: the heartbeat and the state frame at 5 Hz, the
 // session bit at 1 Hz, on their own offsets inside a 200 ms period.
 static void send_session_frames(const climate_command_t *command, uint32_t tick) {
     const bool running = tick >= command->state_tick;
     const uint32_t phase = tick % CLIMATE_SESSION_PERIOD_TICKS;
-    if (phase == 3U) {
+    if (command->tmu_off) {
+        if (phase == 0U) {
+            if (tick >= CLIMATE_STOP_PREAMBLE_TICK
+                    && tick < CLIMATE_STOP_PREAMBLE_END) {
+                send_tmu_telegram(0x01U, 0x10U);
+            } else if (tick >= CLIMATE_STOP_PREAMBLE_END
+                    && tick < CLIMATE_STOP_CLIMATE_END) {
+                send_tmu_telegram(0x03U, 0x10U);
+            } else if (tick >= CLIMATE_STOP_CLIMATE_END
+                    && tick < CLIMATE_STOP_APPLY_END) {
+                send_tmu_telegram(0x03U, 0x14U);
+            } else if (tick >= CLIMATE_STOP_APPLY_END) {
+                send_tmu_frame(command, false);
+            }
+        }
+    } else if (phase == 3U) {
         send_tmu_frame(command, running);
     } else if (phase == 4U) {
         send_climate_frame(0x4DDU, state_data);
@@ -466,12 +555,12 @@ void climate_tick(void) {
         send_session_frames(command, t);
     } else if (t < CLIMATE_WAKE_LEAD_TICKS + CLIMATE_BURST_TICKS) {
         if (command->send_request) {
-            send_climate_frame(CLIMATE_REQUEST_FRAME_ID, command->request);
+            send_climate_burst(command, false);
         }
         send_session_frames(command, t);
     } else if (t < CLIMATE_WAKE_LEAD_TICKS + 2U * CLIMATE_BURST_TICKS) {
         if (command->send_request) {
-            send_climate_frame(CLIMATE_REQUEST_FRAME_ID, command->apply);
+            send_climate_burst(command, true);
         }
         if (command->send_opcode) {
             send_climate_frame(CLIMATE_OPCODE_FRAME_ID, opcode_data);
@@ -507,7 +596,8 @@ fwd_result_t climate_fwd_hook(twai_message_t *msg, can_bus_t fwd_bus) {
     return FWD_PASSTHROUGH;
 }
 
-esp_err_t climate_request_start_temp(uint8_t command, int16_t setpoint_tenths) {
+esp_err_t climate_request_start_temp(uint8_t command, int16_t setpoint_tenths,
+                                     uint8_t options) {
     if (command >= CLIMATE_COMMAND_COUNT) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -517,8 +607,12 @@ esp_err_t climate_request_start_temp(uint8_t command, int16_t setpoint_tenths) {
     if (climate_blocking()) {
         return ESP_ERR_INVALID_STATE;
     }
-    // The setpoint has to be in place before the tick sees the command.
+    // The setpoint and the options have to be in place before the tick sees
+    // the command.
     climate.setpoint_raw = setpoint_raw_from_tenths(setpoint_tenths);
+    climate.options = (uint8_t)(options
+        & (CLIMATE_OPTION_FRONT_DEFROST | CLIMATE_OPTION_REAR_DEFROST
+           | CLIMATE_OPTION_STEERING_HEAT));
     // Block the head unit's copies from here, before the precondition task
     // gets a chance to start the sequence.
     atomic_store_explicit(&climate.command, command, memory_order_release);
@@ -527,7 +621,7 @@ esp_err_t climate_request_start_temp(uint8_t command, int16_t setpoint_tenths) {
 }
 
 esp_err_t climate_request_start(uint8_t command) {
-    return climate_request_start_temp(command, CLIMATE_SETPOINT_DEFAULT_TENTHS);
+    return climate_request_start_temp(command, CLIMATE_SETPOINT_DEFAULT_TENTHS, 0U);
 }
 
 uint8_t climate_command_count(void) {
@@ -620,6 +714,14 @@ fwd_result_t climate_fwd_hook(twai_message_t *msg, can_bus_t fwd_bus) {
 
 esp_err_t climate_request_start(uint8_t command) {
     (void)command;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t climate_request_start_temp(uint8_t command, int16_t setpoint_tenths,
+                                     uint8_t options) {
+    (void)command;
+    (void)setpoint_tenths;
+    (void)options;
     return ESP_ERR_NOT_SUPPORTED;
 }
 
