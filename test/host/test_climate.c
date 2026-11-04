@@ -162,7 +162,7 @@ static void suite_blocking_window(void) {
     CHECK(climate_request_start(0) == ESP_OK);
     CHECK(climate_is_active());
     CHECK(strcmp(climate_command_label(0), "start") == 0);
-    CHECK(climate_command_count() == 4U);
+    CHECK(climate_command_count() == 5U);
     CHECK(strcmp(climate_command_label(1), "stop") == 0);
     frame.identifier = 0x4A2U;
     CHECK(climate_fwd_hook(&frame, CAN_BUS_1) == FWD_BLOCK);

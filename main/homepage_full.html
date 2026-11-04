@@ -1434,6 +1434,8 @@
                             onclick="remoteCommand(0)" title="Climate start at the temperature and with the options below; wakes the car if it is asleep" value="Start" />
                         <input id="remote_command_1" name="remote_command_1" type="button"
                             onclick="remoteCommand(1)" title="Climate stop" value="Stop" />
+                        <input id="remote_command_4" name="remote_command_4" type="button"
+                            onclick="remoteCommand(4)" title="Awake Car Climate Start Test: every frame follows a frame the kit receives, for a car that is already awake and cannot be blocked" value="Awake Car Climate Start Test" />
                     </td>
                 </tr>
                 <tr class="can1_row" style="display:none">
@@ -3160,7 +3162,7 @@ function loadAutoTable(jsonData) {
 	// Remote command prototype: the device replays one of the head unit's own
 	// sequences and blocks the head unit's copies while it runs.
 	const remoteCommandButtons = ["remote_command_0", "remote_command_1",
-		"remote_command_2", "remote_command_3"];
+		"remote_command_2", "remote_command_3", "remote_command_4"];
 
 	// The climate start takes the setpoint and the option checkboxes with it;
 	// lock, unlock and stop ignore both. Options are bits: 1 front defrost,

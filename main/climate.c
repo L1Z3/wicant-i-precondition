@@ -164,6 +164,11 @@ typedef struct {
     // then class 0x03 phase 0x10, then class 0x03 phase 0x14, which the car
     // applies within ~90 ms (captured 2026-11-04 18:2x and 19:0x).
     bool tmu_off;
+    // Drive the burst from the frames the kit receives instead of the 40 ms
+    // tick: one script step per frame on the car bus. A plain tap cannot block
+    // the head unit, so on an awake car the only slot we get is right behind
+    // the traffic already on the segment (the ironiq.py pattern).
+    bool follow;
 } climate_command_t;
 
 #define CLIMATE_COMMAND_COUNT \
@@ -197,6 +202,14 @@ static const climate_command_t climate_commands[] = {
      {0x00U, 0x00U, 0xF3U, 0x43U, 0x00U, 0x00U, 0xC0U, 0x00U},
      {0x00U, 0x00U, 0xF3U, 0xC3U, 0x00U, 0x00U, 0xD0U, 0x00U},
      false, false, false},
+    // Awake-car test: same command as "start", but every frame goes out
+    // immediately behind a frame the kit receives, so it lands in a gap the
+    // head unit left instead of fighting it at a fixed 40 ms cadence.
+    {"start (awake test)",
+     0x03U, 0x50U, (uint8_t)CLIMATE_WAKE_LEAD_TICKS + CLIMATE_BURST_TICKS, true, true,
+     {0x00U, 0x00U, 0x0FU, 0x03U, 0x00U, 0x00U, 0x00U, 0x00U},
+     {0x00U, 0x00U, 0xFFU, 0x03U, 0xFFU, 0xFFU, 0x00U, 0x00U},
+     false, true, false, true},
 };
 
 // ********************* sequence storage *********************
@@ -232,6 +245,9 @@ typedef struct {
     _Atomic uint8_t car_climate;
     // Retries already spent on the running sequence.
     uint8_t retries;
+    // Follow mode: the burst is driven by received frames, not by the tick.
+    _Atomic bool follow;
+    _Atomic uint8_t follow_step;
 
 } climate_state_t;
 
@@ -379,6 +395,16 @@ static void send_tmu_telegram(uint8_t tmu_class, uint8_t phase) {
 // How many times a command whose result the car contradicted is re-sent.
 #define CLIMATE_RETRIES 1U
 
+// Follow mode gives up after 10 s (250 ticks of 40 ms).
+#define CLIMATE_FOLLOW_TICKS 250U
+
+// Follow mode holds the window at ~12.5 Hz for the whole lead, request and
+// apply, and re-asserts it behind every head-unit 0x4F1 keepalive. The head
+// unit idles at 00 F0 at 1 Hz, so a 3-frame burst plus a 1 Hz hold loses to it
+// (1 of 10 awake starts); this wins 8 of 10.
+#define CLIMATE_FOLLOW_HOLD_TICKS 45U
+#define CLIMATE_FOLLOW_PERIOD_TICKS 2U
+
 #define CLIMATE_STOP_PREAMBLE_TICK 5U
 #define CLIMATE_STOP_PREAMBLE_END 80U
 #define CLIMATE_STOP_CLIMATE_END 105U
@@ -491,11 +517,26 @@ static void note_climate_state(const twai_message_t *msg) {
     }
 }
 
+// Follow mode: a tap cannot block the head unit, so the 0x4F1 00 D0 window is
+// re-asserted behind every frame the kit receives on the car bus. The window is
+// then the latest thing on the wire most of the time, and the rest of the
+// schedule -- the 1.04 s lead, the request, the apply -- is unchanged.
+static void climate_follow_reassert(void) {
+    send_wake_frame();
+}
+
 void climate_rx_hook(const twai_message_t *msg, can_bus_t rx_bus) {
     if (msg == NULL || msg->data_length_code < 8U) {
         return;
     }
     note_climate_state(msg);
+    if (rx_bus == CLIMATE_MCAN_BUS
+            && msg->identifier == CLIMATE_WAKE_FRAME_ID
+            && atomic_load_explicit(&climate.follow, memory_order_relaxed)) {
+        // Follow the competitor: the head unit's own 0x4F1 keepalive just went
+        // out, so ours goes out behind it and stays the last word on the wire.
+        climate_follow_reassert();
+    }
     for (size_t i = 0; i < sizeof(climate_watch) / sizeof(climate_watch[0]); i++) {
         if (msg->identifier != climate_watch[i].id) {
             continue;
@@ -579,6 +620,11 @@ void climate_tick(void) {
         t = since - CLIMATE_BURST_TICKS;
     }
 
+    if (atomic_load_explicit(&climate.follow, memory_order_relaxed)
+            && t < CLIMATE_FOLLOW_HOLD_TICKS
+            && (t % CLIMATE_FOLLOW_PERIOD_TICKS) == 0U) {
+        send_wake_frame();
+    }
     if (t < CLIMATE_BURST_TICKS) {
         send_wake_frame();
     } else if (t < CLIMATE_WAKE_LEAD_TICKS) {
@@ -625,6 +671,7 @@ void climate_tick(void) {
             atomic_store_explicit(&climate.car_climate, 0U, memory_order_relaxed);
             return;
         }
+        atomic_store_explicit(&climate.follow, false, memory_order_relaxed);
         atomic_store_explicit(&climate.active, false, memory_order_relaxed);
         ESP_LOGI(TAG, "remote command: %s sequence finished", command->label);
     }
@@ -662,6 +709,9 @@ esp_err_t climate_request_start_temp(uint8_t command, int16_t setpoint_tenths,
            | CLIMATE_OPTION_STEERING_HEAT));
     // Block the head unit's copies from here, before the precondition task
     // gets a chance to start the sequence.
+    atomic_store_explicit(&climate.follow, climate_commands[command].follow,
+                          memory_order_relaxed);
+    atomic_store_explicit(&climate.follow_step, 0U, memory_order_relaxed);
     atomic_store_explicit(&climate.command, command, memory_order_release);
     atomic_store_explicit(&climate.requested, true, memory_order_relaxed);
     return ESP_OK;
