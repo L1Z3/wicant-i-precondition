@@ -398,12 +398,6 @@ static void send_tmu_telegram(uint8_t tmu_class, uint8_t phase) {
 // Follow mode gives up after 10 s (250 ticks of 40 ms).
 #define CLIMATE_FOLLOW_TICKS 250U
 
-// Follow mode holds the window at ~12.5 Hz for the whole lead, request and
-// apply, and re-asserts it behind every head-unit 0x4F1 keepalive. The head
-// unit idles at 00 F0 at 1 Hz, so a 3-frame burst plus a 1 Hz hold loses to it
-// (1 of 10 awake starts); this wins 8 of 10.
-#define CLIMATE_FOLLOW_HOLD_TICKS 45U
-#define CLIMATE_FOLLOW_PERIOD_TICKS 2U
 
 #define CLIMATE_STOP_PREAMBLE_TICK 5U
 #define CLIMATE_STOP_PREAMBLE_END 80U
@@ -517,26 +511,11 @@ static void note_climate_state(const twai_message_t *msg) {
     }
 }
 
-// Follow mode: a tap cannot block the head unit, so the 0x4F1 00 D0 window is
-// re-asserted behind every frame the kit receives on the car bus. The window is
-// then the latest thing on the wire most of the time, and the rest of the
-// schedule -- the 1.04 s lead, the request, the apply -- is unchanged.
-static void climate_follow_reassert(void) {
-    send_wake_frame();
-}
-
 void climate_rx_hook(const twai_message_t *msg, can_bus_t rx_bus) {
     if (msg == NULL || msg->data_length_code < 8U) {
         return;
     }
     note_climate_state(msg);
-    if (rx_bus == CLIMATE_MCAN_BUS
-            && msg->identifier == CLIMATE_WAKE_FRAME_ID
-            && atomic_load_explicit(&climate.follow, memory_order_relaxed)) {
-        // Follow the competitor: the head unit's own 0x4F1 keepalive just went
-        // out, so ours goes out behind it and stays the last word on the wire.
-        climate_follow_reassert();
-    }
     for (size_t i = 0; i < sizeof(climate_watch) / sizeof(climate_watch[0]); i++) {
         if (msg->identifier != climate_watch[i].id) {
             continue;
@@ -620,11 +599,6 @@ void climate_tick(void) {
         t = since - CLIMATE_BURST_TICKS;
     }
 
-    if (atomic_load_explicit(&climate.follow, memory_order_relaxed)
-            && t < CLIMATE_FOLLOW_HOLD_TICKS
-            && (t % CLIMATE_FOLLOW_PERIOD_TICKS) == 0U) {
-        send_wake_frame();
-    }
     if (t < CLIMATE_BURST_TICKS) {
         send_wake_frame();
     } else if (t < CLIMATE_WAKE_LEAD_TICKS) {
@@ -680,6 +654,15 @@ void climate_tick(void) {
 fwd_result_t climate_fwd_hook(twai_message_t *msg, can_bus_t fwd_bus) {
     if (fwd_bus != CLIMATE_CAR_BUS || !climate_blocking()) {
         return FWD_PASSTHROUGH;
+    }
+    if (msg->identifier == CLIMATE_WAKE_FRAME_ID
+            && atomic_load_explicit(&climate.follow, memory_order_relaxed)
+            && msg->data_length_code >= 2U) {
+        // Parallel mode: the head unit's own 00 F0 keepalive arrives here, so
+        // hand main.c the same frame with our 00 D0 window in it and let it be
+        // re-sent behind the original — the machinery the 0x4ED rewrite uses.
+        msg->data[1] = 0xD0U;
+        return FWD_MODIFIED;
     }
     if (msg->identifier == CLIMATE_REQUEST_FRAME_ID
             || msg->identifier == CLIMATE_WAKE_FRAME_ID) {
