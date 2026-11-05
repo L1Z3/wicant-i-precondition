@@ -297,7 +297,7 @@
      {
          channel = 6;
      }
-     ESP_LOGE(WIFI_TAG, "AP Channel:%d", channel);
+     ESP_LOGI(WIFI_TAG, "AP Channel:%d", channel);
  
      wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
      ESP_ERROR_CHECK(esp_wifi_init(&cfg));
