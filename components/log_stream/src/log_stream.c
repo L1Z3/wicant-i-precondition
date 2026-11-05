@@ -132,6 +132,17 @@ static int log_stream_vprintf(const char *fmt, va_list args)
     {
         size_t len = (size_t)n < sizeof(line) ? (size_t)n : sizeof(line) - 1;
         len = strip_ansi(line, len);
+        if ((size_t)n >= sizeof(line) && (len == 0 || line[len - 1] != '\n'))
+        {
+            // vsnprintf cut the line at the buffer end and dropped esp_log's
+            // newline with it.  Keep a terminator, or the next line would be
+            // glued onto this one in the ring.
+            if (len == sizeof(line) - 1)
+            {
+                len--;
+            }
+            line[len++] = '\n';
+        }
         ring_write(line, len);
     }
     return s_console_vprintf ? s_console_vprintf(fmt, args) : vprintf(fmt, args);

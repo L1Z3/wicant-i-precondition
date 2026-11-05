@@ -921,7 +921,11 @@ static esp_err_t logs_handler(httpd_req_t *req)
 	{
 		httpd_resp_send_chunk(req, NULL, 0);
 	}
-	return ok ? ESP_OK : ESP_FAIL;
+	// A failed chunk send means the reader went away (closed the browser tab,
+	// lost Wi-Fi, or the script was stopped).  That is the normal end of a
+	// follow stream, not a server error: returning an error here makes httpd
+	// log "uri handler execution failed" on every disconnect.
+	return ESP_OK;
 }
 
 // Emits one log line at the requested level so the web UI's live log view
