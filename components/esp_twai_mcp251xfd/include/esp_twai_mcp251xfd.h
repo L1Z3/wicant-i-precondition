@@ -46,6 +46,19 @@ esp_err_t twai_new_node_mcp251xfd(spi_host_device_t host, const twai_mcp251xfd_n
 // frames, so it is a lower bound on the frames the controller dropped.
 uint32_t twai_mcp251xfd_get_rx_overflow_count(void);
 
+// Bring-up diagnostics. task-context only; never call from an ISR.
+//
+// twai_mcp251xfd_dump_state() logs the adapter/driver state, the controller's
+// TREC/CON/INT/FIFOSTA/FIFOUA/TEFSTA/OSC/DEVID registers, overrun counters and
+// the interrupt thread's stack high-water mark. It performs SPI reads only
+// while the node is in use and started, so calling it on a sleeping controller
+// cannot wake it.
+//
+// twai_mcp251xfd_is_sleeping() reports whether the controller is believed to
+// be in Low Power Mode (a node that was never created counts as awake).
+void twai_mcp251xfd_dump_state(const char *why);
+bool twai_mcp251xfd_is_sleeping(void);
+
 #ifdef __cplusplus
 }
 #endif

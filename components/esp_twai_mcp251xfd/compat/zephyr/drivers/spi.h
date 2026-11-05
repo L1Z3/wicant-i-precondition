@@ -5,7 +5,17 @@
 #include "driver/spi_master.h"
 #include "hal/spi_ll.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "log_flash.h"
 #include <zephyr/device.h>
+
+// Bring-up diagnostics for the direct (LL) SPI path. The spin limit is a
+// last-resort hang detector: a normal 18-byte transfer at 16 MHz completes in
+// ~9 us, so it should never be reached.
+#define SPI_LL_TIMEOUT_SPINS 1000000U
+#define SPI_LL_SLOW_US       200
+#define SPI_LL_STATS_US      (10LL * 1000 * 1000)
+#define SPI_LL_TAG           "mcp251xfd_spi"
 
 // Zephyr SPI API on an ESP-IDF SPI device that the adapter adds and reserves.
 struct spi_dt_spec {
@@ -46,9 +56,34 @@ static inline bool spi_is_ready_dt(const struct spi_dt_spec *spec)
 // 80 MHz and prevents automatic light sleep from the first node creation
 // until restart, as the node is never freed; an explicit
 // esp_light_sleep_start() ignores it. Don't release the bus to save power.
-static inline void spi_transfer_ll(spi_dev_t *hw, const void *tx, void *rx, size_t len)
+//
+// Returns 0, or -EIO/-EINVAL; the statistics and the slow/stuck logs are
+// kept here so a transfer that hangs is reported with its length and the
+// flash-log marker.
+static inline int spi_transfer_ll(spi_dev_t *hw, const void *tx, void *rx, size_t len)
 {
+	// Statistics; the header is only included from the adapter's TU.
+	static uint32_t s_xfers;
+	static uint32_t s_timeouts;
+	static uint32_t s_max_us;
+	static uint64_t s_total_us;
+	static int64_t s_stats_us;
+	static int64_t s_slow_log_us;
 	size_t bits = len * 8;
+	int64_t t0 = esp_timer_get_time();
+	uint32_t spins = 0;
+	// Snapshot the file-log flash marker before the transfer. The LL loop
+	// runs from flash; if a littlefs write/erase starts while it polls, the
+	// CPU cannot execute the next instruction until the cache is back, and
+	// the sequence counter changes even though active is false again by the
+	// time we log.
+	uint32_t log_flash_seq0 = log_flash_seq();
+	bool log_flash_active0 = log_flash_active();
+
+	if (len > SOC_SPI_MAXIMUM_BUFFER_SIZE) {
+		ESP_LOGE(SPI_LL_TAG, "transfer too long for the LL path: %u bytes", (unsigned)len);
+		return -EINVAL;
+	}
 
 	// The IDF path leaves its DMA channels enabled on the peripheral, and with
 	// either DMA bit set the peripheral clocks from the DMA descriptor chain
@@ -66,17 +101,66 @@ static inline void spi_transfer_ll(spi_dev_t *hw, const void *tx, void *rx, size
 	spi_ll_apply_config(hw);
 	spi_ll_user_start(hw);
 	while (!spi_ll_usr_is_done(hw)) {
+		if (++spins >= SPI_LL_TIMEOUT_SPINS) {
+			s_timeouts++;
+			ESP_LOGE(SPI_LL_TAG, "LL transfer stuck: len=%u bits=%u spins=%lu "
+				 "cmd_usr=%lu done=%d timeouts=%lu log_flash=%d seq=%lu (SPI "
+				 "clock/CS/MISO or cache stall?)",
+				 (unsigned)len, (unsigned)bits, (unsigned long)spins,
+				 (unsigned long)spi_ll_get_running_cmd(hw),
+				 spi_ll_usr_is_done(hw), (unsigned long)s_timeouts,
+				 log_flash_active(), (unsigned long)log_flash_seq());
+			return -EIO;
+		}
 	}
 	if (rx) {
 		spi_ll_read_buffer(hw, rx, bits);
 	}
+
+	uint32_t log_flash_seq1 = log_flash_seq();
+	bool log_flash_active1 = log_flash_active();
+	bool log_flash_during = log_flash_active0 || log_flash_active1 ||
+				 log_flash_seq1 != log_flash_seq0;
+
+	int64_t dt = esp_timer_get_time() - t0;
+	s_xfers++;
+	s_total_us += (uint64_t)dt;
+	if ((uint32_t)dt > s_max_us) {
+		s_max_us = (uint32_t)dt;
+	}
+	if (dt > SPI_LL_SLOW_US) {
+		int64_t now_us = esp_timer_get_time();
+		if (now_us - s_slow_log_us > 1000000LL) {
+			s_slow_log_us = now_us;
+			ESP_LOGW(SPI_LL_TAG, "slow LL transfer: %lld us (len=%u bits=%u, "
+				 "max=%lu us, avg=%lu us over %lu transfers, log_flash=%d "
+				 "act=%d/%d seq=%lu->%lu)",
+				 (long long)dt, (unsigned)len, (unsigned)bits,
+				 (unsigned long)s_max_us,
+				 (unsigned long)(s_xfers ? s_total_us / s_xfers : 0),
+				 (unsigned long)s_xfers, log_flash_during,
+				 log_flash_active0, log_flash_active1,
+				 (unsigned long)log_flash_seq0, (unsigned long)log_flash_seq1);
+		}
+	}
+	int64_t now_us = esp_timer_get_time();
+	if (s_xfers != 0 && (now_us - s_stats_us) >= SPI_LL_STATS_US) {
+		s_stats_us = now_us;
+		ESP_LOGI(SPI_LL_TAG, "LL stats: %lu transfers, avg=%lu us, max=%lu us, "
+			 "timeouts=%lu",
+			 (unsigned long)s_xfers, (unsigned long)(s_total_us / s_xfers),
+			 (unsigned long)s_max_us, (unsigned long)s_timeouts);
+		s_xfers = 0;
+		s_total_us = 0;
+		s_max_us = 0;
+	}
+	return 0;
 }
 
 // Largest transfer the DMA path accepts: one CAN FD message object (8 header +
 // 64 payload bytes) plus its 2-byte command. Must match the bus's
 // max_transfer_sz.
 #define SPI_BOUNCE_LEN 128
-#define SPI_DMA_TAG      "mcp251xfd_spi"
 
 // DMA transfers need 4-byte-aligned buffers, and the driver's CAN FD object
 // buffer is a packed struct whose 2-byte command sits at a padded offset, so it
@@ -90,7 +174,7 @@ static inline int spi_transceive_dma(const struct spi_dt_spec *spec, const void 
 	static uint8_t bounce_rx[SPI_BOUNCE_LEN] __attribute__((aligned(4)));
 
 	if (len > SPI_BOUNCE_LEN) {
-		ESP_LOGE(SPI_DMA_TAG, "transfer too long: %u bytes", (unsigned)len);
+		ESP_LOGE(SPI_LL_TAG, "transfer too long: %u bytes", (unsigned)len);
 		return -EINVAL;
 	}
 	memcpy(bounce_tx, tx, len);
@@ -127,8 +211,7 @@ static inline int spi_transceive_dt(const struct spi_dt_spec *spec, const struct
 	void *rx_buf = rx ? rx->buffers[0].buf : NULL;
 
 	if (spec->hw && len <= SOC_SPI_MAXIMUM_BUFFER_SIZE) {
-		spi_transfer_ll(spec->hw, tx->buffers[0].buf, rx_buf, len);
-		return 0;
+		return spi_transfer_ll(spec->hw, tx->buffers[0].buf, rx_buf, len);
 	}
 
 	return spi_transceive_dma(spec, tx->buffers[0].buf, rx_buf, len);

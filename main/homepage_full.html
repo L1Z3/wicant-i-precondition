@@ -472,6 +472,7 @@
                 border-radius: 4px;
             }
         }
+
     </style>
 </head>
 
@@ -1114,6 +1115,18 @@
                         <input type="text" id="specific_init" name="specific_init" oninput="enableAutoStoreButton()">
                     </td>
                 </tr>
+                <tr>
+                    <td>Log Level:</td>
+                    <td>
+                        <select id="log_level" name="log_level" onchange="submit_enable();">
+                            <option value="none">None</option>
+                            <option value="error">Error</option>
+                            <option value="warn">Warning</option>
+                            <option value="info">Info</option>
+                        </select>
+                        Applies after boot; boot messages always log at Info.
+                    </td>
+                </tr>
             </table>
 
             <div id="specific_pids_table">
@@ -1471,6 +1484,7 @@
             </table>
         </div>
 
+
         <input id="submit_button" name="submit_button" type="button" onclick="postConfig()" value="Submit Changes" disabled />
     </div>
     
@@ -1555,6 +1569,7 @@
                 warning.style.display = "none";
             }
         }
+
 		let latest_car_models = null;
 		// does this board have the car-on sense pin? read from /check_status;
 		// car-off sleep shows the live car-on voltage only when it does
@@ -2740,6 +2755,7 @@ function loadAutoTable(jsonData) {
                 document.getElementById("car_on_sense_voltage").innerHTML = obj.car_on_sense_voltage;
             }
             toggleSleepVoltageEnabled();
+
 			if(obj.port_type == "tcp") {
 				document.getElementById("port_type_status").innerHTML = "TCP";
 			} else if(obj.port_type == "udp") {
@@ -3091,6 +3107,7 @@ function loadAutoTable(jsonData) {
         obj["precon_mode"] = document.getElementById("precon_mode").value;
         obj["precon_button"] = document.getElementById("precon_button").value;
         obj["precon_press"] = document.getElementById("precon_press").value;
+        obj["log_level"] = document.getElementById("log_level").value;
 		var configJSON = JSON.stringify(obj);
         const storeResult = await storeAutoTableData();
         if (!storeResult) {
@@ -3468,6 +3485,10 @@ function loadAutoTable(jsonData) {
                 carSelect.value = "auto";
             }
             updatePreconButtonVisibility();
+            syncPreconButtonToggle();
+            // log_level is missing from older configs; the firmware
+            // defaults it to "warn"
+            document.getElementById("log_level").value = obj.log_level || "warn";
 			if(obj.batt_alert_time == "1") {
 				document.getElementById("batt_alert_time").selectedIndex = "0";
 			} else if(obj.batt_alert_time == "6") {

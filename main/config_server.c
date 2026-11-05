@@ -77,6 +77,7 @@
 #include "precondition.h"
 #include "track_popup.h"
 #include "esp_timer.h"
+#include "log_stream.h"
 
 #define WIFI_CONNECTED_BIT			BIT0
 #define WS_CONNECTED_BIT			BIT1
@@ -170,8 +171,10 @@ const char device_config_default[] = R"json({
 "egmp_car_model":"auto",
 "precon_mode":"once",
 "precon_button":"sw_star",
-"precon_press":"short"
+"precon_press":"short",
+"log_level":"warn"
 })json";
+
 static device_config_t device_config;
 TimerHandle_t xrestartTimer;
 
@@ -831,6 +834,132 @@ static esp_err_t logo_handler(httpd_req_t *req)
 	httpd_resp_set_type(req, "image/svg+xml");
     httpd_resp_send(req, (const char*)resp_str, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
+}
+
+// How long a follow stream may stay quiet before a keep-alive newline chunk.
+#define LOG_STREAM_HEARTBEAT_US (15LL * 1000 * 1000)
+
+// Streams the RAM log as plain text and keeps the response open while the
+// device writes, so a reader sees lines as they are produced. Nothing is kept
+// on flash: the ring is the whole history and old bytes are overwritten.
+//
+// A cursor is the byte position in that stream (0 at boot). A fresh request
+// starts at the oldest buffered byte; ?after=<n> resumes where a previous one
+// stopped. The X-Log-Start response header is the position of the first body
+// byte, so a reader can count on from there. ?once=1 returns what is buffered
+// and closes instead of following. After a quiet spell a single newline chunk
+// tells the reader the stream is still alive.
+static esp_err_t logs_handler(httpd_req_t *req)
+{
+	char chunk[1024];
+	uint32_t buffered = 0, dropped = 0;
+	uint64_t pos = 0;
+	bool have_pos = false;
+	bool once = false;
+
+	char query[64];
+	char value[24];
+	if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK)
+	{
+		if (httpd_query_key_value(query, "after", value, sizeof(value)) == ESP_OK)
+		{
+			char *end = NULL;
+			pos = strtoull(value, &end, 10);
+			have_pos = (end != value);
+		}
+		if (httpd_query_key_value(query, "once", value, sizeof(value)) == ESP_OK)
+		{
+			once = strcmp(value, "0") != 0;
+		}
+	}
+
+	log_stream_get_stats(&buffered, &dropped);
+	uint64_t total = log_stream_total();
+	if (!have_pos)
+	{
+		// Everything the ring still holds.
+		pos = total >= buffered ? total - buffered : 0;
+	}
+
+	char hdr[24];
+	snprintf(hdr, sizeof(hdr), "%llu", (unsigned long long)pos);
+	httpd_resp_set_type(req, "text/plain");
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	httpd_resp_set_hdr(req, "X-Log-Start", hdr);
+	if (dropped > 0)
+	{
+		snprintf(hdr, sizeof(hdr), "%lu", (unsigned long)dropped);
+		httpd_resp_set_hdr(req, "X-Log-Dropped", hdr);
+	}
+
+	bool ok = true;
+	int64_t idle_since = esp_timer_get_time();
+	while (ok)
+	{
+		size_t n = log_stream_read(&pos, chunk, sizeof(chunk));
+		if (n > 0)
+		{
+			ok = httpd_resp_send_chunk(req, chunk, n) == ESP_OK;
+			idle_since = esp_timer_get_time();
+		}
+		else if (once)
+		{
+			break;
+		}
+		else if (esp_timer_get_time() - idle_since >= LOG_STREAM_HEARTBEAT_US)
+		{
+			ok = httpd_resp_send_chunk(req, "\n", 1) == ESP_OK;
+			idle_since = esp_timer_get_time();
+		}
+		else
+		{
+			vTaskDelay(pdMS_TO_TICKS(50));
+		}
+	}
+
+	if (ok)
+	{
+		httpd_resp_send_chunk(req, NULL, 0);
+	}
+	return ok ? ESP_OK : ESP_FAIL;
+}
+
+// Emits one log line at the requested level so the web UI's live log view
+// can demonstrate itself. The tag's level is forced to Info first: the test
+// buttons must produce output even when the configured post-boot level
+// would filter that severity.
+static esp_err_t test_log_handler(httpd_req_t *req)
+{
+	static const char *test_tag = "LOG_TEST";
+	char query[32] = {0};
+	char level[8] = {0};
+
+	if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK)
+	{
+		httpd_query_key_value(query, "level", level, sizeof(level));
+	}
+
+	esp_log_level_set(test_tag, ESP_LOG_INFO);
+	if (strcmp(level, "error") == 0)
+	{
+		ESP_LOGE(test_tag, "test error message from the web UI");
+	}
+	else if (strcmp(level, "warn") == 0)
+	{
+		ESP_LOGW(test_tag, "test warning message from the web UI");
+	}
+	else if (strcmp(level, "info") == 0)
+	{
+		ESP_LOGI(test_tag, "test info message from the web UI");
+	}
+	else
+	{
+		httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "level must be info, warn or error");
+		return ESP_FAIL;
+	}
+
+	httpd_resp_sendstr(req, "Logged");
+	return ESP_OK;
 }
 
 static esp_err_t store_auto_data_handler(httpd_req_t *req)
@@ -1856,6 +1985,18 @@ static const httpd_uri_t logo_uri = {
      * context to demonstrate it's usage */
     .user_ctx  = NULL
 };
+static const httpd_uri_t logs_uri = {
+    .uri       = "/logs",
+    .method    = HTTP_GET,
+    .handler   = logs_handler,
+    .user_ctx  = NULL
+};
+static const httpd_uri_t test_log_uri = {
+    .uri       = "/test_log",
+    .method    = HTTP_POST,
+    .handler   = test_log_handler,
+    .user_ctx  = NULL
+};
 static const httpd_uri_t ws = {
         .uri        = "/ws",
         .method     = HTTP_GET,
@@ -2512,6 +2653,21 @@ static void config_server_load_cfg(char *cfg)
 	//*****
 
 	//*****
+	key = cJSON_GetObjectItem(root,"log_level");
+	if(key == 0 || !cJSON_IsString(key) ||
+	   (strcmp(key->valuestring, "none") != 0 && strcmp(key->valuestring, "error") != 0 &&
+	    strcmp(key->valuestring, "warn") != 0 && strcmp(key->valuestring, "info") != 0))
+	{
+		strcpy(device_config.log_level, "warn");
+	}
+	else
+	{
+		strlcpy(device_config.log_level, key->valuestring, sizeof(device_config.log_level));
+	}
+	ESP_LOGI(TAG, "device_config.log_level: %s", device_config.log_level);
+	//*****
+
+	//*****
 	key = cJSON_GetObjectItem(root,"sta_security");
 	if(key == 0)
 	{
@@ -2761,6 +2917,8 @@ static httpd_handle_t config_server_init(void)
         httpd_register_uri_handler(server, &check_status_uri);
         httpd_register_uri_handler(server, &load_config_uri);
         httpd_register_uri_handler(server, &logo_uri);
+        httpd_register_uri_handler(server, &logs_uri);
+        httpd_register_uri_handler(server, &test_log_uri);
         httpd_register_uri_handler(server, &ws);
         httpd_register_uri_handler(server, &file_upload);
 		httpd_register_uri_handler(server, &system_reboot);
@@ -2802,6 +2960,8 @@ void config_server_restart(void)
         httpd_register_uri_handler(server, &check_status_uri);
         httpd_register_uri_handler(server, &load_config_uri);
         httpd_register_uri_handler(server, &logo_uri);
+        httpd_register_uri_handler(server, &logs_uri);
+        httpd_register_uri_handler(server, &test_log_uri);
         httpd_register_uri_handler(server, &ws);
         httpd_register_uri_handler(server, &file_upload);
 		httpd_register_uri_handler(server, &system_reboot);
@@ -3366,4 +3526,21 @@ int8_t config_server_precon_press(void)
 		return PRESS_LONG;
 	}
 	return PRESS_SHORT;
+}
+
+esp_log_level_t config_server_get_log_level(void)
+{
+	if(strcmp(device_config.log_level, "none") == 0)
+	{
+		return ESP_LOG_NONE;
+	}
+	else if(strcmp(device_config.log_level, "error") == 0)
+	{
+		return ESP_LOG_ERROR;
+	}
+	else if(strcmp(device_config.log_level, "info") == 0)
+	{
+		return ESP_LOG_INFO;
+	}
+	return ESP_LOG_WARN;
 }

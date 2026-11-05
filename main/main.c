@@ -28,6 +28,8 @@
 #include "nvs_flash.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_chip_info.h"
+#include "esp_heap_caps.h"
 #include <string.h>
 #include "esp_timer.h"
 #include "comm_server.h"
@@ -59,8 +61,24 @@
 #include "beep.h"
 #include "debug_logs.h"
 #include "debug_logs_config.h"
+#include "log_stream.h"
 
 #define TAG 		__func__
+
+// Compile-time timestamp source, logged at boot so a capture can be checked
+// against the build that produced it. RTOS ticks pause in light sleep, so
+// CONFIG_LOG_TIMESTAMP_SOURCE_SYSTEM is what makes sleep time visible.
+#if CONFIG_LOG_TIMESTAMP_SOURCE_SYSTEM
+#define LOG_TS_NAME "system"
+#elif CONFIG_LOG_TIMESTAMP_SOURCE_SYSTEM_FULL
+#define LOG_TS_NAME "system_full"
+#elif CONFIG_LOG_TIMESTAMP_SOURCE_UNIX
+#define LOG_TS_NAME "unix"
+#elif CONFIG_LOG_TIMESTAMP_SOURCE_RTOS
+#define LOG_TS_NAME "rtos"
+#else
+#define LOG_TS_NAME "none"
+#endif
 
 // The ESP32-S3 temperature sensor is a die/package proxy, not ambient. Log it
 // slowly so it can be correlated with resets or CAN faults without adding load.
@@ -562,8 +580,6 @@ static void can_rx_task(void *pvParameters)
 	}
 }
 
-// CAN-FD is a separate, host-only path: no forwarding, no preconditioning,
-// and no MQTT/BLE replication. It only has a GVRET encoder on TCP.
 static void can_fd_rx_task(void *pvParameters)
 {
 	while (1)
@@ -592,6 +608,29 @@ static void can_fd_rx_task(void *pvParameters)
 					 (unsigned long)fd_host_drop_cnt);
 			}
 		}
+	}
+}
+
+static const char *reset_reason_name(esp_reset_reason_t reason)
+{
+	switch (reason) {
+	case ESP_RST_UNKNOWN: return "unknown";
+	case ESP_RST_POWERON: return "power-on";
+	case ESP_RST_EXT: return "external";
+	case ESP_RST_SW: return "software/esp_restart";
+	case ESP_RST_PANIC: return "panic";
+	case ESP_RST_INT_WDT: return "interrupt watchdog";
+	case ESP_RST_TASK_WDT: return "task watchdog";
+	case ESP_RST_WDT: return "other watchdog";
+	case ESP_RST_DEEPSLEEP: return "deep sleep";
+	case ESP_RST_BROWNOUT: return "brownout";
+	case ESP_RST_SDIO: return "sdio";
+	case ESP_RST_USB: return "usb";
+	case ESP_RST_JTAG: return "jtag";
+	case ESP_RST_EFUSE: return "efuse";
+	case ESP_RST_PWR_GLITCH: return "power glitch";
+	case ESP_RST_CPU_LOCKUP: return "cpu lockup";
+	default: return "?";
 	}
 }
 
@@ -630,6 +669,39 @@ static void temperature_proxy_task(void *arg)
 
 void app_main(void)
 {
+	// Hook esp_log before anything else logs: from here on the device keeps a
+	// RAM ring that /logs streams; nothing is written to flash.
+	log_stream_init();
+
+	esp_chip_info_t chip_info;
+
+	esp_chip_info(&chip_info);
+	ESP_LOGI(TAG, "===== boot: hw=%s git=%s idf=%s =====",
+			 HARDWARE_VERSION, GIT_SHA, IDF_VER);
+	ESP_LOGI(TAG, "boot: chip=%d rev=%d cores=%d | flash cfg=%s | psram total=%lu bytes "
+			 "(SPIRAM=%d mode=%s) | partition table %s",
+			 chip_info.model, chip_info.revision, (int)chip_info.cores,
+			 CONFIG_ESPTOOLPY_FLASHSIZE,
+			 (unsigned long)heap_caps_get_total_size(MALLOC_CAP_SPIRAM),
+#if CONFIG_SPIRAM
+			 1,
+#else
+			 0,
+#endif
+#if CONFIG_SPIRAM_MODE_OCT
+			 "octal",
+#else
+			 "quad",
+#endif
+			 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME);
+	ESP_LOGI(TAG, "boot: reset reason=%d (%s), heap free=%lu internal=%lu largest=%lu",
+			 esp_reset_reason(), reset_reason_name(esp_reset_reason()),
+			 (unsigned long)esp_get_free_heap_size(),
+			 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+			 (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+
+	hw_config_log();
+
 	dev_status_init();
 	dev_status_set_bits(DEV_AWAKE_BIT);
     ESP_ERROR_CHECK(nvs_flash_init());
@@ -657,11 +729,15 @@ void app_main(void)
     gpio_reset_pin(CAN_STDBY_GPIO_NUM);
     gpio_set_direction(CAN_STDBY_GPIO_NUM, GPIO_MODE_OUTPUT);
     gpio_set_level(CAN_STDBY_GPIO_NUM, 1);
+    ESP_LOGI(TAG, "CAN transceiver STDBY GPIO%d -> 1 (standby) at boot", CAN_STDBY_GPIO_NUM);
 #endif
 #ifdef MCP2518FD_STDBY_GPIO_NUM
     gpio_reset_pin(MCP2518FD_STDBY_GPIO_NUM);
     gpio_set_direction(MCP2518FD_STDBY_GPIO_NUM, GPIO_MODE_OUTPUT);
     gpio_set_level(MCP2518FD_STDBY_GPIO_NUM, 1);
+    ESP_LOGI(TAG, "TCAN3413 STB GPIO%d -> 1 (standby) at boot; the MCP2518FD "
+             "controller is not asleep until bus 1 is enabled and disabled once",
+             MCP2518FD_STDBY_GPIO_NUM);
 #endif
 
     xMsg_Rx_Queue = xQueueCreate(16, sizeof( xdev_buffer) );
@@ -681,6 +757,19 @@ void app_main(void)
             derived_mac_addr[3], derived_mac_addr[4], derived_mac_addr[5]);
 	
 	config_server_start(&xmsg_ws_tx_queue, &xMsg_Rx_Queue, CONNECTED_LED_GPIO_NUM, (char*)&uid[0]);
+	// config_server_start loaded the config, so the configured log level takes
+	// effect from here. The ring itself was allocated in log_stream_init().
+	// One line that pins down exactly how this capture is configured; the
+	// timestamp source is compile-time and easy to get wrong when only the
+	// web UI setting is changed.
+	ESP_LOGW(TAG, "logging: level=%d ring=%lu KB timestamp=%s",
+			 (int)config_server_get_log_level(),
+			 (unsigned long)(log_stream_size() / 1024), LOG_TS_NAME);
+#if CONFIG_LOG_TIMESTAMP_SOURCE_RTOS
+	ESP_LOGW(TAG, "logging: RTOS timestamps pause in light sleep; rebuild with "
+			 "CONFIG_LOG_TIMESTAMP_SOURCE_SYSTEM to see real sleep time");
+#endif
+
 	// These services read wiring and preconditioning settings during initialization.
 	beep_init();
 	precondition_init();
@@ -709,6 +798,16 @@ void app_main(void)
 	xTaskCreate(can_rx_task, "can_rx_task", 1024*3, (void*)AF_INET, 7, NULL);
 #if HW_HAS_MCP2518FD
 	xTaskCreate(can_fd_rx_task, "can_fd_rx", 1024*4, NULL, 5, NULL);
+#endif
+
+	ESP_LOGI(TAG, "CAN config: protocol=%d fwd_en=%d | can0 rate_idx=%d mode=%d | can1 en=%d",
+			 config_server_protocol(), config_server_get_fwd_en(), can_datarate,
+			 config_server_get_can_mode(), config_server_get_can1_en());
+#if CAN_BUS_COUNT > 1
+	ESP_LOGI(TAG, "CAN config: can1 rate_idx=%d mode=%d", config_server_get_can1_rate(),
+			 config_server_get_can1_mode());
+#else
+	ESP_LOGI(TAG, "CAN config: single-bus variant, bus 1 not present");
 #endif
 
 	if(can_datarate != -1)
@@ -757,7 +856,17 @@ void app_main(void)
 
 	if(config_server_get_can1_en())
 	{
+		ESP_LOGI(TAG, "can1: enabled by config, bringing bus 1 up");
 		can_enable(CAN_BUS_1);
+	}
+	else
+	{
+		ESP_LOGW(TAG, "can1: disabled by config; bus 1 will not be initialised");
+#if HW_HAS_MCP2518FD
+		ESP_LOGW(TAG, "can1: disabled means the MCP2518FD is never created or put in "
+				 "Low Power Mode; expect it to draw its normal operating current "
+				 "while the rest of the device sleeps");
+#endif
 	}
 
 	// MITM: the head unit reaches the rest of the bus only through us, so
@@ -834,6 +943,16 @@ void app_main(void)
 //		mqtt_init((char*)&uid[0], CONNECTED_LED_GPIO_NUM, &xmsg_mqtt_rx_queue);
 //	}
 
+
+	ESP_LOGI(TAG, "boot CAN setup complete: protocol=%d, can0=%d, bus1_present=%d",
+			 protocol, (int)can_is_enabled(CAN_BUS_0),
+#if CAN_BUS_COUNT > 1
+			 (int)can_is_enabled(CAN_BUS_1)
+#else
+			 0
+#endif
+			 );
+	can_dump_diagnostics("boot");
 
 	wifi_network_init(NULL, NULL);
 	int32_t port = config_server_get_port();
@@ -924,13 +1043,41 @@ void app_main(void)
 	// pdTRUE, /* BIT_0 should be cleared before returning. */
 	// pdFALSE, /* Don't wait for both bits, either bit will do. */
 	// portMAX_DELAY);/* Wait forever. */  
-	// esp_log_level_set("*", ESP_LOG_NONE);
-	esp_log_level_set("*", ESP_LOG_WARN);
-	esp_log_level_set(TEMP_PROXY_TAG, ESP_LOG_INFO);
+	// Boot always logs at the compiled-in default level; from here on the
+	// configured post-boot level applies (default warn). CAN/ADC diagnostics
+	// stay at Info even at the default Warn so a capture does not silently
+	// omit the 60 s dump, ADC summaries or bus state recovery; Error/None
+	// still means fully quiet.
+	esp_log_level_t post_level = config_server_get_log_level();
+	esp_log_level_set("*", post_level);
+	if (post_level == ESP_LOG_WARN || post_level == ESP_LOG_INFO)
+	{
+		static const char *const diag_tags[] = {
+			"can_dump_diagnostics",
+			"read_ss_adc_voltage",
+			"adc_task",
+			"mcp251xfd",
+			"can_mcp251xfd",
+			"mcp251xfd_spi",
+			"log_stream",
+			"temp_proxy",
+			"can_recovery_task",
+			"can_enable",
+			"can_disable",
+			"can_bus1_create_node",
+			"can_mcp2518fd_bus_init",
+			"can_transceiver_standby",
+		};
+		for (size_t i = 0; i < sizeof(diag_tags) / sizeof(diag_tags[0]); i++)
+		{
+			esp_log_level_set(diag_tags[i], ESP_LOG_INFO);
+		}
+	}
 
 	// A die-temperature trace is useful when chasing resets under load, but it
 	// is not an ambient measurement. The task reads once a minute and does not
-	// touch the CAN paths.
+	// touch the CAN paths. The temp_proxy tag is included in diag_tags above,
+	// so it follows the configured post-boot log level.
 	temperature_sensor_config_t temp_cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 80);
 	temperature_sensor_handle_t temp_sensor = NULL;
 	esp_err_t temp_err = temperature_sensor_install(&temp_cfg, &temp_sensor);

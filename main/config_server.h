@@ -24,6 +24,7 @@
 #include "esp_tls_crypto.h"
 #include <stdbool.h>
 #include <esp_http_server.h>
+#include "esp_log.h"
 
 #define AP_MODE				0
 #define APSTA_MODE			1
@@ -145,6 +146,7 @@ typedef struct _device_config
     char precon_mode[16];
     char precon_button[32];
     char precon_press[16];
+    char log_level[10];
 }device_config_t;
 
 
@@ -215,3 +217,4 @@ int8_t config_server_precon_button(void);
 bool config_server_temperature_fahrenheit(void);
 int8_t config_server_precon_mode(void);
 int8_t config_server_precon_press(void);
+esp_log_level_t config_server_get_log_level(void);

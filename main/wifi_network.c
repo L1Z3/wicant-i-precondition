@@ -34,7 +34,7 @@
  #include "config_server.h"
  #include "ble.h"
  #include "dev_status.h"
- #include "wifi_network.h"
+#include "wifi_network.h"
  
  #define WIFI_CONNECTED_BIT 			BIT0
  #define WIFI_FAIL_BIT     			BIT1
@@ -174,7 +174,7 @@
      {
          return;
      }
- 
+
      xEventGroupWaitBits(s_wifi_event_group,
                          WIFI_CONNECT_IDLE_BIT,
                          pdFALSE,
@@ -238,7 +238,7 @@
      }
      else return 0;
  }
- 
+
  // Whether the Wi-Fi driver has been initialized and not yet deinitialized.
  // Used by background tasks (e.g. the GVRET broadcast socket) to stay quiet
  // while the device is sleeping or BLE has taken over the radio.
