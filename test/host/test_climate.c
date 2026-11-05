@@ -58,6 +58,10 @@ static const uint8_t trailer_payload[8] = {0};
 // 0x4DD is 5 Hz on this car and only byte 2 moves when the session opens
 static const uint8_t state_payload[8] = {0x00U, 0x00U, 0x00U, 0x00U,
                                          0x08U, 0x00U, 0x00U, 0x00U};
+// pending marker the head unit raises in byte 2 while its own request is in
+// flight, which a start now mirrors
+static const uint8_t state_pending_payload[8] = {0x00U, 0x00U, 0xFEU, 0x00U,
+                                                0x08U, 0x00U, 0x00U, 0x00U};
 // lock: request/apply differ only in the follow-up state nibble (D6 0x40)
 static const uint8_t lock_request_payload[8] = {0x00U, 0x00U, 0xF3U, 0x43U,
                                                 0x00U, 0x00U, 0xC0U, 0x00U};
@@ -177,7 +181,7 @@ static void suite_blocking_window(void) {
     // a second request while this one is queued is refused, and off the end of
     // the table is an argument error rather than a run
     CHECK(climate_request_start(0) == ESP_ERR_INVALID_STATE);
-    CHECK(climate_request_start(4) == ESP_ERR_INVALID_ARG);
+    CHECK(climate_request_start(5) == ESP_ERR_INVALID_ARG);
 }
 
 // The full climate start: wake bit first, a one second lead with the session
@@ -234,15 +238,26 @@ static void suite_start(void) {
                 }
             }
             if (sent[k].id == 0x4DDU) {
-                CHECK(memcmp(sent[k].data, state_payload, 8U) == 0);
+                // a start raises the pending marker in byte 2 until the apply,
+                // exactly as the head unit does for its own requests
+                CHECK(memcmp(sent[k].data, state_pending_payload, 8U) == 0
+                      || memcmp(sent[k].data, state_payload, 8U) == 0);
                 state++;
             }
             if (sent[k].id == 0x39BU) {
                 CHECK_MSG(sent[k].data[3] == counter, "0x39B counter %02X at %u",
                           (unsigned)sent[k].data[3], (unsigned)k);
-                // the session heartbeat always carries class 0 and phase 0;
-                // only the stop telegram raises those bytes
-                CHECK(sent[k].data[5] == 0x00U && sent[k].data[6] == 0x00U);
+                // a start opens the session the way the telematics unit does:
+                // class 1 while the window opens, class 3 afterwards, phase 0x10
+                // class 0 phase 0 is the plain heartbeat; while the session is
+                // being announced the same frame carries class 1 then class 3
+                // with phase 0x10, as the telematics unit sends it
+                if (sent[k].data[5] == 0x00U) {
+                    CHECK(sent[k].data[6] == 0x00U);
+                } else {
+                    CHECK(sent[k].data[5] == 0x01U || sent[k].data[5] == 0x03U);
+                    CHECK(sent[k].data[6] == 0x10U);
+                }
                 CHECK(sent[k].data[1] == 0x10U);
                 counter = (uint8_t)((counter + 4U) & 0x3FU);
                 tmu_count++;

@@ -102,6 +102,7 @@
 #define CLIMATE_REQUEST_FRAME_ID 0x4A2U
 #define CLIMATE_OPCODE_FRAME_ID 0x0C7U
 #define CLIMATE_TMU_FRAME_ID 0x39BU
+#define CLIMATE_STATE_FRAME_ID 0x4DDU
 
 // The car announces the cabin setpoint the way its own ECUs do: the telematics
 // frame 0x39B carries it in byte 1, the VCU re-broadcasts it on M-CAN in 0x2AC
@@ -280,6 +281,13 @@ static const uint8_t trailer_data[8] = {0x00U, 0x00U, 0x00U, 0x00U,
 static const uint8_t state_data[8] = {0x00U, 0x00U, 0x00U, 0x00U,
                                       0x08U, 0x00U, 0x00U, 0x00U};
 
+// While the head unit itself carries a remote request it raises byte 2 of 0x4DD
+// to 0xFE ("a command is pending") and drops it back to 0x00 at the apply. Our
+// replay never did that, which is the one head-unit-side difference that lines
+// up with the car ignoring an awake-car start. See the header comment.
+static const uint8_t state_pending_data[8] = {0x00U, 0x00U, 0xFEU, 0x00U,
+                                              0x08U, 0x00U, 0x00U, 0x00U};
+
 static void send_frame_on(can_bus_t bus, uint32_t identifier,
                           const uint8_t data[8]) {
     twai_message_t packet = {0};
@@ -372,6 +380,18 @@ static void send_idle_frame(void) {
 // and byte 6 (the phase) are zero except while a command is being executed.
 // Sending a permanent class 0x03 phase 0x10 here made the car treat every
 // replay as a stop, which is how the 2026-11-04 stop telegram was found.
+// A real start announces the session on I-CAN before the M-CAN command: the
+// TMU sends 0x39B as `50 <setpoint> 00 <ctr> 00 01 10 00` (class 1, phase
+// 0x10) while the head unit is opening the window. Our replay only ever sent
+// the plain heartbeat (class 0), which is the one difference left on the
+// telematics side. The stop already uses the same class-1 preamble and works.
+static void send_tmu_session_open(uint8_t tmu_class, uint8_t phase) {
+    uint8_t data[8] = {0x50U, climate.setpoint_raw, 0x00U,
+                       climate.session_counter, 0x00U, tmu_class, phase, 0x00U};
+    climate.session_counter = (uint8_t)((climate.session_counter + 4U) & 0x3FU);
+    send_frame_on(CLIMATE_TMU_BUS, CLIMATE_TMU_FRAME_ID, data);
+}
+
 static void send_tmu_frame(const climate_command_t *command, bool running) {
     uint8_t data[8] = {(uint8_t)(running ? command->tmu_state : 0x00U),
                        climate.setpoint_raw, 0x00U, climate.session_counter, 0x00U,
@@ -425,9 +445,22 @@ static void send_session_frames(const climate_command_t *command, uint32_t tick)
             }
         }
     } else if (phase == 3U) {
-        send_tmu_frame(command, running);
+        if (command->climate_start && tick < CLIMATE_WAKE_LEAD_TICKS) {
+            send_tmu_session_open(0x01U, 0x10U);
+        } else if (command->climate_start && tick < CLIMATE_TRAILER_TICK) {
+            send_tmu_session_open(0x03U, 0x10U);
+        } else {
+            send_tmu_frame(command, running);
+        }
     } else if (phase == 4U) {
-        send_climate_frame(0x4DDU, state_data);
+        // A start on an awake car is the case the car ignores; show it the
+        // pending marker the head unit raises for its own requests, then let the
+        // byte fall back to 0x00 once the apply has gone out.
+        if (command->climate_start && tick < CLIMATE_TRAILER_TICK) {
+            send_climate_frame(CLIMATE_STATE_FRAME_ID, state_pending_data);
+        } else {
+            send_climate_frame(CLIMATE_STATE_FRAME_ID, state_data);
+        }
     }
     if ((tick % CLIMATE_KEEPALIVE_TICKS) == 11U) {
         send_wake_frame();
