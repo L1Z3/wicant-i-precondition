@@ -1,9 +1,10 @@
 # Host-side tests
 
 Plain-C tests that compile the hardware-independent firmware sources
-(`main/hsm.c`, `main/precondition.c`, and `main/persistent_settings.c`) against
-stub ESP-IDF headers and drive them with a fake clock and fake CAN traffic.
-They need no ESP-IDF install and no hardware to run:
+(`main/hsm.c`, `main/precondition.c`, `main/persistent_settings.c`, and
+`main/car_settings.c`) against stub ESP-IDF headers and drive them with a fake
+clock and fake CAN traffic. They need no ESP-IDF install and no hardware to
+run:
 
 ```sh
 make -C test/host
@@ -27,6 +28,7 @@ test/host/
     driver/twai.h  freertos/FreeRTOS.h  freertos/queue.h  freertos/task.h
   test_hsm.c            state machine engine semantics
   test_precondition.c   precondition features (built for two bus counts)
+  test_car_settings.c   charge-limit bridging and injection (two bus counts)
 ```
 
 ## How it works
@@ -42,16 +44,16 @@ tests against it.
 Each `test_*.c` is one self-contained test program: it must run everything it
 covers and exit 0 on success, non-zero on failure.
 
-`test_precondition.c` is the exception to one-binary-per-source: `precondition.c`
-picks the head-unit bus from `CAN_BUS_COUNT` (on a single-bus board
-`HEAD_UNIT_BUS` falls back to `CAN_BUS_0`), so the suite is built twice —
-`build/test_precondition` for the two-bus custom board and
-`build/test_precondition_1bus` with `-DCAN_BUS_COUNT=1` for the v300 board — and
-both run under `make`. Each build passes its configuration as
-`-DEXPECT_CAN_BUS_COUNT=<n>` and `run_suite()` asserts it, because the suite is
-self-consistent under either value: without that marker a stub or flag
-regression could run the same configuration twice and leave the single-bus
-branches uncovered.
+The bus-count suites are the exception to one-binary-per-source:
+`precondition.c` and `car_settings.c` both pick the head-unit bus from
+`CAN_BUS_COUNT` (on a single-bus board `HEAD_UNIT_BUS` falls back to
+`CAN_BUS_0`), so each is built twice — `build/test_precondition` and
+`build/test_car_settings` for the two-bus custom board, and the `_1bus`
+binaries with `-DCAN_BUS_COUNT=1` for the v300 board — and all run under
+`make`. Each build passes its configuration as `-DEXPECT_CAN_BUS_COUNT=<n>`
+and `run_suite()` asserts it, because a suite can be self-consistent under
+either value: without that marker a stub or flag regression could run the same
+configuration twice and leave the single-bus branches uncovered.
 
 ## Adding a test
 
@@ -74,14 +76,16 @@ branches uncovered.
    because the real header takes it from `hw_config.h`; leave it undefined and
    `#if CAN_BUS_COUNT > 1` silently compiles the single-bus side. A test needing
    the other configuration needs its own explicit rule, as
-   `build/test_precondition_1bus` has.
+   `build/test_precondition_1bus` and `build/test_car_settings_1bus` have.
 
 ## Quirks worth knowing
 
-- `test_precondition` forks a child per suite: the firmware's config snapshot,
-  repeating-mode latch, and platform discovery flags live in process static
-  storage, so each mode/press combination needs a fresh process. Run one suite directly with
-  `build/test_precondition <name substring>` (e.g. `continuous`).
+- `test_precondition` and `test_car_settings` fork a child per suite: the
+  firmware's config snapshot, repeating-mode latch, and platform discovery
+  flags (precondition) or the whole charge-limit state (car_settings) live in
+  process static storage, so each scenario needs a fresh process. Run one suite
+  directly with `build/test_precondition <name substring>` (e.g. `continuous`)
+  or `build/test_car_settings <name substring>` (e.g. `conflict`).
 - The `nvs.h` stub is an in-memory single-slot fake; tests seed and inspect
   it through `fake_nvs_exists`/`fake_nvs_value` (see the persistent-restore
   suite).

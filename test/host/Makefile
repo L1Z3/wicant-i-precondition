@@ -9,9 +9,9 @@
 # Adding a test: drop test_<name>.c in this directory; it is discovered
 # automatically, built as its own binary, and run by `make`. See README.md.
 #
-# The precondition and beep suites are also built with -DCAN_BUS_COUNT=1
-# (see SINGLE_BUS_BINS below) so the v300/single-bus preprocessor branches are
-# exercised rather than merely compiled out.
+# The precondition, beep, and car_settings suites are also built with
+# -DCAN_BUS_COUNT=1 (see SINGLE_BUS_BINS below) so the v300/single-bus
+# preprocessor branches are exercised rather than merely compiled out.
 #
 # Firmware sources under test are copied into build/src first: for quoted
 # #includes the compiler searches the including file's own directory before
@@ -23,7 +23,8 @@ MAIN := ../../main
 # firmware files tests compile against (copied into build/src)
 FW_FILES := utf8_utf16_converter.c utf8_utf16_converter.h hsm.c hsm.h beep.c beep.h \
 	isotp_tx.c isotp_tx.h track_popup.c track_popup.h \
-	precondition.c precondition.h persistent_settings.c persistent_settings.h
+	precondition.c precondition.h persistent_settings.c persistent_settings.h \
+	car_settings.c car_settings.h
 # firmware sources linked into every test binary (tests that #include a
 # source instead, for introspection, don't list it here)
 LINK_SRCS := build/src/hsm.c
@@ -32,9 +33,9 @@ CC ?= cc
 CFLAGS ?= -std=gnu17 -Wall -Wextra -Wno-unused-parameter -g -pthread
 CPPFLAGS += -Istubs -Isupport -Ibuild/src
 
-# every test_*.c, plus single-bus builds of the precondition and beep suites
-# so their CAN_BUS_COUNT fallbacks run in CI
-SINGLE_BUS_BINS := build/test_precondition_1bus build/test_beep_single_bus
+# every test_*.c, plus single-bus builds of the precondition, beep and
+# car_settings suites so their CAN_BUS_COUNT fallbacks run in CI
+SINGLE_BUS_BINS := build/test_precondition_1bus build/test_beep_single_bus build/test_car_settings_1bus
 TEST_BINS := $(patsubst %.c,build/%,$(wildcard test_*.c)) $(SINGLE_BUS_BINS)
 FW_COPIES := $(addprefix build/src/,$(FW_FILES))
 HEADERS := $(wildcard stubs/*.h stubs/*/*.h support/*.h)
@@ -67,10 +68,13 @@ build/test_%: test_%.c $(FW_COPIES) $(HEADERS) | build/src
 		$(if $(filter test_isotp_tx.c test_track_popup.c,$<),build/src/isotp_tx.c) \
 		$(if $(filter test_track_popup.c,$<),build/src/utf8_utf16_converter.c)
 
-# Explicit rule, so it wins over the build/test_% pattern above: the same suite
-# with the one-bus board's CAN_BUS_COUNT. The stub in stubs/can.h is #ifndef'd
-# so this -D takes effect.
+# Explicit rules, so they win over the build/test_% pattern above: the same
+# suites with the one-bus board's CAN_BUS_COUNT. The stub in stubs/can.h is
+# #ifndef'd so this -D takes effect.
 build/test_precondition_1bus: test_precondition.c $(FW_COPIES) $(HEADERS) | build/src
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DCAN_BUS_COUNT=1 -DEXPECT_CAN_BUS_COUNT=1 -o $@ $< $(LINK_SRCS)
+
+build/test_car_settings_1bus: test_car_settings.c $(FW_COPIES) $(HEADERS) | build/src
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DCAN_BUS_COUNT=1 -DEXPECT_CAN_BUS_COUNT=1 -o $@ $< $(LINK_SRCS)
 
 clean:
