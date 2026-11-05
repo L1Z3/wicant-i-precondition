@@ -103,6 +103,7 @@
 #define CLIMATE_OPCODE_FRAME_ID 0x0C7U
 #define CLIMATE_TMU_FRAME_ID 0x39BU
 #define CLIMATE_STATE_FRAME_ID 0x4DDU
+#define CLIMATE_HU_STATUS_FRAME_ID 0x4EBU
 
 // The car announces the cabin setpoint the way its own ECUs do: the telematics
 // frame 0x39B carries it in byte 1, the VCU re-broadcasts it on M-CAN in 0x2AC
@@ -203,14 +204,6 @@ static const climate_command_t climate_commands[] = {
      {0x00U, 0x00U, 0xF3U, 0x43U, 0x00U, 0x00U, 0xC0U, 0x00U},
      {0x00U, 0x00U, 0xF3U, 0xC3U, 0x00U, 0x00U, 0xD0U, 0x00U},
      false, false, false},
-    // Awake-car test: same command as "start", but every frame goes out
-    // immediately behind a frame the kit receives, so it lands in a gap the
-    // head unit left instead of fighting it at a fixed 40 ms cadence.
-    {"start (awake test)",
-     0x03U, 0x50U, (uint8_t)CLIMATE_WAKE_LEAD_TICKS + CLIMATE_BURST_TICKS, true, true,
-     {0x00U, 0x00U, 0x0FU, 0x03U, 0x00U, 0x00U, 0x00U, 0x00U},
-     {0x00U, 0x00U, 0xFFU, 0x03U, 0xFFU, 0xFFU, 0x00U, 0x00U},
-     false, true, false, true},
 };
 
 // ********************* sequence storage *********************
@@ -689,12 +682,26 @@ fwd_result_t climate_fwd_hook(twai_message_t *msg, can_bus_t fwd_bus) {
         return FWD_PASSTHROUGH;
     }
     if (msg->identifier == CLIMATE_WAKE_FRAME_ID
-            && atomic_load_explicit(&climate.follow, memory_order_relaxed)
             && msg->data_length_code >= 2U) {
         // Parallel mode: the head unit's own 00 F0 keepalive arrives here, so
         // hand main.c the same frame with our 00 D0 window in it and let it be
         // re-sent behind the original — the machinery the 0x4ED rewrite uses.
         msg->data[1] = 0xD0U;
+        return FWD_MODIFIED;
+    }
+    if (msg->identifier == CLIMATE_STATE_FRAME_ID
+            && msg->data_length_code >= 3U) {
+        // 0x4DD runs at 4 Hz whenever the car is awake. Raise byte 2 to 0xFE,
+        // the marker the head unit itself sets while a remote request is in
+        // flight, and let main.c re-send the frame behind the original.
+        msg->data[2] = 0xFEU;
+        return FWD_MODIFIED;
+    }
+    if (msg->identifier == CLIMATE_HU_STATUS_FRAME_ID
+            && msg->data_length_code >= 5U) {
+        // 0x4EB is the head unit's other 4 Hz awake heartbeat; byte 4 is 0x80
+        // while it is carrying a request and 0x00 otherwise.
+        msg->data[4] = 0x80U;
         return FWD_MODIFIED;
     }
     if (msg->identifier == CLIMATE_REQUEST_FRAME_ID
