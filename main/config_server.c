@@ -113,18 +113,13 @@ static char can_datarate_str[11][7] = {
 								"1000K",
 };
 
-// Boards that can sense the car's ignition (EB-FD and proto) default to
-// car-off sleep; the others keep meatPi's default. This reaches any board that
-// falls back to the defaults (missing, unreadable or invalid config.json). On
-// the bench, a board fed below sleep_volt with nothing on the car-on pin sleeps
-// after sleep_time (2 min by default) and takes Wi-Fi, BLE and CAN forwarding
-// with it: raise the supply above sleep_volt or put the car-on pin above
-// CAR_ON_THRESHOLD_V to get it back.
-#if HW_HAS_CAR_ON_SENSE
-#define SLEEP_STATUS_DEFAULT "car_off"
-#else
-#define SLEEP_STATUS_DEFAULT "disable"
-#endif
+// Sleep is opt-in on every board, including the EB-FD and proto boards that
+// can sense the car's ignition. Defaulting those to car-off sleep reached any
+// board that falls back to these defaults (missing, unreadable or invalid
+// config.json): on the bench, a board fed below sleep_volt with nothing on the
+// car-on pin slept after sleep_time (2 min by default) and took Wi-Fi, BLE and
+// CAN forwarding with it, which reads as a brick. Car-off sleep is one
+// settings save away, and the status tab shows it.
 
 const char device_config_default[] = R"json({
 "wifi_mode":"AP",
@@ -145,7 +140,8 @@ const char device_config_default[] = R"json({
 "protocol":"savvycan",
 "ble_pass":"123456",
 "ble_status":"disable",
-)json" "\"sleep_status\":\"" SLEEP_STATUS_DEFAULT "\",\n" R"json("sleep_volt":"13.1",
+"sleep_status":"disable",
+"sleep_volt":"13.1",
 "wakeup_volt":"13.5",
 "batt_alert":"disable",
 "batt_alert_ssid":"MeatPi",
@@ -1324,10 +1320,14 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     {
     	ble_disable();
     }
-    for(int bus = 0; bus < CAN_BUS_COUNT; bus++)
-    {
-        can_disable(bus);
-    }
+    /* MITM forwarding holds the buses: can_disable() refuses while the bridge
+     * is locked, and the recovery task brings a bus that did go down back
+     * within a second anyway, so asking here only pretends to quiet them. Bus
+     * 0 keeps receiving through the flash writes (CONFIG_TWAI_ISR_CACHE_SAFE)
+     * and bus 1's SPI driver just stalls them, so the upload does not need
+     * them off. If a quiet bus is wanted during the write, add a maintenance
+     * teardown in can.c (take the nodes down despite the lock, until the
+     * reboot that follows every upload that gets this far) and call it here. */
     /* Skip leading "/upload" from URI to get filename */
     /* Note sizeof() counts NULL termination hence the -1 */
     const char *filename = get_path_from_uri(filepath, ((struct file_server_data *)req->user_ctx)->base_path,
@@ -1493,34 +1493,49 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
 
     /* An image built for another board variant (a proto image on an EB-FD,
      * say) installs and boots, then drives CAN hardware that isn't there:
-     * refuse it. A USB flash still installs anything. */
+     * refuse it. Fail closed when either side's project name does not carry a
+     * board variant, because then "not for this board" cannot be ruled out.
+     * A USB flash still installs anything. */
     char running_variant[16];
-    if (app_variant(esp_app_get_description(), running_variant, sizeof(running_variant)))
+    bool running_known = app_variant(esp_app_get_description(), running_variant,
+                                     sizeof(running_variant));
+    esp_app_desc_t new_app;
+    char new_variant[16];
+    err = esp_ota_get_partition_description(update_partition, &new_app);
+    bool new_known = err == ESP_OK &&
+                     app_variant(&new_app, new_variant, sizeof(new_variant));
+    if (!running_known || !new_known || strcmp(new_variant, running_variant) != 0)
     {
-        esp_app_desc_t new_app;
-        char new_variant[16];
-
-        err = esp_ota_get_partition_description(update_partition, &new_app);
-        if (err != ESP_OK || !app_variant(&new_app, new_variant, sizeof(new_variant)) ||
-            strcmp(new_variant, running_variant) != 0)
+        char msg[96];
+        if (!running_known)
+        {
+            ESP_LOGE(TAG, "Refusing firmware: this build has no board variant in its project name");
+            snprintf(msg, sizeof(msg), "This firmware cannot tell its own board variant; flash over USB");
+        }
+        else if (!new_known)
+        {
+            ESP_LOGE(TAG, "Refusing firmware %.32s: no board variant in its project name",
+                     err == ESP_OK ? new_app.project_name : "(unreadable)");
+            snprintf(msg, sizeof(msg), "Firmware has no board variant; not installing it");
+        }
+        else
         {
             ESP_LOGE(TAG, "Refusing firmware %.32s: not for this %s board",
-                     err == ESP_OK ? new_app.project_name : "(unreadable)", running_variant);
-            /* Keep the image from ever booting, then reboot into this one,
-             * still selected, which brings back the CAN and BLE turned off
-             * above. */
-            esp_err_t erase_err = esp_partition_erase_range(update_partition, 0,
-                                                            update_partition->erase_size);
-            if (erase_err != ESP_OK)
-            {
-                ESP_LOGE(TAG, "Couldn't erase the refused firmware (%s)", esp_err_to_name(erase_err));
-            }
-            char msg[80];
+                     new_app.project_name, running_variant);
             snprintf(msg, sizeof(msg), "Firmware is not for this board (this is %s)", running_variant);
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
-            xTimerStart(xrestartTimer, 0);
-            return ESP_FAIL;
         }
+        /* Erase the whole image, not just its header: keep it from ever
+         * booting, then reboot into this one, still selected, which brings
+         * back the BLE turned off above. */
+        esp_err_t erase_err = esp_partition_erase_range(update_partition, 0,
+                                                        update_partition->size);
+        if (erase_err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Couldn't erase the refused firmware (%s)", esp_err_to_name(erase_err));
+        }
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
+        xTimerStart(xrestartTimer, 0);
+        return ESP_FAIL;
     }
 
     err = esp_ota_set_boot_partition(update_partition);

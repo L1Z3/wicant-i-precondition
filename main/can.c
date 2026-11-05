@@ -197,12 +197,13 @@ static volatile bool can_parked;
 // the other bus isn't bridged either. That's not counted towards the latch,
 // since the far side can send the same frame: for 50 ms after we send one,
 // the head unit's all-zero 0x0C7 (stop burst) or the car's idle 0x465 (beep
-// release) isn't bridged, but they're the same as ours. As a backstop for
-// anything else that circulates (one of ours whose entry another of ours
-// overwrote; RTR frames; modified frames), arrivals in one slot faster than
-// anything repeats on a real bus also latch. That misses only several of ours
-// escaping at once into different slots while nothing else is on the wire
-// (full-rate SavvyCAN playback on a bench); any other node's frames latch it.
+// release) isn't bridged, but they're the same as ours. RTR frames carry no
+// data and are matched on their identifier alone. As a backstop for anything
+// else that circulates (one of ours whose entry another of ours overwrote;
+// modified frames), arrivals in one slot faster than anything repeats on a
+// real bus also latch. That misses only several of ours escaping at once into
+// different slots while nothing else is on the wire (full-rate SavvyCAN
+// playback on a bench); any other node's frames latch it.
 // Times are when the driver received the frame, not when it's dequeued: the
 // queue fills before can_rx_task starts, and a backlog drains in a few ms.
 #define WIRE_SLOTS			64		// per bus, direct-mapped by frame hash
@@ -211,6 +212,11 @@ static volatile bool can_parked;
 #define WIRE_LATCH_US		100000
 #define WIRE_LOOP_REPEATS	16		// arrivals in one slot this fast: circulating,
 #define WIRE_LOOP_US		25000	// one frame comes back about every 0.5 ms
+// A latch from a transient (a full-rate playback on the bench, say) would
+// otherwise cost a power cycle: clear it after this long without a repeat. A
+// wire that really is shared re-latches within a few frames, at the cost of
+// that short burst of duplicates every five minutes.
+#define WIRE_REARM_US		(5LL * 60 * 1000000)
 typedef struct {
 	int64_t us;					// last seen; 0: empty
 	int64_t run_us;				// first of the latest run of arrivals in this slot
@@ -230,6 +236,11 @@ static int64_t wire_rx_us;
 // that waited in the TX pool still counts as ours when it comes back
 static wire_frame_t wire_tx[CAN_BUS_COUNT][WIRE_SLOTS];
 static portMUX_TYPE wire_tx_mux = portMUX_INITIALIZER_UNLOCKED;
+// Set by wire_latch() and read by can_bridge_check() to re-arm; the second
+// pair counts the "seen on both buses" matches for the current latch window
+static int64_t wire_shared_at_us;
+static int64_t wire_first_us;
+static int wire_matches;
 #endif
 // Latched by can_bridge_check(); outside the #if so status can read it on
 // every build
@@ -344,12 +355,14 @@ static CAN_ISR_ATTR bool can_on_tx_done(twai_node_handle_t handle, const twai_tx
 	{
 		// Rewritten whole: another of ours may have taken the entry since
 		wire_frame_t *f = &wire_tx[bus][slot->wire_slot];
+		bool rtr = slot->frame.header.rtr;
 		portENTER_CRITICAL_SAFE(&wire_tx_mux);
 		f->us = esp_timer_get_time();
 		f->id = slot->frame.header.id;
 		f->extd = slot->frame.header.ide;
-		f->rtr = 0;
-		f->dlc = slot->frame.header.dlc;
+		f->rtr = rtr ? 1 : 0;
+		// RTR frames match on their identifier alone (see wire_slot())
+		f->dlc = rtr ? 0 : slot->frame.header.dlc;
 		for (int i = 0; i < f->dlc; i++)
 		{
 			f->data[i] = slot->data[i];
@@ -1250,6 +1263,7 @@ static void wire_store(wire_frame_t *f, const twai_message_t *msg, uint8_t dlc, 
 #if CAN_BUS_COUNT > 1
 static void wire_latch(const twai_message_t *msg, uint8_t dlc, can_bus_t rx_bus, const char *why)
 {
+	wire_shared_at_us = esp_timer_get_time();
 	wire_shared = true;
 	char hex[3 * TWAI_FRAME_MAX_DLC + 1] = "";
 	for (int i = 0; i < dlc && !msg->rtr; i++)
@@ -1257,17 +1271,35 @@ static void wire_latch(const twai_message_t *msg, uint8_t dlc, can_bus_t rx_bus,
 		snprintf(hex + 3 * i, sizeof(hex) - 3 * i, " %02x", msg->data[i]);
 	}
 	ESP_LOGE(TAG, "ID 0x%03lx%s%s on bus %d %s: bus 0 and bus 1 share a wire, so MITM forwarding "
-			 "is off until restart. Check the harness, or set the forwarding mode to parallel",
-			 (unsigned long)msg->identifier, msg->rtr ? " RTR" : "", hex, rx_bus, why);
+			 "is off for %d min. Check the harness, or set the forwarding mode to parallel",
+			 (unsigned long)msg->identifier, msg->rtr ? " RTR" : "", hex, rx_bus, why,
+			 (int)(WIRE_REARM_US / 60000000));
 }
 #endif
 
 bool can_bridge_check(const twai_message_t *msg, can_bus_t rx_bus)
 {
 #if CAN_BUS_COUNT > 1
-	if (wire_shared || rx_bus >= CAN_BUS_COUNT)
+	if (rx_bus >= CAN_BUS_COUNT)
 	{
 		return false;
+	}
+	if (wire_shared)
+	{
+		if (esp_timer_get_time() - wire_shared_at_us < WIRE_REARM_US)
+		{
+			return false;
+		}
+		// No duplicate for five minutes: let forwarding run again. Stale
+		// entries can't match anyway (WIRE_MATCH_US is 50 ms), but their run
+		// counters would, so clear them along with the latch's own window.
+		wire_shared = false;
+		memset(wire_rx, 0, sizeof(wire_rx));
+		wire_first_us = 0;
+		wire_matches = 0;
+		ESP_LOGW(TAG, "MITM forwarding re-armed: no duplicate for %d min. If the harness still "
+				 "shares a wire, the next frames to loop will latch it again",
+				 (int)(WIRE_REARM_US / 60000000));
 	}
 	uint8_t dlc = (msg->data_length_code > TWAI_FRAME_MAX_DLC)
 					  ? TWAI_FRAME_MAX_DLC : msg->data_length_code;
@@ -1300,10 +1332,6 @@ bool can_bridge_check(const twai_message_t *msg, can_bus_t rx_bus)
 		wire_latch(msg, dlc, rx_bus, "keeps coming back");
 		return false;
 	}
-	if (msg->rtr)
-	{
-		return true;
-	}
 
 	portENTER_CRITICAL(&wire_tx_mux);
 	bool ours = wire_match(&wire_tx[other][slot], msg, dlc, now);
@@ -1317,14 +1345,12 @@ bool can_bridge_check(const twai_message_t *msg, can_bus_t rx_bus)
 		return true;
 	}
 
-	static int64_t first_us;
-	static int matches;
-	if (matches == 0 || now - first_us > WIRE_LATCH_US)
+	if (wire_matches == 0 || now - wire_first_us > WIRE_LATCH_US)
 	{
-		first_us = now;
-		matches = 0;
+		wire_first_us = now;
+		wire_matches = 0;
 	}
-	if (++matches >= WIRE_LATCH_MATCHES)
+	if (++wire_matches >= WIRE_LATCH_MATCHES)
 	{
 		wire_latch(msg, dlc, rx_bus, "was received on both");
 	}
@@ -1450,12 +1476,15 @@ static esp_err_t can_send_frame(can_bus_t bus, twai_message_t *message, TickType
 	slot->frame.buffer_len = message->rtr ? 0 : dlc;
 	slot->wire_slot = -1;
 #if CAN_BUS_COUNT > 1
-	if (ours && bridge_locked && !wire_shared && !message->rtr)
+	if (ours && bridge_locked && !wire_shared)
 	{
-		uint32_t wslot = wire_slot(message, dlc);
+		// RTR frames carry no payload and go in with dlc 0, so they match the
+		// way can_bridge_check() hashes and compares arrivals
+		uint8_t wire_dlc = message->rtr ? 0 : dlc;
+		uint32_t wslot = wire_slot(message, wire_dlc);
 		slot->wire_slot = (int8_t)wslot;
 		portENTER_CRITICAL(&wire_tx_mux);
-		wire_store(&wire_tx[bus][wslot], message, dlc, now);
+		wire_store(&wire_tx[bus][wslot], message, wire_dlc, now);
 		portEXIT_CRITICAL(&wire_tx_mux);
 	}
 #else

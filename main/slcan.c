@@ -309,8 +309,14 @@ char* slcan_parse_str(uint8_t *buf, uint8_t len, twai_message_t *frame, QueueHan
 			    }
 			    else if (slcan_buffer[i] == 'C')
 			    {
-			        // Close channel command
+			        // Close channel command. MITM forwarding refuses to take
+			        // the bus down, so the OK for this would be a lie: BEL
+			        // instead (the default case answers it)
 					ESP_LOGI(TAG, "open close!");
+					if(can_bridge_locked())
+					{
+						refused = 1;
+					}
 			    	can_disable(CAN_BUS_0);
 			    	state = SL_END;
 			    	cmd = SL_CLOSE;
