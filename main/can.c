@@ -2350,7 +2350,17 @@ void can_dump_diagnostics(const char *why)
 	{
 		uint32_t used = 0;
 		int64_t oldest_age_us = 0;
+		char age[48];
 		can_slot_stats((can_bus_t)bus, &used, &oldest_age_us);
+		if (can_diag[bus].last_state_us)
+		{
+			snprintf(age, sizeof(age), "%lld ms ago",
+					 (long long)((now - can_diag[bus].last_state_us) / 1000));
+		}
+		else
+		{
+			snprintf(age, sizeof(age), "never changed");
+		}
 
 		ESP_LOGI(TAG, "bus %d: state=%s node=%p enable_bit=%u rate=%lu silent=%u loop=%u "
 				 "auto_tx=%u filter=0x%08lx mask=0x%08lx",
@@ -2375,12 +2385,10 @@ void can_dump_diagnostics(const char *why)
 				 (unsigned long)can_diag[bus].tx_drv_timeout,
 				 (unsigned long)can_diag[bus].tx_drv_no_mem,
 				 (unsigned long)can_diag[bus].tx_drv_other);
-		ESP_LOGI(TAG, "bus %d: last_state=%s (%lld ms ago) changes=%lu bus_off=%lu "
+		ESP_LOGI(TAG, "bus %d: last_state=%s (%s) changes=%lu bus_off=%lu "
 				 "stalls=%lu | err_passive=%u backoff=%u pending=%u slots=%lu oldest=%lld ms | "
 				 "lock_waits=%lu max_wait=%lld ms max_hold=%lld ms",
-				 bus, can_state_name(can_diag[bus].last_state),
-				 (long long)((can_diag[bus].last_state_us
-							  ? (now - can_diag[bus].last_state_us) / 1000 : 0)),
+				 bus, can_state_name(can_diag[bus].last_state), age,
 				 (unsigned long)can_diag[bus].state_changes,
 				 (unsigned long)can_diag[bus].bus_off,
 				 (unsigned long)can_diag[bus].stall_recoveries,
