@@ -325,7 +325,7 @@ static void can_fwd_count_drop(const char *why)
 	if (now - can_fwd_drop_log_us > CAN_FWD_DROP_LOG_INTERVAL_US)
 	{
 		can_fwd_drop_log_us = now;
-		ESP_LOGW(TAG, "precondition fwd: %lu frames dropped (%s)",
+		ESP_LOGW(TAG, "forwarding: %lu frames dropped (%s)",
 				 (unsigned long)can_fwd_dropped, why);
 	}
 }
