@@ -713,6 +713,45 @@ static void run_ioniq6_battery_frames(void) {
           == (PRECONDITION_BLOCK_BATTERY_WARM | PRECONDITION_BLOCK_BATTERY_LOW_SOC));
 }
 
+// The power-status byte is published on every car-side frame from either
+// identifier, with the plug state decoded from the low nibble.
+static void run_car_power_state(void) {
+    precondition_init();
+    precondition_power_t power;
+    uint8_t d[8] = {0x06};
+
+    CHECK(!precondition_get_car_power(&power));
+    // car-side only, like the READY tracking
+    rx_frame(0x038, d, CAN_BUS_1);
+    CHECK(!precondition_get_car_power(&power));
+
+    fake_now = 123456;
+    rx_frame(0x038, d, CAN_BUS_0);
+    CHECK(precondition_get_car_power(&power));
+    CHECK(power.raw == 0x06 && power.plugged_in);
+    CHECK(power.updated_at_us == fake_now);
+    CHECK(!car_in_ready());
+
+    // ON but not READY, unplugged
+    d[0] = 0x02;
+    rx_frame(0x038, d, CAN_BUS_0);
+    CHECK(precondition_get_car_power(&power));
+    CHECK(power.raw == 0x02 && !power.plugged_in);
+
+    // READY reads 0x04, and a repeated frame still refreshes the age
+    car_power(true);
+    fake_now += 1000;
+    car_power(true);
+    CHECK(precondition_get_car_power(&power));
+    CHECK(power.raw == 0x04 && !power.plugged_in);
+    CHECK(power.updated_at_us == fake_now);
+
+    // the Ioniq 6 identifier decodes the same way
+    ioniq6_power(0x06, CAN_BUS_0);
+    CHECK(precondition_get_car_power(&power));
+    CHECK(power.raw == 0x06 && power.plugged_in);
+}
+
 // The Ioniq 6 form of the precondition status frame, 0x0A82AA03. It must drive
 // the state machine exactly like 0x2AD, and it is the only thing that identifies
 // an Ioniq 6 for the web UI's "auto" vehicle setting: a recognised status byte on
@@ -2186,6 +2225,7 @@ static const suite_t suites[] = {
     {"precondition conditioning mode check", ONCE, PRESS_SHORT, run_conditioning_mode_check},
     {"precondition conditioning mode blocker", ONCE, PRESS_SHORT, run_conditioning_mode_blocker},
     {"precondition conditioning mode blocker repeating", CONTINUOUS, PRESS_SHORT, run_conditioning_mode_blocker_repeating},
+    {"precondition car power state", ONCE, PRESS_SHORT, run_car_power_state},
     {"precondition automatic temperature cutoff", CONTINUOUS, PRESS_SHORT, run_automatic_temperature_cutoff},
     {"precondition persistent temperature cutoff", PERSISTENT, PRESS_SHORT, run_automatic_temperature_cutoff},
     {"precondition continuous cool wait", CONTINUOUS, PRESS_SHORT, run_managed_cool_wait},
