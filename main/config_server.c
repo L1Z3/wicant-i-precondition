@@ -1109,6 +1109,21 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	// without the sense pin.
 	cJSON_AddStringToObject(root, "can_ready_state", car_in_ready() ? "Ready" : "Not Ready");
 
+	precondition_power_t car_power;
+
+	if (precondition_get_car_power(&car_power)) {
+        cJSON_AddBoolToObject(root, "car_power_valid", true);
+        cJSON_AddBoolToObject(root, "plugged_in", car_power.plugged_in);
+        cJSON_AddNumberToObject(root, "car_power_raw", car_power.raw);
+        cJSON_AddNumberToObject(
+            root,
+            "car_power_age_ms",
+            (esp_timer_get_time() - car_power.updated_at_us) / 1000
+        );
+	} else {
+        cJSON_AddBoolToObject(root, "car_power_valid", false);
+	}
+
 	char uptime_str[32];
 	dev_status_format_uptime(uptime_str, sizeof(uptime_str));
 	if(uptime_str[0] == '\0')
