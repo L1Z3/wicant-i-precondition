@@ -567,6 +567,10 @@
                     </td>
                 </tr>
                 <tr>
+                    <td>Plugged In (CAN):</td>
+                    <td><div id="plugged_in_status">Waiting for CAN data</div></td>
+                </tr>
+                <tr>
                     <td>HV Battery State of Charge:</td>
                     <td><div id="battery_soc_status">Waiting for CAN data</div></td>
                 </tr>
@@ -2702,6 +2706,13 @@ function loadAutoTable(jsonData) {
 				document.getElementById("port_type_status").innerHTML = "TCP";
 			} else if(obj.port_type == "udp") {
 				document.getElementById("port_type_status").innerHTML = "UDP";
+			}
+			if (obj.car_power_valid) {
+				// the raw byte is shown so unrecognised power states can be reported
+				const raw = Number(obj.car_power_raw).toString(16).toUpperCase().padStart(2, "0");
+				document.getElementById("plugged_in_status").textContent = `${obj.plugged_in ? "Yes" : "No"} (0x${raw}); (${formatAge(obj.car_power_age_ms)} ago)`;
+			} else {
+				document.getElementById("plugged_in_status").textContent = "Waiting for CAN data";
 			}
 			if (obj.battery_soc_valid) {
 				document.getElementById("battery_soc_status").textContent = `${obj.battery_soc_pct}%; (${formatAge(obj.battery_soc_age_ms)} ago)`;

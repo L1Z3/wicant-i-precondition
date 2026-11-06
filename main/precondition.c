@@ -173,6 +173,10 @@ static bool is_utility_request(const twai_message_t *frame) {
 #define POWER_STATUS_MASK 0x0FU
 #define POWER_STATUS_READY(power_status_byte) \
     (((power_status_byte) & POWER_STATUS_MASK) == 0x04U)
+// plugged in: read while charging and while ON but not READY with the charge
+// cable connected, where the same state unplugged reads 0x02 (EV6, Ioniq 6)
+#define POWER_STATUS_PLUGGED_IN(power_status_byte) \
+    (((power_status_byte) & POWER_STATUS_MASK) == 0x06U)
 
 #define PRECONDITION_DEBOUNCE_US 1000000U  // 1 second
 #define PRECONDITION_LONG_PRESS_US 1000000U  // short/long press threshold: 1 second
@@ -399,6 +403,7 @@ static struct {
 static QueueHandle_t battery_temperature_queue = NULL;
 static QueueHandle_t battery_soc_queue = NULL;
 static QueueHandle_t car_model_queue = NULL;
+static QueueHandle_t car_power_queue = NULL;
 static QueueHandle_t precondition_state_queue = NULL;
 static QueueHandle_t precondition_toggle_queue = NULL;
 
@@ -1351,6 +1356,13 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
     if (IS_POWER_STATUS_FRAME(to_push->identifier)
             && rx_bus == CAR_BUS
             && to_push->data_length_code >= 1U) {
+        precondition_power_t power = {
+            .raw = to_push->data[0],
+            .plugged_in = POWER_STATUS_PLUGGED_IN(to_push->data[0]),
+            .updated_at_us = sm_now(sm),
+        };
+        xQueueOverwrite(car_power_queue, &power);
+
         ready_status_t ready = POWER_STATUS_READY(to_push->data[0])
                                ? READY_STATUS_READY : READY_STATUS_NOT_READY;
         // UNKNOWN counts as not-ready, preserving the plain-bool edge behavior:
@@ -1565,6 +1577,8 @@ void precondition_init(void) {
     configASSERT(battery_soc_queue != NULL);
     car_model_queue = xQueueCreate(1, sizeof(egmp_car_model_t));
     configASSERT(car_model_queue != NULL);
+    car_power_queue = xQueueCreate(1, sizeof(precondition_power_t));
+    configASSERT(car_power_queue != NULL);
     precondition_state_queue = xQueueCreate(1, sizeof(precondition_state_t));
     configASSERT(precondition_state_queue != NULL);
     precondition_toggle_queue = xQueueCreate(1, sizeof(uint8_t));
@@ -1606,6 +1620,14 @@ bool precondition_get_battery_soc(precondition_soc_t *out) {
     }
 
     return xQueuePeek(battery_soc_queue, out, 0) == pdTRUE;
+}
+
+bool precondition_get_car_power(precondition_power_t *out) {
+    if (out == NULL || car_power_queue == NULL) {
+        return false;
+    }
+
+    return xQueuePeek(car_power_queue, out, 0) == pdTRUE;
 }
 
 bool precondition_get_car_model(egmp_car_model_t *out) {
