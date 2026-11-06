@@ -875,10 +875,25 @@ static esp_err_t logs_handler(httpd_req_t *req)
 
 	log_stream_get_stats(&buffered, &dropped);
 	uint64_t total = log_stream_total();
+	uint64_t earliest = total >= buffered ? total - buffered : 0;
+	bool reset = false;
 	if (!have_pos)
 	{
 		// Everything the ring still holds.
-		pos = total >= buffered ? total - buffered : 0;
+		pos = earliest;
+	}
+	else if (pos < earliest || pos > total)
+	{
+		// The cursor cannot be honoured.  It is either older than the oldest
+		// byte the ring still holds (the reader was away long enough for the
+		// ring to overwrite it), or beyond the end, which happens after a
+		// reboot because positions restart at 0.  Start over at the oldest
+		// byte and say so: otherwise a reader that reconnects with its old
+		// position would be clamped to the newest byte and silently miss the
+		// new boot banner and reset reason -- exactly the lines worth having
+		// after a crash.
+		pos = earliest;
+		reset = true;
 	}
 
 	char hdr[24];
@@ -886,6 +901,10 @@ static esp_err_t logs_handler(httpd_req_t *req)
 	httpd_resp_set_type(req, "text/plain");
 	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
 	httpd_resp_set_hdr(req, "X-Log-Start", hdr);
+	if (reset)
+	{
+		httpd_resp_set_hdr(req, "X-Log-Reset", "1");
+	}
 	if (dropped > 0)
 	{
 		snprintf(hdr, sizeof(hdr), "%lu", (unsigned long)dropped);
