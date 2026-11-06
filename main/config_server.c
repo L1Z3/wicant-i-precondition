@@ -24,6 +24,7 @@
 #include <esp_log.h>
 #include <esp_system.h>
 #include <sys/param.h>
+#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -813,10 +814,13 @@ static esp_err_t precondition_climate_start_handler(httpd_req_t *req)
 			parse_tenths(value, &setpoint);
 		}
 		// o = OR of the climate-start options (1 front defrost, 2 rear/side,
-		// 4 steering wheel heat); the individual f/r/w flags are accepted too.
+		// 4 steering wheel heat; 16/32/64 select the trial arm and 128/256/
+		// 384 widen the request spacing, see climate.c); the individual f/r/w
+		// flags are accepted too. The whole value is parsed, not just the
+		// first digit.
 		if (httpd_query_key_value(query, "o", value, sizeof(value)) == ESP_OK
 				&& value[0] >= '0' && value[0] <= '9') {
-			options = (unsigned)(value[0] - '0');
+			options = (unsigned)strtoul(value, NULL, 10);
 		}
 		if (httpd_query_key_value(query, "f", value, sizeof(value)) == ESP_OK
 				&& value[0] == '1') {
@@ -834,7 +838,7 @@ static esp_err_t precondition_climate_start_handler(httpd_req_t *req)
 
 	char resp_str[96];
 	esp_err_t err = climate_request_start_temp((uint8_t)command, setpoint,
-											   (uint8_t)options);
+											   (uint16_t)options);
 	if (err == ESP_ERR_NOT_SUPPORTED) {
 		snprintf(resp_str, sizeof(resp_str), "Remote commands need the head-unit bus");
 	} else if (err == ESP_ERR_INVALID_ARG) {
@@ -1176,7 +1180,8 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	// remote climate prototype; the UI disables its button while this is set,
 	// and shows the short status line next to the preconditioning rows
 	cJSON_AddBoolToObject(root, "remote_climate_active", climate_is_active());
-	char climate_status[96] = {0};
+	cJSON_AddNumberToObject(root, "climate_tx_gap_us", climate_last_tx_gap_us());
+	char climate_status[768] = {0};
 	if (climate_get_status(climate_status, sizeof(climate_status))) {
 		cJSON_AddStringToObject(root, "remote_climate_status", climate_status);
 	}

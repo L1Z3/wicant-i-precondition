@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "can.h"
 #include "climate.h"
 #include "hw_config.h"
@@ -232,7 +233,26 @@ typedef struct {
     // it raises `requested`, read by the tick.
     uint8_t setpoint_raw;
     // CLIMATE_OPTION_* bits for a climate start, written with the setpoint.
-    uint8_t options;
+    uint16_t options;
+    // Trial-series arm, selected by the high nibble of the options byte
+    // (the low nibble keeps the CLIMATE_OPTION_* payload bits):
+    //   bit 0 (0x10): the I-CAN class telegram announces state 0x00 /
+    //                 setpoint 0x00, the way the real awake start does
+    //                 (0x2AD then completes 00 01 -> 00 02), instead of
+    //                 "50 <setpoint>" (which leaves 0x2AD stuck at 00 01).
+    //   bit 1 (0x20): class-3-only announce (the HU-button shape; the cloud
+    //                 shape runs a class-1 phase first).
+    //   bit 2 (0x40): skip the 3 s C0 preamble and the F3 43/F3 C3 envelope
+    //                 when the head unit was seen talking within the last 2 s
+    //                 (car already awake: the real awake start goes straight
+    //                 to the 0x4F1 00 D0 burst).
+    uint8_t arm;
+    // The head unit was on 0x4F1 within the last 2 s when the sequence
+    // started: the car is awake, so the wake preamble is not what the real
+    // head unit does (it only wakes a sleeping car).
+    bool car_awake;
+    // now_tick of the last head-unit 0x4F1 frame seen (awake check above).
+    uint32_t hu_4f1_last_tick;
     // Last climate state the car reported on 0x2AD: 0 unknown since the
     // sequence started, 1 on, 2 off. A sequence that ends with the car
     // disagreeing is retried once (see the end of climate_tick).
@@ -243,9 +263,64 @@ typedef struct {
     _Atomic bool follow;
     _Atomic uint8_t follow_step;
 
+    // ---- instrumentation (added for the awake-start trial series) ----
+    // Microsecond spacing of our own 0x4A2 triplet, measured in send_frame_on()
+    // so H4 (arbitration pushing the gap past ~90 ms) is a number, not a story.
+    uint32_t tx4a2_last_us;
+    uint32_t tx4a2_gap_us;      // most recent gap
+    uint32_t tx4a2_gap_min_us;  // smallest gap seen this sequence
+    uint32_t tx4a2_gap_max_us;  // largest gap seen this sequence
+    uint32_t tx4a2_count;
+    // Conflict-prone head-unit frames: how many we saw (so we know there IS
+    // existing traffic to conflict with) and how many actually needed a
+    // rewrite. When the count of "seen" is zero there is no HU traffic and
+    // FWD_MODIFIED has nothing to piggyback on.
+    uint32_t hu_seen_4f1, hu_mod_4f1;
+    uint32_t hu_seen_4dd, hu_mod_4dd;
+    uint32_t hu_seen_4eb, hu_mod_4eb;
+    uint32_t hu_seen_4a2, hu_block_4a2;
+
 } climate_state_t;
 
 static climate_state_t climate;
+
+// ********************* response ring *********************
+//
+// The last transitions of the three frames the car answers with, so a trial can
+// be graded from one HTTP call instead of an external websocket capture:
+//   0x2AD  byte0/1   BMS precondition state (04 01 on, 00 02 off, 00 01 session)
+//   0x037  byte0     HV power state (0x00 off, 0x22/0x23 engaged)
+//   0x380  byte3/4   DATC setpoints
+// Only edges (a change in the watched bytes) are recorded.
+#define CLIMATE_RING_LEN 32
+typedef struct {
+    uint16_t tick;   // ticks since the sequence started (40 ms each)
+    uint16_t id;
+    uint8_t first;
+    uint8_t second;
+    uint8_t bus;     // 0 = car, 1 = head-unit side
+} climate_ring_t;
+static climate_ring_t climate_ring[CLIMATE_RING_LEN];
+static uint8_t climate_ring_head;   // next slot to write
+static uint8_t climate_ring_count;
+// Last packed byte pair per ring id (0=0x2AD, 1=0x037, 2=0x380), so only
+// edges are pushed. 0xFFFF forces a push of the first value after a reset.
+static uint16_t climate_ring_last[3] = {0xFFFFU, 0xFFFFU, 0xFFFFU};
+
+static void ring_push(uint16_t id, uint8_t first, uint8_t second,
+                      can_bus_t bus) {
+    climate_ring_t *e = &climate_ring[climate_ring_head];
+    e->tick = (uint16_t)(atomic_load_explicit(&climate.tick,
+                                              memory_order_relaxed) & 0xFFFFU);
+    e->id = id;
+    e->first = first;
+    e->second = second;
+    e->bus = (uint8_t)(bus == CLIMATE_CAR_BUS ? 0 : 1);
+    climate_ring_head = (uint8_t)((climate_ring_head + 1U) % CLIMATE_RING_LEN);
+    if (climate_ring_count < CLIMATE_RING_LEN) {
+        climate_ring_count++;
+    }
+}
 
 // Event word: id in bits 0..14, above that the two payload bytes worth
 // reporting, then which bus it arrived on, so one atomic load is a complete
@@ -288,6 +363,23 @@ static void send_frame_on(can_bus_t bus, uint32_t identifier,
     packet.data_length_code = 8U;
     memcpy(packet.data, data, 8U);
     can_send(bus, &packet, 1);
+    // H4 instrumentation: the spacing of our own 0x4A2 triplet, so a request
+    // that arbitration stretched past the ~90 ms the ICU tolerates is visible.
+    if (identifier == CLIMATE_REQUEST_FRAME_ID) {
+        const uint32_t now = (uint32_t)esp_timer_get_time();
+        if (climate.tx4a2_last_us != 0U) {
+            const uint32_t gap = now - climate.tx4a2_last_us;
+            climate.tx4a2_gap_us = gap;
+            if (gap < climate.tx4a2_gap_min_us) {
+                climate.tx4a2_gap_min_us = gap;
+            }
+            if (gap > climate.tx4a2_gap_max_us) {
+                climate.tx4a2_gap_max_us = gap;
+            }
+        }
+        climate.tx4a2_last_us = now;
+        climate.tx4a2_count++;
+    }
 }
 
 static void send_climate_frame(uint32_t identifier, const uint8_t data[8]) {
@@ -378,8 +470,27 @@ static void send_idle_frame(void) {
 // 0x10) while the head unit is opening the window. Our replay only ever sent
 // the plain heartbeat (class 0), which is the one difference left on the
 // telematics side. The stop already uses the same class-1 preamble and works.
+// The announce shape depends on whether the head unit is talking. With the
+// head unit present the car is already in a session and "50 <setpoint>"
+// (running) completes it — 10/10 measured; with the head unit silent the
+// announce must OPEN a session, which only "00 00" (idle) does — 19/22
+// measured against 1/10 for "50 <setpoint>". Arm bit 5 picks per car state
+// (car_awake is the head-unit-seen-in-the-last-2-s flag set at pickup);
+// bits 0/1 force one shape or the other for the trial series.
+static bool use_fixed_shape(void) {
+    return (climate.arm & 0x20U) != 0U && !climate.car_awake;
+}
+
 static void send_tmu_session_open(uint8_t tmu_class, uint8_t phase) {
-    uint8_t data[8] = {0x50U, climate.setpoint_raw, 0x00U,
+    // The real awake start announces the session with state 0x00 and no
+    // setpoint (00 00 00 <ctr> 00 01 10 00, seen 2026-11-06 in the H2 cloud
+    // capture); "50 <setpoint>" is the running heartbeat, and putting it in
+    // the announce leaves 0x2AD stuck at 00 01 on an awake car. Arm bit 0
+    // replays the real content.
+    const bool fixed = (climate.arm & 0x01U) != 0U || use_fixed_shape();
+    const uint8_t state = fixed ? 0x00U : 0x50U;
+    const uint8_t sp = fixed ? 0x00U : climate.setpoint_raw;
+    uint8_t data[8] = {state, sp, 0x00U,
                        climate.session_counter, 0x00U, tmu_class, phase, 0x00U};
     climate.session_counter = (uint8_t)((climate.session_counter + 4U) & 0x3FU);
     send_frame_on(CLIMATE_TMU_BUS, CLIMATE_TMU_FRAME_ID, data);
@@ -439,7 +550,12 @@ static void send_session_frames(const climate_command_t *command, uint32_t tick)
         }
     } else if (phase == 3U) {
         if (command->climate_start && tick < CLIMATE_WAKE_LEAD_TICKS) {
-            send_tmu_session_open(0x01U, 0x10U);
+            // The cloud start runs a class-1 phase while it waits, the
+            // head-unit button only ever sends class 3. Arm bit 1 picks the
+            // button shape.
+            const uint8_t cls = ((climate.arm & 0x02U) != 0U || use_fixed_shape())
+                                    ? 0x03U : 0x01U;
+            send_tmu_session_open(cls, 0x10U);
         } else if (command->climate_start && tick < CLIMATE_TRAILER_TICK) {
             send_tmu_session_open(0x03U, 0x10U);
         } else {
@@ -542,6 +658,22 @@ void climate_rx_hook(const twai_message_t *msg, can_bus_t rx_bus) {
         return;
     }
     note_climate_state(msg);
+    // Response ring: push an edge whenever one of the three state frames the
+    // car answers with changes in its watched bytes, so the trial can be graded
+    // from one HTTP call.
+    int ridx = (msg->identifier == 0x2ADU) ? 0
+             : (msg->identifier == 0x037U) ? 1
+             : (msg->identifier == 0x380U) ? 2 : -1;
+    if (ridx >= 0) {
+        uint8_t b0, b1;
+        if (ridx == 2) { b0 = msg->data[3]; b1 = msg->data[4]; }
+        else { b0 = msg->data[0]; b1 = msg->data[1]; }
+        const uint16_t packed = (uint16_t)(((uint16_t)b0 << 8) | b1);
+        if (packed != climate_ring_last[ridx]) {
+            climate_ring_last[ridx] = packed;
+            ring_push((uint16_t)msg->identifier, b0, b1, rx_bus);
+        }
+    }
     for (size_t i = 0; i < sizeof(climate_watch) / sizeof(climate_watch[0]); i++) {
         if (msg->identifier != climate_watch[i].id) {
             continue;
@@ -584,6 +716,25 @@ void climate_tick(void) {
         atomic_store_explicit(&climate.car_climate, 0U, memory_order_relaxed);
         climate.retries = 0U;
         climate.session_counter = 0U;
+        // The head unit talks at 1 Hz whenever the car is awake; a keepalive
+        // inside the last 2 s means the wake preamble should not run (arm 2).
+        climate.car_awake =
+            (now - climate.hu_4f1_last_tick) < 50U;
+        // reset instrumentation + response ring for this trial
+        climate.tx4a2_last_us = 0U;
+        climate.tx4a2_gap_us = 0U;
+        climate.tx4a2_gap_min_us = 0xFFFFFFFFU;
+        climate.tx4a2_gap_max_us = 0U;
+        climate.tx4a2_count = 0U;
+        climate.hu_seen_4f1 = climate.hu_mod_4f1 = 0U;
+        climate.hu_seen_4dd = climate.hu_mod_4dd = 0U;
+        climate.hu_seen_4eb = climate.hu_mod_4eb = 0U;
+        climate.hu_seen_4a2 = climate.hu_block_4a2 = 0U;
+        climate_ring_head = 0U;
+        climate_ring_count = 0U;
+        climate_ring_last[0] = 0xFFFFU;
+        climate_ring_last[1] = 0xFFFFU;
+        climate_ring_last[2] = 0xFFFFU;
         ESP_LOGI(TAG, "remote command: replaying %s",
                  climate_commands[atomic_load_explicit(&climate.command,
                                                        memory_order_relaxed)].label);
@@ -595,7 +746,14 @@ void climate_tick(void) {
     uint32_t t = atomic_fetch_add_explicit(
         &climate.tick, 1U, memory_order_relaxed);
 
-    if (command->prewake) {
+    // The wake preamble (3 s of 00 C0 plus the F3 43/F3 C3 envelope) is what
+    // the head unit does when it has to wake a sleeping car; on an awake car
+    // it goes straight to the 00 D0 burst with no envelope at all (H2,
+    // 2026-11-06). Arm bit 2 skips the preamble when the head unit was seen
+    // talking within the last 2 s.
+    const bool skip_prewake =
+        (climate.arm & 0x04U) != 0U && climate.car_awake;
+    if (command->prewake && !skip_prewake) {
         // Waking a sleeping car: 3.0 s of 0x4F1 00 C0, then the F3 43 session
         // envelope, then 0x4F1 00 D0 with F3 C3 120 ms later. Captured
         // 2026-11-04 at 4713.954 / 4716.951 / 4716.962 / 4717.072 s.
@@ -625,31 +783,41 @@ void climate_tick(void) {
         t = since - CLIMATE_BURST_TICKS;
     }
 
+    // Series H4: arm bits 3..4 widen the request/apply/opcode triplet spacing
+    // (1 tick = 40 ms) to find where the ICU's arbitration stops accepting the
+    // request. gap 1 is byte-for-byte the old schedule.
+    const uint32_t gap = 1U + ((uint32_t)(climate.arm >> 3) & 0x03U);
+    const uint32_t req0 = CLIMATE_WAKE_LEAD_TICKS;
+    const uint32_t app0 = req0 + 3U * gap;
+    const uint32_t tra0 = app0 + 3U * gap;
+    const uint32_t seq0 = tra0 + 3U * gap;
+    const uint32_t shift = seq0 - CLIMATE_SESSION_TICK;
+
     if (t < CLIMATE_BURST_TICKS) {
         send_wake_frame();
-    } else if (t < CLIMATE_WAKE_LEAD_TICKS) {
+    } else if (t < req0) {
         send_session_frames(command, t);
-    } else if (t < CLIMATE_WAKE_LEAD_TICKS + CLIMATE_BURST_TICKS) {
-        if (command->send_request) {
+    } else if (t < app0) {
+        if (command->send_request && ((t - req0) % gap) == 0U) {
             send_climate_burst(command, false);
         }
         send_session_frames(command, t);
-    } else if (t < CLIMATE_WAKE_LEAD_TICKS + 2U * CLIMATE_BURST_TICKS) {
-        if (command->send_request) {
+    } else if (t < tra0) {
+        if (command->send_request && ((t - app0) % gap) == 0U) {
             send_climate_burst(command, true);
         }
-        if (command->send_opcode) {
+        if (command->send_opcode && ((t - app0) % gap) == 0U) {
             send_climate_frame(CLIMATE_OPCODE_FRAME_ID, opcode_data);
         }
         send_session_frames(command, t);
-    } else if (t < CLIMATE_SESSION_TICK) {
-        if (command->send_opcode) {
+    } else if (t < seq0) {
+        if (command->send_opcode && ((t - tra0) % gap) == 0U) {
             send_climate_frame(CLIMATE_OPCODE_FRAME_ID, trailer_data);
         }
         send_session_frames(command, t);
-    } else if (t < CLIMATE_SEQUENCE_TICKS) {
+    } else if (t < CLIMATE_SEQUENCE_TICKS + shift) {
         send_session_frames(command, t);
-    } else if (t < CLIMATE_CLEAR_TICKS) {
+    } else if (t < CLIMATE_CLEAR_TICKS + shift) {
         // close the session the way the head unit does, so the car does not
         // think a remote request is still open
         send_idle_frame();
@@ -678,43 +846,78 @@ void climate_tick(void) {
 }
 
 fwd_result_t climate_fwd_hook(twai_message_t *msg, can_bus_t fwd_bus) {
-    if (fwd_bus != CLIMATE_CAR_BUS || !climate_blocking()) {
+    if (fwd_bus != CLIMATE_CAR_BUS) {
         return FWD_PASSTHROUGH;
     }
     if (msg->identifier == CLIMATE_WAKE_FRAME_ID
             && msg->data_length_code >= 2U) {
-        // Parallel mode: the head unit's own 00 F0 keepalive arrives here, so
-        // hand main.c the same frame with our 00 D0 window in it and let it be
-        // re-sent behind the original — the machinery the 0x4ED rewrite uses.
-        msg->data[1] = 0xD0U;
-        return FWD_MODIFIED;
+        // Always remember when the head unit last spoke, even outside a
+        // sequence: at sequence start it tells us whether the car is already
+        // awake (see climate.car_awake) and it is the "seen" side of the
+        // conflict counters below.
+        climate.hu_4f1_last_tick = atomic_load_explicit(&climate.now_tick,
+                                                       memory_order_relaxed);
+    }
+    if (!climate_blocking()) {
+        return FWD_PASSTHROUGH;
+    }
+    if (msg->identifier == CLIMATE_REQUEST_FRAME_ID
+            && msg->data_length_code >= 1U) {
+        // The head unit starts the same remote command on its own as soon as
+        // the request reaches it; suppress its copy so the car sees one command.
+        climate.hu_seen_4a2++;
+        climate.hu_block_4a2++;
+        return FWD_BLOCK;
+    }
+    if (msg->identifier == CLIMATE_WAKE_FRAME_ID
+            && msg->data_length_code >= 2U) {
+        // Parallel mode: the head unit's own 00 F0/C0 keepalive arrives here.
+        // Rewrite byte 1 to our 00 D0 window and re-inject it behind the
+        // original -- but only when the byte is not already 0xD0. Rewriting an
+        // unchanged frame would just inject a duplicate.
+        climate.hu_seen_4f1++;
+        if (msg->data[1] != 0xD0U) {
+            msg->data[1] = 0xD0U;
+            climate.hu_mod_4f1++;
+            return FWD_MODIFIED;
+        }
+        return FWD_PASSTHROUGH;
     }
     if (msg->identifier == CLIMATE_STATE_FRAME_ID
             && msg->data_length_code >= 3U) {
         // 0x4DD runs at 4 Hz whenever the car is awake. Raise byte 2 to 0xFE,
         // the marker the head unit itself sets while a remote request is in
-        // flight, and let main.c re-send the frame behind the original.
-        msg->data[2] = 0xFEU;
-        return FWD_MODIFIED;
+        // flight -- only when it is not already 0xFE.
+        climate.hu_seen_4dd++;
+        if (msg->data[2] != 0xFEU) {
+            msg->data[2] = 0xFEU;
+            climate.hu_mod_4dd++;
+            return FWD_MODIFIED;
+        }
+        return FWD_PASSTHROUGH;
     }
     if (msg->identifier == CLIMATE_HU_STATUS_FRAME_ID
             && msg->data_length_code >= 5U) {
         // 0x4EB is the head unit's other 4 Hz awake heartbeat; byte 4 is 0x80
         // while it is carrying a request and 0x00 otherwise.
-        msg->data[4] = 0x80U;
-        return FWD_MODIFIED;
+        climate.hu_seen_4eb++;
+        if (msg->data[4] != 0x80U) {
+            msg->data[4] = 0x80U;
+            climate.hu_mod_4eb++;
+            return FWD_MODIFIED;
+        }
+        return FWD_PASSTHROUGH;
     }
     if (msg->identifier == CLIMATE_REQUEST_FRAME_ID
             || msg->identifier == CLIMATE_WAKE_FRAME_ID) {
-        // The head unit starts the same remote command on its own as soon as
-        // the request reaches it; let only our replay through to the car.
+        // too short to rewrite safely; block rather than pass the HU's copy on
         return FWD_BLOCK;
     }
     return FWD_PASSTHROUGH;
 }
 
 esp_err_t climate_request_start_temp(uint8_t command, int16_t setpoint_tenths,
-                                     uint8_t options) {
+                                     uint16_t options) {
     if (command >= CLIMATE_COMMAND_COUNT) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -722,14 +925,41 @@ esp_err_t climate_request_start_temp(uint8_t command, int16_t setpoint_tenths,
     // busy too: the UI disables its buttons on climate_is_active(), which is
     // exactly this condition.
     if (climate_blocking()) {
-        return ESP_ERR_INVALID_STATE;
+        // A start may take over the tail of a previous non-start command once
+        // that command's bus work is done (Series B: "lock, then start 1/3/5/
+        // 10 s later", "start 2 s after our own stop"). Everything past the
+        // done point is just heartbeat, and the start replays from scratch.
+        // Starts never take over other starts (the retry logic owns those).
+        const uint8_t cur = atomic_load_explicit(&climate.command,
+                                                 memory_order_relaxed);
+        const uint32_t t = atomic_load_explicit(&climate.tick,
+                                                memory_order_relaxed);
+        const bool picking_up =
+            !atomic_load_explicit(&climate.active, memory_order_relaxed);
+        // A stop is still sending its class telegrams until its apply end;
+        // the other commands finish at the first heartbeat tick.
+        const uint32_t done_tick = climate_commands[cur].tmu_off
+            ? (uint32_t)CLIMATE_STOP_APPLY_END + 1U
+            : (uint32_t)CLIMATE_SESSION_TICK;
+        if (climate_commands[command].climate_start
+                && !climate_commands[cur].climate_start
+                && (picking_up || t >= done_tick)) {
+            atomic_store_explicit(&climate.active, false, memory_order_relaxed);
+            atomic_store_explicit(&climate.requested, false, memory_order_relaxed);
+        } else {
+            return ESP_ERR_INVALID_STATE;
+        }
     }
     // The setpoint and the options have to be in place before the tick sees
     // the command.
     climate.setpoint_raw = setpoint_raw_from_tenths(setpoint_tenths);
-    climate.options = (uint8_t)(options
+    climate.options = (uint16_t)(options
         & (CLIMATE_OPTION_FRONT_DEFROST | CLIMATE_OPTION_REAR_DEFROST
            | CLIMATE_OPTION_STEERING_HEAT));
+    // The trial arm travels in the high bits: bits 0..2 pick the awake-start
+    // shape (see climate_state_t.arm), bits 3..4 widen the request/apply/
+    // opcode triplet spacing from 40 ms to 80/120/160 ms (Series H4).
+    climate.arm = (uint8_t)((options >> 4) & 0x3FU);
     // Block the head unit's copies from here, before the precondition task
     // gets a chance to start the sequence.
     atomic_store_explicit(&climate.follow, climate_commands[command].follow,
@@ -789,37 +1019,86 @@ bool climate_get_status(char *out, size_t len) {
         snprintf(phase, sizeof(phase), "idle");
     }
 
-    if (!atomic_load_explicit(&climate.event_valid, memory_order_relaxed)) {
-        snprintf(out, len, "%s", phase);
-        return true;
+    // Our own 0x4A2 triplet spacing (H4), min/last/max microseconds.
+    char gap[64] = {0};
+    if (climate.tx4a2_count > 0U) {
+        snprintf(gap, sizeof(gap), "; gap %u/%u/%u us",
+                 (unsigned)climate.tx4a2_gap_min_us,
+                 (unsigned)climate.tx4a2_gap_us,
+                 (unsigned)climate.tx4a2_gap_max_us);
     }
 
-    // the event and its timestamp come from two atomics; re-read so a frame
-    // arriving in between cannot pair one id with another id's time
-    uint32_t event = 0;
-    uint32_t event_tick = 0;
-    for (int attempt = 0; attempt < 3; attempt++) {
-        event = atomic_load_explicit(&climate.event, memory_order_relaxed);
-        event_tick = atomic_load_explicit(&climate.event_tick, memory_order_relaxed);
-        if (event == atomic_load_explicit(&climate.event, memory_order_relaxed)) {
-            break;
+    // Last logged edge (kept from the old status line).
+    char event[80] = {0};
+    if (atomic_load_explicit(&climate.event_valid, memory_order_relaxed)) {
+        uint32_t ev = 0;
+        uint32_t ev_tick = 0;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            ev = atomic_load_explicit(&climate.event, memory_order_relaxed);
+            ev_tick = atomic_load_explicit(&climate.event_tick, memory_order_relaxed);
+            if (ev == atomic_load_explicit(&climate.event, memory_order_relaxed)) {
+                break;
+            }
+        }
+        const unsigned id = (unsigned)(ev & 0x7FFU);
+        const unsigned first = (unsigned)((ev >> 16) & 0xFFU);
+        const unsigned second = (unsigned)((ev >> 24) & 0xFFU);
+        const char *bus = (ev & CLIMATE_EVENT_HU) != 0U ? "hu" : "car";
+        if (started) {
+            const int32_t delta = (int32_t)(ev_tick - start_tick);
+            const uint32_t since = delta > 0 ? (uint32_t)delta * 4U / 10U : 0U;
+            snprintf(event, sizeof(event), "; ev 0x%03X %02X %02X %s +%u.%u s",
+                     id, first, second, bus, (unsigned)(since / 10U),
+                     (unsigned)(since % 10U));
+        } else {
+            snprintf(event, sizeof(event), "; ev 0x%03X %02X %02X %s", id, first,
+                     second, bus);
         }
     }
 
-    const unsigned id = (unsigned)(event & 0x7FFU);
-    const unsigned first = (unsigned)((event >> 16) & 0xFFU);
-    const unsigned second = (unsigned)((event >> 24) & 0xFFU);
-    const char *bus = (event & CLIMATE_EVENT_HU) != 0U ? "hu" : "car";
-
-    if (started) {
-        const int32_t delta = (int32_t)(event_tick - start_tick);
-        const uint32_t since = delta > 0 ? (uint32_t)delta * 4U / 10U : 0U;
-        snprintf(out, len, "%s; 0x%03X %02X %02X %s +%u.%u s", phase, id, first,
-                 second, bus, (unsigned)(since / 10U), (unsigned)(since % 10U));
-    } else {
-        snprintf(out, len, "%s; 0x%03X %02X %02X %s", phase, id, first, second, bus);
+    // Response ring, oldest first: id:b0b1@tick[+h]. One HTTP call then grades
+    // the whole trial (0x2AD on/off, 0x037 HV, 0x380 setpoints).
+    char ring[400] = {0};
+    size_t pos = 0;
+    const uint8_t n = climate_ring_count;
+    for (uint8_t k = 0; k < n; k++) {
+        const uint8_t slot = (uint8_t)((climate_ring_head + CLIMATE_RING_LEN - n
+                                        + k) % CLIMATE_RING_LEN);
+        const climate_ring_t *e = &climate_ring[slot];
+        int w = snprintf(ring + pos, sizeof(ring) - pos, " %03X:%02X%02X@%u%s",
+                         (unsigned)e->id, e->first, e->second, (unsigned)e->tick,
+                         e->bus ? "h" : "");
+        if (w < 0 || (size_t)w >= sizeof(ring) - pos) {
+            break;
+        }
+        pos += (size_t)w;
     }
+
+    // Conflict-prone head-unit frames: seen/mod. A zero "seen" means there was
+    // no live HU traffic on that frame, so FWD_MODIFIED had nothing to
+    // piggyback on; "mod" counts the rewrites that were actually needed.
+    char conflict[96];
+    snprintf(conflict, sizeof(conflict),
+             "; conflict 4f1 %u/%u 4dd %u/%u 4eb %u/%u 4a2 %u/%u",
+             (unsigned)climate.hu_seen_4f1, (unsigned)climate.hu_mod_4f1,
+             (unsigned)climate.hu_seen_4dd, (unsigned)climate.hu_mod_4dd,
+             (unsigned)climate.hu_seen_4eb, (unsigned)climate.hu_mod_4eb,
+             (unsigned)climate.hu_seen_4a2, (unsigned)climate.hu_block_4a2);
+
+    // Which trial arm ran, and whether the head unit was talking at sequence
+    // start (the "awake" case where the real start skips the wake preamble).
+    char arm_str[24];
+    snprintf(arm_str, sizeof(arm_str), "; arm%u%s", (unsigned)climate.arm,
+             climate.car_awake ? " awake" : "");
+
+    snprintf(out, len, "%s%s%s%s%s; ring%s", phase, event, gap, conflict,
+             arm_str, ring);
     return true;
+}
+
+// The most recent spacing of our own 0x4A2 triplet, in microseconds (H4).
+uint32_t climate_last_tx_gap_us(void) {
+    return climate.tx4a2_gap_us;
 }
 
 #else
@@ -838,7 +1117,7 @@ esp_err_t climate_request_start(uint8_t command) {
 }
 
 esp_err_t climate_request_start_temp(uint8_t command, int16_t setpoint_tenths,
-                                     uint8_t options) {
+                                     uint16_t options) {
     (void)command;
     (void)setpoint_tenths;
     (void)options;

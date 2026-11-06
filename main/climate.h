@@ -33,7 +33,7 @@
 // temperature: tenths of a degree C, 140..320, e.g. 225 = 22.5 C.
 esp_err_t climate_request_start(uint8_t command);
 esp_err_t climate_request_start_temp(uint8_t command, int16_t setpoint_tenths,
-                                     uint8_t options);
+                                     uint16_t options);
 
 // Options for a climate start, OR-ed together. Each one was captured on its own;
 // combinations are an OR of the observed bits and rear+steering has never been
@@ -62,3 +62,6 @@ fwd_result_t climate_fwd_hook(twai_message_t *msg, can_bus_t fwd_bus);
 
 // One line for the Status tab: phase plus the last frame the car answered with.
 bool climate_get_status(char *out, size_t len);
+
+// Microsecond spacing of our own 0x4A2 triplet, measured by the tick (H4).
+uint32_t climate_last_tx_gap_us(void);
