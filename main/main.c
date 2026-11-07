@@ -305,10 +305,6 @@ static void precondition_task_start(void)
 typedef struct {
 	twai_message_t message;
 	can_bus_t bus;
-	// Bridged (MITM) frame: sent with can_bridge_send() so the wire guard
-	// doesn't treat our own forwarding as ours. Same-bus injections (parallel
-	// mode, precondition duplicates) go out as can_send().
-	bool bridged;
 } can_fwd_item_t;
 
 static QueueHandle_t can_fwd_queue = NULL;
@@ -345,9 +341,7 @@ static void can_fwd_task(void *pvParameters)
 			can_fwd_count_drop("target bus not forwardable");
 			continue;
 		}
-		esp_err_t err = item.bridged
-			? can_bridge_send(item.bus, &item.message, pdMS_TO_TICKS(2))
-			: can_send(item.bus, &item.message, pdMS_TO_TICKS(2));
+		esp_err_t err = can_send(item.bus, &item.message, pdMS_TO_TICKS(2));
 		if (err != ESP_OK)
 		{
 			can_fwd_count_drop("send failed");
@@ -421,10 +415,7 @@ static void can_rx_task(void *pvParameters)
                 can_bus_t fwd_bus;
                 fwd_result_t fwd_result;
                 bool fwd_wanted;
-                // The guard keeps a frame off the bridge if the buses turn
-                // out to share a wire, or if it's one of our own coming back
-                const bool bridged = fwd_bridge_en && can_bridge_check(&rx_msg, rx_bus);
-                if (bridged)
+                if (fwd_bridge_en)
                 {
                     // MITM bridge: forward all traffic to the other bus. The
                     // send is queued, never performed here, so a dead bus 1
@@ -435,9 +426,9 @@ static void can_rx_task(void *pvParameters)
                 }
                 else
                 {
-                    // Parallel mode, single-bus builds and frames the guard keeps
-                    // off the bridge: no bridging; inject a modified duplicate
-                    // alongside the original, on the bus it arrived on.
+                    // Parallel mode and single-bus builds: no bridging; inject a
+                    // modified duplicate alongside the original, on the bus it
+                    // arrived on.
                     // precondition_fwd_hook only modifies CAR_BUS-bound frames,
                     // so bus 1 traffic is left alone.
                     fwd_bus = rx_bus;
@@ -455,7 +446,6 @@ static void can_rx_task(void *pvParameters)
                         can_fwd_item_t fwd_item = {
                             .message = fwd_msg,
                             .bus = fwd_bus,
-                            .bridged = bridged,
                         };
                         if (can_fwd_queue == NULL ||
                             xQueueSend(can_fwd_queue, &fwd_item, 0) != pdTRUE)

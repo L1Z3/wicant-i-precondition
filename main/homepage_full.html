@@ -2697,7 +2697,6 @@ function loadAutoTable(jsonData) {
 					var fwd_states = {
 						"mitm": "MITM (forwarding)",
 						"parallel": "Parallel (no forwarding)",
-						"off_shared_wire": "Off: bus 0 and bus 1 share a wire. Check the harness, or set the forwarding mode to Parallel",
 					};
 					document.getElementById("can_fwd_state").innerHTML = fwd_states[obj.can_fwd_state] || obj.can_fwd_state;
 					document.getElementById("can_fwd_state_row").style.display = "";
