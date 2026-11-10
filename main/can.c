@@ -1217,8 +1217,11 @@ uint8_t can_get_bitrate(can_bus_t bus)
 // CAN-FD is bus-1-only and latched into the node at the next can_enable().
 // Values are raw bits/second so GVRET's SETUP_FD can pass through whatever
 // data rate the host negotiated.
+// Single-bus boards (v300) have no bus 1: can_cfg has one entry, and indexing
+// it with CAN_BUS_1 fails the build under -Werror=array-bounds.
 void can_set_fd(can_bus_t bus, uint8_t enabled, uint32_t data_rate)
 {
+#if CAN_BUS_COUNT > 1
 	if (bus != CAN_BUS_1 || can_cfg[bus].bus_state == ON_BUS)
 	{
 		return;
@@ -1229,20 +1232,35 @@ void can_set_fd(can_bus_t bus, uint8_t enabled, uint32_t data_rate)
 	}
 	can_cfg[bus].fd_enabled = enabled ? 1 : 0;
 	can_cfg[bus].fd_data_rate = data_rate;
+#else
+	(void)bus;
+	(void)enabled;
+	(void)data_rate;
+#endif
 }
 
 bool can_is_fd_enabled(can_bus_t bus)
 {
+#if CAN_BUS_COUNT > 1
 	return bus == CAN_BUS_1 && can_cfg[bus].fd_enabled;
+#else
+	(void)bus;
+	return false;
+#endif
 }
 
 uint32_t can_get_fd_bitrate(can_bus_t bus)
 {
+#if CAN_BUS_COUNT > 1
 	if (bus != CAN_BUS_1)
 	{
 		return 0;
 	}
 	return can_cfg[bus].fd_data_rate;
+#else
+	(void)bus;
+	return 0;
+#endif
 }
 
 uint8_t can_fd_dlc_to_len(uint8_t dlc)
