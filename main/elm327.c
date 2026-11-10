@@ -36,6 +36,7 @@
 #include "std_pid.h"
 #include "sleep_mode.h"
 #include "elm327.h"
+#include "ble_ota.h"
 
 #define TAG 		__func__
 
@@ -156,6 +157,18 @@ static uint8_t elm327_fill_data_from_hex_str(const char *str, uint8_t *data, int
 		data[i] = byte;
 	}
 	return 0;
+}
+
+/*
+ * ATXOB - firmware update over BLE; see ble_ota.c.
+ *
+ *   ATXOB          -> XOB:1
+ *   ATXOB<size>    -> XOB:READY, then <size> bytes of image
+ *   ATXOBEND       -> XOB:DONE, then reboots 500 ms later
+ */
+static char* elm327_ble_ota(const char* command_str)
+{
+	return (char*)ble_ota_command(&command_str[3]);
 }
 
 static char* elm327_return_ok(const char* command_str)
@@ -1088,6 +1101,7 @@ const xelm327_cmd_t elm327_commands[] = {
 											{"@", elm327_device_description},//display device description
 											{"i", elm327_identify},//identify yourself
 											{"m", elm327_return_ok},//memory off or on
+											{"xob", elm327_ble_ota},//firmware update over BLE (see ble_ota.c)
 
 											{NULL, NULL},
 									};
