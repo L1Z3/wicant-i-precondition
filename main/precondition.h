@@ -56,4 +56,17 @@ bool precondition_get_car_model(egmp_car_model_t *out);
 // EV_CAR_NOT_READY event.
 bool car_in_ready(void);
 
+// Latest power-status byte, published on every frame rather than only on READY
+// edges, so a reader can tell a live value from one left behind when the bus
+// went quiet.
+typedef struct {
+    // byte 0 of the power-status frame; its low nibble is the power state
+    uint8_t raw;
+    // the low nibble reads 0x06: awake with the charge cable connected
+    bool plugged_in;
+    int64_t updated_at_us;
+} precondition_power_t;
+
+bool precondition_get_car_power(precondition_power_t *out);
+
 #endif
