@@ -636,7 +636,7 @@
                     <tr>
                         <td>AP Password:</td>
                         <td>
-                            <input type="text" id="ap_pass_value" name="ap_pass_value" value="Testpass" />
+                            <input type="password" autocomplete="new-password" id="ap_pass_value" name="ap_pass_value" value="Testpass" placeholder="unchanged" />
                         </td>
                     </tr>
                     <tr>
@@ -663,7 +663,7 @@
                     <tr>
                         <td>Password:</td>
                         <td>
-                            <input type="text" id="pass_value" name="pass_value" value="TomatoSauce" disabled />
+                            <input type="password" autocomplete="new-password" id="pass_value" name="pass_value" value="TomatoSauce" disabled placeholder="unchanged" />
                         </td>
                     </tr>
                     <tr>
@@ -834,7 +834,7 @@
                         </tr>
                         <tr>
                             <td><label for="mqtt_pass"><b>MQTT Pass:</b></label></td>
-                            <td><input type="text" id="mqtt_pass" name="mqtt_pass" value="meatpi" /></td>
+                            <td><input type="password" autocomplete="new-password" id="mqtt_pass" name="mqtt_pass" value="meatpi" placeholder="unchanged" /></td>
                         </tr>
                         <tr>
                             <td><label for="keep_alive"><b>Keep Alive:</b></label></td>
@@ -1222,7 +1222,7 @@
                     </tr>
                     <tr>
                         <td><label for="batt_alert_pass"><b>Password:</b></label></td>
-                        <td><input type="text" id="batt_alert_pass" name="batt_alert_pass" value="TomatoSauce" /></td>
+                        <td><input type="password" autocomplete="new-password" id="batt_alert_pass" name="batt_alert_pass" value="TomatoSauce" placeholder="unchanged" /></td>
                     </tr>
                     <tr>
                         <td><label for="batt_alert_volt"><b>Alert Voltage:</b></label></td>
@@ -1259,7 +1259,7 @@
                     </tr>
                     <tr>
                         <td><label for="batt_mqttpass"><b>Alert MQTT Pass:</b></label></td>
-                        <td><input type="text" id="batt_mqtt_pass" name="batt_mqtt_pass" value="meatpi" /></td>
+                        <td><input type="password" autocomplete="new-password" id="batt_mqtt_pass" name="batt_mqtt_pass" value="meatpi" placeholder="unchanged" /></td>
                     </tr>
                     <tr>
                         <td><label for="batt_alert_topic"><b>Alert Topic:</b></label></td>
@@ -2564,7 +2564,9 @@ function loadAutoTable(jsonData) {
 			document.getElementById("mqtt_en").disabled = false;
 			document.getElementById("batt_alert").disabled = false;
 		}
-		if(document.getElementById("ap_pass_value").value.length < 8 || document.getElementById("ap_pass_value").value.length > 63 || document.getElementById("pass_value").value.length < 8 || document.getElementById("pass_value").value.length > 63) {
+		// The device never sends stored passwords: an empty field keeps the stored one.
+		const badPass = (id) => { const n = document.getElementById(id).value.length; return n != 0 && (n < 8 || n > 63); };
+		if(badPass("ap_pass_value") || badPass("pass_value")) {
             showNotification("AP/Station password len, min=0 max=64", "red");
 			document.getElementById("submit_button").disabled = true;
 		} else if(document.getElementById("ssid_value").value.length < 1 || document.getElementById("ssid_value").value.length > 32) {
