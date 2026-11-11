@@ -524,22 +524,26 @@ static esp_err_t store_config_handler(httpd_req_t *req)
         return ESP_ERR_NO_MEM; // Memory allocation failure
     }
 
-    int ret = httpd_req_recv(req, buf, buf_size);
-
-    if (ret <= 0)
+    // The body can arrive in several pieces; read all of it before writing,
+    // or a partial config gets saved and the device resets to defaults.
+    size_t received = 0;
+    int timeouts = 0;
+    while (received < buf_size)
     {
-        if (ret == HTTPD_SOCK_ERR_TIMEOUT)
+        int ret = httpd_req_recv(req, buf + received, buf_size - received);
+        if (ret == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts < 5)
         {
-            // Retry receiving if timeout occurred
+            continue;
+        }
+        if (ret <= 0)
+        {
             free(buf);
             return ESP_FAIL;
         }
-        // Handle read error
-        free(buf);
-        return ESP_FAIL;
+        received += ret;
     }
 
-    char *kept = config_keep_stored_secrets(buf, ret);
+    char *kept = config_keep_stored_secrets(buf, buf_size);
     const char *to_write = kept ? kept : buf;
     size_t to_write_len = kept ? strlen(kept) : buf_size;
 
@@ -3168,12 +3172,16 @@ void config_server_set_ble_config(uint8_t b)
 	{
 		cJSON_SetValuestring(cJSON_GetObjectItem(root,"ble_status"), "disable");
 	}
+	// Don't log the config: it holds every stored password.
 	const char *resp_str = cJSON_Print(root);
-	ESP_LOGI(TAG, "resp_str:%s", resp_str);
 	FILE* f = fopen(FS_MOUNT_POINT"/config.json", "w");
+	if (f != NULL && resp_str != NULL)
+	{
+		// fputs, not fprintf: a "%" in a password must not be read as a format.
+		fputs(resp_str, f);
+	}
 	if (f != NULL)
 	{
-		fprintf(f, resp_str);
 		fclose(f);
 	}
 	xTimerStart( xrestartTimer, 0 );
