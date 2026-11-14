@@ -156,6 +156,14 @@ static uint8_t slcan_frame_id[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 static uint8_t slcan_frame_data = 0;
 static uint8_t slcan_frame_dlc = 0;
 static uint8_t slcan_frame_state = SL_FRAME_ID;
+// The frame being assembled lives here, not in the caller's twai_message_t:
+// can_tx_task declares that struct fresh inside its loop and a line can be
+// split across calls, so anything written into the caller's frame before the
+// last chunk would be lost. It is filled in one go at the terminating '\r'.
+static uint32_t slcan_frame_word = 0;
+static uint8_t slcan_frame_extd = 0;
+static uint8_t slcan_frame_rtr = 0;
+static uint8_t slcan_frame_bytes[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 
 // Forget a half-received frame. The idle reset in slcan_parse_str has to clear
 // this as well: it only reset the command parser, so a command that arrived
@@ -167,7 +175,22 @@ static void slcan_reset_frame(void)
 	slcan_frame_data = 0;
 	slcan_frame_dlc = 0;
 	slcan_frame_state = SL_FRAME_ID;
+	slcan_frame_word = 0;
+	slcan_frame_extd = 0;
+	slcan_frame_rtr = 0;
 	memset(slcan_frame_id, 0, sizeof(slcan_frame_id));
+	memset(slcan_frame_bytes, 0, sizeof(slcan_frame_bytes));
+}
+
+// Hand the assembled frame to the caller. Only the fields the parser owns are
+// written; the caller sets self (loopback) itself.
+static void slcan_materialize_frame(twai_message_t *frame)
+{
+	frame->identifier = slcan_frame_word;
+	frame->extd = slcan_frame_extd;
+	frame->rtr = slcan_frame_rtr;
+	frame->data_length_code = slcan_frame_dlc;
+	memcpy(frame->data, slcan_frame_bytes, sizeof(slcan_frame_bytes));
 }
 
 static uint8_t slcan_set_frame(uint8_t byte, twai_message_t *frame, uint8_t msg_type)
@@ -182,8 +205,8 @@ static uint8_t slcan_set_frame(uint8_t byte, twai_message_t *frame, uint8_t msg_
 
 				if(slcan_frame_index == 8)
 				{
-					frame->extd = 1;
-					frame->identifier = (((slcan_frame_id[6]<<4)+slcan_frame_id[7]) & 0xFF) |
+					slcan_frame_extd = 1;
+					slcan_frame_word = (((slcan_frame_id[6]<<4)+slcan_frame_id[7]) & 0xFF) |
 							((((slcan_frame_id[4]<<4)+slcan_frame_id[5]) << 8) & 0x0000FF00) |
 							((((slcan_frame_id[2]<<4)+slcan_frame_id[3]) << 16) & 0x00FF0000) |
 							((((slcan_frame_id[0]<<4)+slcan_frame_id[1]) << 24) & 0xFF000000);
@@ -197,8 +220,8 @@ static uint8_t slcan_set_frame(uint8_t byte, twai_message_t *frame, uint8_t msg_
 
 				if(slcan_frame_index == 3)
 				{
-					frame->extd = 0;
-					frame->identifier = (((slcan_frame_id[1]<<4)+slcan_frame_id[2]) & 0xFF) |
+					slcan_frame_extd = 0;
+					slcan_frame_word = (((slcan_frame_id[1]<<4)+slcan_frame_id[2]) & 0xFF) |
 							((slcan_frame_id[0]<<8) & 0x00000F00) ;
 					slcan_frame_state = SL_FRAME_DLC;
 					slcan_frame_index = 0;
@@ -216,20 +239,14 @@ static uint8_t slcan_set_frame(uint8_t byte, twai_message_t *frame, uint8_t msg_
 			// from a malformed line, so drop the line instead.
 			if(dlc > 8)
 			{
-				slcan_frame_state = SL_FRAME_ID;
-				slcan_frame_index = 0;
-				slcan_frame_data = 0;
-				memset(slcan_frame_id, 0,sizeof(slcan_frame_id));
+				slcan_reset_frame();
 				return 2;
 			}
 
-			// Keep the DLC here rather than in the caller's frame: a command split
-			// across two calls resumes in SL_FRAME_DATA, and can_tx_task hands the
-			// parser an uninitialised twai_message_t on every iteration, so the
-			// frame being assembled cannot depend on it.
 			slcan_frame_dlc = dlc;
+			slcan_frame_rtr = (msg_type == SL_REMOTE_STD || msg_type == SL_REMOTE_EXT);
 
-			if(dlc == 0 || msg_type == SL_REMOTE_STD || msg_type == SL_REMOTE_EXT)
+			if(dlc == 0 || slcan_frame_rtr)
 			{
 				slcan_frame_state = SL_FRAME_ID;
 				slcan_frame_index = 0;
@@ -250,14 +267,13 @@ static uint8_t slcan_set_frame(uint8_t byte, twai_message_t *frame, uint8_t msg_
 			}
 			else
 			{
-				frame->data[slcan_frame_index/2] = (slcan_frame_data<<4)+ascii_to_num(byte);
+				slcan_frame_bytes[slcan_frame_index/2] = (slcan_frame_data<<4)+ascii_to_num(byte);
 			}
 
 			slcan_frame_index++;
 
 			if(slcan_frame_index == slcan_frame_dlc*2)
 			{
-				frame->data_length_code = slcan_frame_dlc;
 				slcan_frame_state = SL_FRAME_ID;
 				slcan_frame_index = 0;
 				slcan_frame_data = 0;
@@ -603,41 +619,9 @@ char* slcan_parse_str(uint8_t *buf, uint8_t len, twai_message_t *frame, QueueHan
 					}
 					else
 					{
-						switch(cmd)
-						{
-							case SL_REMOTE_STD:
-							{
-								frame->rtr = 1;
-								frame->extd = 0;
-								state = SL_END;
-								break;
-							}
-							case SL_DATA_STD:
-							{
-								frame->rtr = 0;
-								frame->extd = 0;
-								state = SL_END;
-								break;
-							}
-							case SL_REMOTE_EXT:
-							{
-								frame->rtr = 1;
-								frame->extd = 1;
-								state = SL_END;
-								break;
-							}
-							case SL_DATA_EXT:
-							{
-								frame->rtr = 0;
-								frame->extd = 1;
-								state = SL_END;
-								break;
-							}
-
-//								break;
-						}
-//						state = SL_END;
-//							break;
+						// The frame is fully assembled in the parser's statics;
+						// it is copied into the caller's struct at the '\r'.
+						state = SL_END;
 					}
 					break;
 				}
@@ -648,14 +632,8 @@ char* slcan_parse_str(uint8_t *buf, uint8_t len, twai_message_t *frame, QueueHan
 				{
 					if(cmd == SL_REMOTE_STD || cmd == SL_DATA_STD || cmd == SL_REMOTE_EXT || cmd == SL_DATA_EXT)
 					{
-						if(loopback)
-						{
-							frame->self = 1;
-						}
-						else
-						{
-							frame->self = 0;
-						}
+						slcan_materialize_frame(frame);
+						frame->self = loopback ? 1 : 0;
 
 						if (ESP_ERR_INVALID_STATE == can_send(CAN_BUS_0, frame, 1))
 						{

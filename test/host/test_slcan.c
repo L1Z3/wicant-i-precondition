@@ -30,6 +30,7 @@ static size_t sent_count;
 
 static char response[64];
 static size_t response_count;
+static bool bridge_locked;  // the MITM-lock answer; a suite may flip it
 
 // --- fakes the parser calls -------------------------------------------------
 esp_err_t can_send(can_bus_t bus, twai_message_t *frame, TickType_t wait) {
@@ -47,6 +48,13 @@ void can_set_loopback(can_bus_t bus, uint8_t flag) { (void)bus; (void)flag; }
 void can_set_bitrate(can_bus_t bus, uint8_t rate) { (void)bus; (void)rate; }
 void can_set_filter(can_bus_t bus, uint32_t f) { (void)bus; (void)f; }
 void can_set_mask(can_bus_t bus, uint32_t m) { (void)bus; (void)m; }
+
+// MITM forwarding holds bus 0's configuration; while it does, the parser must
+// answer a refused command with BEL. The suites below flip this to check that.
+bool can_bridge_locked(void) { return bridge_locked; }
+
+// Bus 0's current rate. Only read under the lock, by the 'S' refusal check.
+uint8_t can_get_bitrate(can_bus_t bus) { (void)bus; return CAN_500K; }
 
 static void record_response(char *str, uint32_t len, QueueHandle_t *q) {
     (void)q;
@@ -243,6 +251,38 @@ static void run_dlc_guards(void) {
     }
 }
 
+// MITM forwarding holds bus 0's configuration: a command that would change it
+// is answered with BEL, not with the OK that would be a lie. Once the lock is
+// released the same command is accepted again.
+static void run_locked_refusals(void) {
+    reset();
+    bridge_locked = true;
+
+    feed("C\r", 2, 40000);  // close bus 0
+    CHECK_MSG(response_count == 1 && response[0] == '\a',
+              "close under MITM lock answered %zu bytes starting 0x%02x, want BEL",
+              response_count, response_count ? (unsigned char)response[0] : 0);
+
+    response_count = 0;
+    feed("S0\r", 3, 80000);  // change bus 0's bitrate
+    CHECK_MSG(response_count == 1 && response[0] == '\a',
+              "bitrate change under MITM lock answered %zu bytes starting 0x%02x, want BEL",
+              response_count, response_count ? (unsigned char)response[0] : 0);
+
+    response_count = 0;
+    feed("Y\r", 2, 120000);  // open in loopback
+    CHECK_MSG(response_count == 1 && response[0] == '\a',
+              "loopback open under MITM lock answered %zu bytes starting 0x%02x, want BEL",
+              response_count, response_count ? (unsigned char)response[0] : 0);
+
+    bridge_locked = false;
+    response_count = 0;
+    feed("C\r", 2, 160000);  // close again, now allowed
+    CHECK_MSG(response_count == 1 && response[0] == '\r',
+              "close with the lock released answered %zu bytes starting 0x%02x, want CR",
+              response_count, response_count ? (unsigned char)response[0] : 0);
+}
+
 static const struct {
     const char *name;
     void (*fn)(void);
@@ -253,6 +293,7 @@ static const struct {
     {"slcan idle after partial", run_idle_after_partial},
     {"slcan poisoned frame", run_poisoned_frame},
     {"slcan dlc guards", run_dlc_guards},
+    {"slcan locked refusals", run_locked_refusals},
 };
 
 #define NUM_SUITES (sizeof(suites) / sizeof(suites[0]))
