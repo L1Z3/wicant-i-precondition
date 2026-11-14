@@ -32,6 +32,17 @@ static char response[64];
 static size_t response_count;
 static bool bridge_locked;  // the MITM-lock answer; a suite may flip it
 
+// What the parser asked the bus to do. Recording rather than ignoring these
+// keeps the suite honest: a command that answers OK must also reach can.c.
+static uint8_t silent_state;
+static uint8_t loopback_state;
+static uint8_t rate_value;
+static size_t rate_calls;
+static uint32_t last_filter;
+static size_t filter_calls;
+static uint32_t last_mask;
+static size_t mask_calls;
+
 // --- fakes the parser calls -------------------------------------------------
 esp_err_t can_send(can_bus_t bus, twai_message_t *frame, TickType_t wait) {
     (void)wait;
@@ -43,11 +54,11 @@ esp_err_t can_send(can_bus_t bus, twai_message_t *frame, TickType_t wait) {
 
 void can_enable(can_bus_t bus) { (void)bus; }
 void can_disable(can_bus_t bus) { (void)bus; }
-void can_set_silent(can_bus_t bus, uint8_t flag) { (void)bus; (void)flag; }
-void can_set_loopback(can_bus_t bus, uint8_t flag) { (void)bus; (void)flag; }
-void can_set_bitrate(can_bus_t bus, uint8_t rate) { (void)bus; (void)rate; }
-void can_set_filter(can_bus_t bus, uint32_t f) { (void)bus; (void)f; }
-void can_set_mask(can_bus_t bus, uint32_t m) { (void)bus; (void)m; }
+void can_set_silent(can_bus_t bus, uint8_t flag) { (void)bus; silent_state = flag; }
+void can_set_loopback(can_bus_t bus, uint8_t flag) { (void)bus; loopback_state = flag; }
+void can_set_bitrate(can_bus_t bus, uint8_t rate) { (void)bus; rate_value = rate; rate_calls++; }
+void can_set_filter(can_bus_t bus, uint32_t f) { (void)bus; last_filter = f; filter_calls++; }
+void can_set_mask(can_bus_t bus, uint32_t m) { (void)bus; last_mask = m; mask_calls++; }
 
 // MITM forwarding holds bus 0's configuration; while it does, the parser must
 // answer a refused command with BEL. The suites below flip this to check that.
@@ -89,6 +100,25 @@ static size_t mk_std_line(char *out, uint32_t id, uint8_t dlc, const uint8_t *da
     return n;
 }
 
+// Extended-ID equivalent: 'T'/'R' <8 hex id> <dlc hex> [data hex] '\r'.
+static size_t mk_ext_line(char *out, uint32_t id, uint8_t dlc, const uint8_t *data, int rtr) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t n = 0;
+    out[n++] = rtr ? 'R' : 'T';
+    for (int shift = 28; shift >= 0; shift -= 4) {
+        out[n++] = hex[(id >> shift) & 0xF];
+    }
+    out[n++] = hex[dlc & 0xF];
+    if (!rtr) {
+        for (uint8_t b = 0; b < dlc; b++) {
+            out[n++] = hex[(data[b] >> 4) & 0xF];
+            out[n++] = hex[data[b] & 0xF];
+        }
+    }
+    out[n++] = '\r';
+    return n;
+}
+
 // The firmware hands the parser a twai_message_t it reuses across calls, so
 // keep one too: a command split across two calls resumes mid-frame.
 static twai_message_t frame;
@@ -115,6 +145,11 @@ static void check_frame(size_t i, uint32_t id, const uint8_t *data, uint8_t dlc)
     }
 }
 
+static void check_reply(const char *want, size_t want_len, const char *what) {
+    CHECK_MSG(response_count == want_len && memcmp(response, want, want_len) == 0,
+              "%s answered %zu bytes, want %zu", what, response_count, want_len);
+}
+
 static const uint8_t D4F1[8] = {0x00, 0xD0, 0, 0, 0, 0, 0, 0};
 static const uint8_t D4A2[8] = {0x00, 0x00, 0xFF, 0x03, 0xFF, 0xFF, 0x00, 0x00};
 
@@ -125,6 +160,15 @@ static void reset(void) {
     memset(response, 0, sizeof(response));
     memset(&frame, 0, sizeof(frame));
     fake_now = 0;
+    bridge_locked = false;
+    silent_state = 0;
+    loopback_state = 0;
+    rate_value = 0;
+    rate_calls = 0;
+    last_filter = 0;
+    filter_calls = 0;
+    last_mask = 0;
+    mask_calls = 0;
     slcan_init(record_response);
 }
 
@@ -283,6 +327,211 @@ static void run_locked_refusals(void) {
               response_count, response_count ? (unsigned char)response[0] : 0);
 }
 
+// Extended-ID frames carry the 29-bit ID in eight hex digits after 'T'. The
+// assembler is shared with the 11-bit path, so this pins that the word and the
+// extd flag come out right, including when the line is split.
+static void run_extended_ids(void) {
+    reset();
+    static const uint8_t data[8] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
+    char line[40];
+    size_t len = mk_ext_line(line, 0x1ABCDEF0u, 8, data, 0);
+
+    feed(line, len, 40000);
+    CHECK_MSG(sent_count == 1, "extended line sent %zu frames", sent_count);
+    if (sent_count == 1) {
+        CHECK_MSG(sent[0].frame.identifier == 0x1ABCDEF0u,
+                  "extended id 0x%x, want 0x1ABCDEF0", (unsigned)sent[0].frame.identifier);
+        CHECK_MSG(sent[0].frame.extd == 1, "extended line came out as std");
+        CHECK_MSG(sent[0].frame.rtr == 0, "extended line came out as RTR");
+        CHECK_MSG(sent[0].frame.data_length_code == 8,
+                  "extended dlc %u", sent[0].frame.data_length_code);
+        CHECK_MSG(memcmp(sent[0].frame.data, data, 8) == 0, "extended data mismatch");
+    }
+
+    // The same line split across two calls, as a 64-byte recv hands it over.
+    sent_count = 0;
+    feed(line, 5, 80000);
+    feed(line + 5, len - 5, 85000);
+    CHECK_MSG(sent_count == 1, "split extended line sent %zu frames", sent_count);
+    if (sent_count == 1) {
+        CHECK_MSG(sent[0].frame.identifier == 0x1ABCDEF0u,
+                  "split extended id 0x%x", (unsigned)sent[0].frame.identifier);
+        CHECK_MSG(sent[0].frame.extd == 1, "split extended line came out as std");
+        CHECK_MSG(sent[0].frame.data_length_code == 8,
+                  "split extended dlc %u", sent[0].frame.data_length_code);
+    }
+}
+
+// 'r'/'R' are RTR: the identifier and DLC travel, the payload does not. A data
+// frame after one must not inherit the rtr flag.
+static void run_rtr_frames(void) {
+    reset();
+    feed("r4F18\r", 6, 40000);
+    CHECK_MSG(sent_count == 1, "std RTR line sent %zu frames", sent_count);
+    if (sent_count == 1) {
+        CHECK_MSG(sent[0].frame.identifier == 0x4F1,
+                  "RTR id 0x%x", (unsigned)sent[0].frame.identifier);
+        CHECK_MSG(sent[0].frame.extd == 0, "std RTR came out extd");
+        CHECK_MSG(sent[0].frame.rtr == 1, "std RTR came out as data");
+        CHECK_MSG(sent[0].frame.data_length_code == 8,
+                  "RTR dlc %u", sent[0].frame.data_length_code);
+    }
+
+    sent_count = 0;
+    feed("R1ABCDEF02\r", 11, 80000);
+    CHECK_MSG(sent_count == 1, "ext RTR line sent %zu frames", sent_count);
+    if (sent_count == 1) {
+        CHECK_MSG(sent[0].frame.identifier == 0x1ABCDEF0u,
+                  "ext RTR id 0x%x", (unsigned)sent[0].frame.identifier);
+        CHECK_MSG(sent[0].frame.extd == 1, "ext RTR came out std");
+        CHECK_MSG(sent[0].frame.rtr == 1, "ext RTR came out as data");
+        CHECK_MSG(sent[0].frame.data_length_code == 2,
+                  "ext RTR dlc %u", sent[0].frame.data_length_code);
+    }
+
+    sent_count = 0;
+    char line[32];
+    size_t len = mk_std_line(line, 0x4A2, 8, D4A2);
+    feed(line, len, 120000);
+    CHECK_MSG(sent_count == 1 && sent[0].frame.rtr == 0,
+              "data line after RTR came out rtr=%d", sent_count ? sent[0].frame.rtr : -1);
+}
+
+// Loopback is a parser-side setting: 'Y' turns it on and the frame the host
+// sees its own echoes through carries self=1; 'O' clears it again.
+static void run_loopback(void) {
+    reset();
+    feed("Y\r", 2, 40000);
+    CHECK_MSG(loopback_state == 1 && silent_state == 0,
+              "Y left loopback=%u silent=%u", loopback_state, silent_state);
+
+    char line[32];
+    size_t len = mk_std_line(line, 0x4F1, 8, D4F1);
+    feed(line, len, 80000);
+    CHECK_MSG(sent_count == 1, "frame after Y sent %zu", sent_count);
+    if (sent_count == 1) {
+        CHECK_MSG(sent[0].frame.self == 1,
+                  "loopback frame self=%u, want 1", sent[0].frame.self);
+    }
+
+    sent_count = 0;
+    feed("O\r", 2, 120000);
+    CHECK_MSG(loopback_state == 0, "O left loopback=%u", loopback_state);
+    feed(line, len, 160000);
+    CHECK_MSG(sent_count == 1, "frame after O sent %zu", sent_count);
+    if (sent_count == 1) {
+        CHECK_MSG(sent[0].frame.self == 0,
+                  "non-loopback frame self=%u, want 0", sent[0].frame.self);
+    }
+}
+
+// 'M'/'m' are the accept code and mask: the hex digits arrive most significant
+// first and come out as one 32-bit word. While MITM holds the bus only the
+// accept-all values may pass.
+static void run_accept_code_and_mask(void) {
+    reset();
+    feed("M12345678\r", 10, 40000);
+    CHECK_MSG(filter_calls == 1 && last_filter == 0x12345678u,
+              "M12345678 set filter 0x%08x (%zu calls)", (unsigned)last_filter, filter_calls);
+
+    feed("mFFFFFFFF\r", 10, 80000);
+    CHECK_MSG(mask_calls == 1 && last_mask == 0xFFFFFFFFu,
+              "mFFFFFFFF set mask 0x%08x (%zu calls)", (unsigned)last_mask, mask_calls);
+
+    bridge_locked = true;
+    response_count = 0;
+    feed("M00000001\r", 10, 120000);
+    CHECK_MSG(response_count == 1 && response[0] == '\a',
+              "M under lock answered %zu bytes, want BEL", response_count);
+
+    response_count = 0;
+    feed("M00000000\r", 10, 160000);
+    CHECK_MSG(response_count == 1 && response[0] == '\r',
+              "accept-all M under lock answered %zu bytes, want OK", response_count);
+
+    response_count = 0;
+    feed("mFFFFFFFE\r", 10, 200000);
+    CHECK_MSG(response_count == 1 && response[0] == '\a',
+              "m under lock answered %zu bytes, want BEL", response_count);
+
+    response_count = 0;
+    feed("mFFFFFFFF\r", 10, 240000);
+    CHECK_MSG(response_count == 1 && response[0] == '\r',
+              "accept-all m under lock answered %zu bytes, want OK", response_count);
+}
+
+// The text replies are host-visible strings; 'Z1'/'Z0' add or drop the four
+// hex digits of timestamp in slcan_parse_frame()'s output.
+static void run_text_replies(void) {
+    reset();
+    response_count = 0;
+    feed("V\r", 2, 40000);
+    check_reply("V2011\r", 6, "V");
+
+    response_count = 0;
+    feed("N\r", 2, 80000);
+    check_reply("N43010123\r", 10, "N");
+
+    response_count = 0;
+    feed("F\r", 2, 120000);
+    check_reply("F00\r", 4, "F");
+
+    feed("Z1\r", 3, 160000);
+    twai_message_t f = {0};
+    f.identifier = 0x4F1;
+    f.data_length_code = 1;
+    f.data[0] = 0xAA;
+    char buf[64];
+    int8_t n = slcan_parse_frame((uint8_t *)buf, &f);
+    CHECK_MSG(n == 12, "timestamped frame encoded %d bytes, want 12", (int)n);
+    for (int i = n - 4; i < n - 1; i++) {
+        bool hex = (buf[i] >= '0' && buf[i] <= '9') || (buf[i] >= 'A' && buf[i] <= 'F');
+        CHECK_MSG(hex, "timestamp digit %d is 0x%02x", i, (unsigned char)buf[i]);
+    }
+
+    feed("Z0\r", 3, 200000);
+    n = slcan_parse_frame((uint8_t *)buf, &f);
+    CHECK_MSG(n == 8, "frame without timestamp encoded %d bytes, want 8", (int)n);
+}
+
+// 'S' with an index selects from sl_bitrate[]; an index past the table is
+// ignored rather than indexing off the end.
+static void run_bitrate_table(void) {
+    reset();
+    for (int i = 0; i <= 8; i++) {
+        char cmd[8];
+        int n = snprintf(cmd, sizeof(cmd), "S%d\r", i);
+        size_t before = rate_calls;
+        feed(cmd, (size_t)n, 40000 + (int64_t)i * 1000);
+        CHECK_MSG(rate_calls == before + 1 && rate_value == sl_bitrate[i],
+                  "S%d set rate %u (%zu calls), want %u", i, rate_value, rate_calls, sl_bitrate[i]);
+    }
+    size_t before = rate_calls;
+    feed("S9\r", 3, 60000);
+    CHECK_MSG(rate_calls == before, "S9 changed the rate (%zu calls)", rate_calls);
+}
+
+// A host can stream without ever terminating a line. The parser must not
+// accumulate those bytes in its scratch buffer and must still take the next
+// real command.
+static void run_buffer_flood(void) {
+    reset();
+    char chunk[256];
+    memset(chunk, 'x', 255);  // unknown command bytes are skipped in SL_HEADER
+    for (int i = 0; i < 10; i++) {
+        feed(chunk, 255, 40000 + (int64_t)i * 1000);
+    }
+    CHECK_MSG(sent_count == 0, "flood of 2550 bytes sent %zu frames", sent_count);
+
+    char line[32];
+    size_t len = mk_std_line(line, 0x4F1, 8, D4F1);
+    feed(line, len, 60000);
+    CHECK_MSG(sent_count == 1, "line after the flood sent %zu frames, want 1", sent_count);
+    if (sent_count == 1) {
+        check_frame(0, 0x4F1, D4F1, 8);
+    }
+}
+
 static const struct {
     const char *name;
     void (*fn)(void);
@@ -294,6 +543,13 @@ static const struct {
     {"slcan poisoned frame", run_poisoned_frame},
     {"slcan dlc guards", run_dlc_guards},
     {"slcan locked refusals", run_locked_refusals},
+    {"slcan extended ids", run_extended_ids},
+    {"slcan rtr frames", run_rtr_frames},
+    {"slcan loopback", run_loopback},
+    {"slcan accept code and mask", run_accept_code_and_mask},
+    {"slcan text replies", run_text_replies},
+    {"slcan bitrate table", run_bitrate_table},
+    {"slcan buffer flood", run_buffer_flood},
 };
 
 #define NUM_SUITES (sizeof(suites) / sizeof(suites[0]))
