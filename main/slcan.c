@@ -306,6 +306,21 @@ char* slcan_parse_str(uint8_t *buf, uint8_t len, twai_message_t *frame, QueueHan
 	static uint32_t buffer_index = 0;
 
 	time_now = esp_timer_get_time();
+	// One line at a time lives in this buffer, and len is a uint8_t, so
+	// today a chunk cannot reach the end of it. Keep the invariant local
+	// anyway: a chunk that does not fit cannot be the start of a well-formed
+	// line, so drop the partial line instead of writing past the allocation.
+	if (buffer_index + len > SLCAN_BUFFER_SIZE)
+	{
+		state = SL_HEADER;
+		cmd = SL_NONE;
+		cmd_ret = SL_NONE;
+		msg_index = 0;
+		refused = 0;
+		buffer_index = 0;
+		slcan_reset_frame();
+		return 0;
+	}
     memcpy(&slcan_buffer[buffer_index], buf, len);
     buffer_index += len;
 	
