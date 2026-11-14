@@ -33,19 +33,18 @@
 // All buses on all boards: classic CAN, 87.5% sample point (CiA recommendation)
 #define CAN_SAMPLE_POINT_PERMILL    875
 
-#if HARDWARE_VER == WICAN_CUSTOM
+#if HARDWARE_VER == WICAN_PROTO || HARDWARE_VER == WICAN_EB_FD
 
-// ---- Custom WiCAN: ESP32-S3-WROOM-1 N16R8, two CAN buses, no STN chip. ---- //
+// ---- Proto / EB-FD: ESP32-S3-WROOM-1 N16R8, two CAN buses, no STN chip. ---- //
 // These values come essentially verbatim from the hwconfig.h/main.c
-// in Ali's provided test firmware for the custom WiCAN.
+// in Ali's provided test firmwares.
 
-// -- Bus 0: TWAI controller on ESP -> SN65HVD233 #1 -- //
+#define CAN_BUS_COUNT                2
+
+// -- Bus 0: TWAI controller on ESP -> SN65HVD233 (EB-FD U2) -- //
 
 #define TX_GPIO_NUM                 2
 #define RX_GPIO_NUM                 1
-// As per Ali, the transceiver standby mode (i.e. RS mode-select pin (pin 8))
-// is not working on the custom WiCAN rev 1.
-// As such, CAN_STDBY_GPIO_NUM is not defined here. 
 
 // Indicates whether the hardware has a second voltage divider
 // to read a second (hot-when-car-on) power pin.
@@ -66,10 +65,14 @@
 // // calibrate this based on ground truth measurements from another device
 // #define V_CAR_ON_READ_OFFSET_V           0.0f
 
+#if HARDWARE_VER == WICAN_PROTO
+
+// As per Ali, transceiver standby (RS, pin 8) is not working on proto.
+// CAN_STDBY_GPIO_NUM remains undefined for this board.
 // -- Bus 1: MCP2515 (SPI2) -> SN65HVD233 #2 -- //
 
 #define HW_HAS_MCP2515               1
-#define CAN_BUS_COUNT                2
+#define HW_HAS_MCP2518FD             0
 #define MCP2515_SPI_HOST             SPI2_HOST
 #define MCP2515_SCLK_GPIO_NUM        17
 #define MCP2515_MOSI_GPIO_NUM        16
@@ -83,15 +86,47 @@
 #define MCP2515_SPI_CLOCK_HZ         10000000
 #define MCP2515_OSCILLATOR_HZ        8000000
 
-#define CONNECTED_LED_GPIO_NUM       41
-#define ACTIVE_LED_GPIO_NUM          40
-#define PWR_LED_GPIO_NUM             42
+#else
+
+// STDBY_1 -> U2 RS and STDBY_2 -> U4 STB each have a 10 kOhm pull-up
+// (pins and polarity checked on the bench).
+// Drive low for normal operation, high for standby.
+#define CAN_STDBY_GPIO_NUM          11
+#define MCP2518FD_STDBY_GPIO_NUM    12
+
+// OBD-II pins, on the WiCAN's own plug: bus 0 is 6 (H)/14 (L) and connects to 
+// the rest of the M-CAN; bus 1 is 12 (H)/13 (L) connects only to the head unit. 
+// The harness socket it plugs into is numbered as a mirror image (harness pin 1 
+// mates with WiCAN pin 8, 9 with 16), so the harness calls these 3/11 and 13/12.
+//  See README.md.
+
+// -- Bus 1: MCP2518FD U57 (SPI2) -> TCAN3413 U4 -- //
+// MCP2518FD resets over SPI; GPIO 8 is unused.
+// X2 is a 40 MHz crystal; PLL and SYSCLK division remain disabled.
+#define HW_HAS_MCP2515               0
+#define HW_HAS_MCP2518FD             1
+#define MCP2518FD_SPI_HOST           SPI2_HOST
+#define MCP2518FD_SCLK_GPIO_NUM      17
+#define MCP2518FD_MOSI_GPIO_NUM      16
+#define MCP2518FD_MISO_GPIO_NUM      15
+#define MCP2518FD_CS_GPIO_NUM        18
+#define MCP2518FD_INT_GPIO_NUM       7
+// 80/5 MHz. MCP2518FD allows 17 MHz at a 40 MHz SYSCLK, but its 20 ns SDO
+// valid time leaves ~11 ns of MISO margin at 16 MHz through the GPIO matrix.
+#define MCP2518FD_SPI_CLOCK_HZ       16000000
+#define MCP2518FD_OSCILLATOR_HZ      40000000
+
+#endif
+
+#define CONNECTED_LED_GPIO_NUM       41 // Green
+#define ACTIVE_LED_GPIO_NUM          40 // Yellow
+#define PWR_LED_GPIO_NUM             42 // Blue
 #define LED_ON                       0
 #define LED_OFF                      1
 #define PWR_LED_ON                   0
 #define PWR_LED_OFF                  1
 
-// VBAT sense: R1=62K, R2=6.2K divider (x11) to ADC1 ch3
+// VBAT sense: R1=62K, R2=6.2K divider (x11) to ADC1 ch3 / GPIO 4
 #define VBAT_ADC_CHANNEL             ADC_CHANNEL_3
 #define VBAT_ADC_ATTEN               ADC_ATTEN_DB_6
 #define VBAT_DIVIDER_R1_OHM          62000
@@ -112,6 +147,7 @@
 #define HW_HAS_CAR_ON_SENSE          0
 
 #define HW_HAS_MCP2515              0
+#define HW_HAS_MCP2518FD            0
 #define CAN_BUS_COUNT               1
 
 #define CONNECTED_LED_GPIO_NUM		8
@@ -132,7 +168,7 @@
 #define VBAT_READ_OFFSET_V          0.2f
 
 #else
-#error "HARDWARE_VER must be WICAN_V300 or WICAN_CUSTOM"
+#error "HARDWARE_VER must be WICAN_V300, WICAN_PROTO, or WICAN_EB_FD"
 #endif
 
 esp_err_t hw_config_get_device_id(char *uid);

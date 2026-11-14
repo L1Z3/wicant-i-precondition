@@ -33,6 +33,7 @@
 #include "comm_server.h"
 #include "lwip/sockets.h"
 #include "driver/twai.h"
+#include "driver/temperature_sensor.h"
 #include "types.h"
 #include "config_server.h"
 #include "realdash.h"
@@ -60,6 +61,11 @@
 #include "debug_logs_config.h"
 
 #define TAG 		__func__
+
+// The ESP32-S3 temperature sensor is a die/package proxy, not ambient. Log it
+// slowly so it can be correlated with resets or CAN faults without adding load.
+#define TEMP_PROXY_TAG 		"temp_proxy"
+#define TEMP_PROXY_PERIOD_MS	60000
 
 #define GPIO_OUTPUT_PIN_SEL  ((1ULL<<CONNECTED_LED_GPIO_NUM) | (1ULL<<ACTIVE_LED_GPIO_NUM) | (1ULL<<PWR_LED_GPIO_NUM))
 
@@ -286,6 +292,63 @@ static void precondition_task_start(void)
 	ESP_ERROR_CHECK(esp_timer_start_once(precondition_timer, PRECONDITION_TICK_PERIOD_US));
 }
 
+// ---------------------------------------------------------------------------
+// Forward queue.
+//
+// The RX task feeds this queue and a separate task performs the actual
+// can_send(). A dead or slow target bus (MCP2518FD error-passive at startup,
+// 14 ms SPI transfers) must not block the RX task: dropping a forwarded frame
+// is preferable to dropping bus-0 traffic and the GVRET stream.
+// ---------------------------------------------------------------------------
+#define CAN_FWD_QUEUE_LEN 256
+#define CAN_FWD_DROP_LOG_INTERVAL_US (60LL * 1000 * 1000)
+typedef struct {
+	twai_message_t message;
+	can_bus_t bus;
+} can_fwd_item_t;
+
+static QueueHandle_t can_fwd_queue = NULL;
+static uint32_t can_fwd_dropped = 0;
+static int64_t can_fwd_drop_log_us = 0;
+
+// Dropping a forwarded frame is expected when the target bus is down or the
+// queue is full; log the total at most once a minute so a saturated bus does
+// not turn the drop path into a log flood.
+static void can_fwd_count_drop(const char *why)
+{
+	can_fwd_dropped++;
+	int64_t now = esp_timer_get_time();
+	if (now - can_fwd_drop_log_us > CAN_FWD_DROP_LOG_INTERVAL_US)
+	{
+		can_fwd_drop_log_us = now;
+		ESP_LOGW(TAG, "precondition fwd: %lu frames dropped (%s)",
+				 (unsigned long)can_fwd_dropped, why);
+	}
+}
+
+static void can_fwd_task(void *pvParameters)
+{
+	(void)pvParameters;
+	can_fwd_item_t item;
+	while (1)
+	{
+		if (xQueueReceive(can_fwd_queue, &item, portMAX_DELAY) != pdTRUE)
+		{
+			continue;
+		}
+		if (!can_is_forwardable(item.bus))
+		{
+			can_fwd_count_drop("target bus not forwardable");
+			continue;
+		}
+		esp_err_t err = can_send(item.bus, &item.message, pdMS_TO_TICKS(2));
+		if (err != ESP_OK)
+		{
+			can_fwd_count_drop("send failed");
+		}
+	}
+}
+
 static void can_rx_task(void *pvParameters)
 {
 //	static uint32_t num_msg = 0;
@@ -352,46 +415,43 @@ static void can_rx_task(void *pvParameters)
                 can_bus_t fwd_bus;
                 fwd_result_t fwd_result;
                 bool fwd_wanted;
-                TickType_t fwd_wait;
-                static int64_t fwd_fastdrop_until_us[CAN_BUS_COUNT];
                 if (fwd_bridge_en)
                 {
-                    // MITM bridge: forward all traffic to the other bus, with
-					// adaptive backpressure. This task gets preempted, then
-					// drains the RX queue in a batch that can momentarily overrun
-					// the 32-slot TX pool even though a slot frees every ~250us;
-					// waiting a couple ticks absorbs the batch instead of dropping
-					// it. But if the wait itself times out, the bus is saturated
-					// or wedged: fall back to fast-drop for 100ms so a dead bus 1
-					// can't throttle RX servicing (and bus-0 GVRET streaming).
+                    // MITM bridge: forward all traffic to the other bus. The
+                    // send is queued, never performed here, so a dead bus 1
+                    // cannot throttle RX servicing or bus-0 GVRET streaming.
                     fwd_bus = (rx_bus == CAN_BUS_0) ? CAN_BUS_1 : CAN_BUS_0;
                     fwd_result = precondition_fwd_hook(&fwd_msg, fwd_bus);
                     fwd_wanted = (fwd_result != FWD_BLOCK);
-                    fwd_wait =
-                        (esp_timer_get_time() < fwd_fastdrop_until_us[fwd_bus]) ? 0 : 2;
                 }
                 else
                 {
-                    // Parallel mode (and single-bus builds): no bridging; inject
-                    // a modified duplicate alongside the original, on the bus it
-                    // arrived on. precondition_fwd_hook only modifies
-                    // CAR_BUS-bound frames, so bus 1 traffic is left alone.
+                    // Parallel mode and single-bus builds: no bridging; inject a
+                    // modified duplicate alongside the original, on the bus it
+                    // arrived on.
+                    // precondition_fwd_hook only modifies CAR_BUS-bound frames,
+                    // so bus 1 traffic is left alone.
                     fwd_bus = rx_bus;
                     fwd_result = precondition_fwd_hook(&fwd_msg, fwd_bus);
                     fwd_wanted = (fwd_result == FWD_MODIFIED);
-                    fwd_wait = 1;
                 }
-                if (fwd_wanted && can_send(fwd_bus, &fwd_msg, fwd_wait) != ESP_OK)
+                if (fwd_wanted)
                 {
-                    if (fwd_bridge_en && fwd_wait != 0)
+                    if (!can_is_forwardable(fwd_bus))
                     {
-                        fwd_fastdrop_until_us[fwd_bus] = esp_timer_get_time() + 100000;
+                        can_fwd_count_drop("target bus not forwardable");
                     }
-                    static uint32_t fwd_drop_cnt = 0;
-                    if ((++fwd_drop_cnt % 256U) == 1U)
+                    else
                     {
-                        ESP_LOGW(TAG, "precondition fwd: %lu frames dropped",
-                                 (unsigned long)fwd_drop_cnt);
+                        can_fwd_item_t fwd_item = {
+                            .message = fwd_msg,
+                            .bus = fwd_bus,
+                        };
+                        if (can_fwd_queue == NULL ||
+                            xQueueSend(can_fwd_queue, &fwd_item, 0) != pdTRUE)
+                        {
+                            can_fwd_count_drop("forward queue full");
+                        }
                     }
                 }
             }
@@ -492,6 +552,39 @@ static void can_rx_task(void *pvParameters)
 	}
 }
 
+static void temperature_proxy_task(void *arg)
+{
+	temperature_sensor_handle_t sensor = (temperature_sensor_handle_t)arg;
+
+	while (1)
+	{
+		// Re-enable per sample: the sensor is not retained across light sleep
+		// unless the driver is configured with allow_pd, and one sample a
+		// minute does not justify keeping it powered.
+		esp_err_t err = temperature_sensor_enable(sensor);
+		if (err == ESP_OK || err == ESP_ERR_INVALID_STATE)
+		{
+			float celsius = 0;
+			err = temperature_sensor_get_celsius(sensor, &celsius);
+			if (err == ESP_OK)
+			{
+				ESP_LOGI(TEMP_PROXY_TAG, "die %.1f C", celsius);
+			}
+			else
+			{
+				ESP_LOGW(TEMP_PROXY_TAG, "read failed: %s", esp_err_to_name(err));
+			}
+			temperature_sensor_disable(sensor);
+		}
+		else
+		{
+			ESP_LOGW(TEMP_PROXY_TAG, "enable failed: %s", esp_err_to_name(err));
+		}
+
+		vTaskDelay(pdMS_TO_TICKS(TEMP_PROXY_PERIOD_MS));
+	}
+}
+
 void app_main(void)
 {
 	dev_status_init();
@@ -522,6 +615,11 @@ void app_main(void)
     gpio_set_direction(CAN_STDBY_GPIO_NUM, GPIO_MODE_OUTPUT);
     gpio_set_level(CAN_STDBY_GPIO_NUM, 1);
 #endif
+#ifdef MCP2518FD_STDBY_GPIO_NUM
+    gpio_reset_pin(MCP2518FD_STDBY_GPIO_NUM);
+    gpio_set_direction(MCP2518FD_STDBY_GPIO_NUM, GPIO_MODE_OUTPUT);
+    gpio_set_level(MCP2518FD_STDBY_GPIO_NUM, 1);
+#endif
 
     xMsg_Rx_Queue = xQueueCreate(16, sizeof( xdev_buffer) );
     // 128 slots (~10 KB): bigger than upstream 16 in order to ride out wifi/lwip hiccups
@@ -547,6 +645,25 @@ void app_main(void)
 
 	int8_t can_datarate = config_server_get_can_rate();
 	can_init();
+
+	// Start the consumers before the first can_enable() below. The
+	// 256-entry RX queue filled during boot in the can_re log (255 bus-0
+	// and 38 bus-1 frames dropped) because can_rx_task was created after
+	// the transports and Wi-Fi started.
+	can_fwd_queue = xQueueCreate(CAN_FWD_QUEUE_LEN, sizeof(can_fwd_item_t));
+	if (can_fwd_queue != NULL)
+	{
+		xTaskCreate(can_fwd_task, "can_fwd_task", 1024*3, NULL, 6, NULL);
+	}
+	else
+	{
+		ESP_LOGE(TAG, "can_fwd_queue create failed; forwarding disabled");
+	}
+
+	// Prio 7: the CAN datapath must preempt the TCP streaming tasks (prio 5)
+	// instead of timeslicing with them. Safe only because can_rx_task blocks
+	// in can_receive() when idle (see the receive loop).
+	xTaskCreate(can_rx_task, "can_rx_task", 1024*3, (void*)AF_INET, 7, NULL);
 
 	if(can_datarate != -1)
 	{
@@ -592,6 +709,13 @@ void app_main(void)
 	if(config_server_get_can1_en())
 	{
 		can_enable(CAN_BUS_1);
+	}
+
+	// MITM: the head unit reaches the rest of the bus only through us, so
+	// both buses come up now, before any protocol is set up, and stay up
+	if(config_server_get_fwd_en())
+	{
+		can_lock_bridge();
 	}
 #endif
 
@@ -715,10 +839,6 @@ void app_main(void)
     }
 	wc_mdns_init((char*)uid, hardware_version, firmware_version);
 	precondition_task_start();
-    // Prio 7: the CAN datapath must preempt the TCP streaming tasks (prio 5)
-    // instead of timeslicing with them. Safe only because can_rx_task blocks
-    // in can_receive() when idle (see the receive loop).
-    xTaskCreate(can_rx_task, "can_rx_task", 1024*3, (void*)AF_INET, 7, NULL);
     xTaskCreate(can_tx_task, "can_tx_task", 1024*3, (void*)AF_INET, 5, NULL);
 
     // sleep_config: 1 = low-voltage sleep, 2 = car-off sleep. Both run the
@@ -757,6 +877,26 @@ void app_main(void)
 	// portMAX_DELAY);/* Wait forever. */  
 	// esp_log_level_set("*", ESP_LOG_NONE);
 	esp_log_level_set("*", ESP_LOG_WARN);
+	esp_log_level_set(TEMP_PROXY_TAG, ESP_LOG_INFO);
+
+	// A die-temperature trace is useful when chasing resets under load, but it
+	// is not an ambient measurement. The task reads once a minute and does not
+	// touch the CAN paths.
+	temperature_sensor_config_t temp_cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 80);
+	temperature_sensor_handle_t temp_sensor = NULL;
+	esp_err_t temp_err = temperature_sensor_install(&temp_cfg, &temp_sensor);
+	if (temp_err == ESP_OK)
+	{
+		if (xTaskCreate(temperature_proxy_task, "temp_proxy", 4096, temp_sensor, 1, NULL) != pdPASS)
+		{
+			ESP_LOGE(TAG, "temperature proxy task create failed");
+			temperature_sensor_uninstall(temp_sensor);
+		}
+	}
+	else
+	{
+		ESP_LOGW(TAG, "temperature sensor unavailable: %s", esp_err_to_name(temp_err));
+	}
 	// esp_log_level_set("autopid_parser", ESP_LOG_ERROR);
 	// esp_log_level_set("autopid_task", ESP_LOG_ERROR);
 	// esp_log_level_set("elm327_process_cmd", ESP_LOG_ERROR);

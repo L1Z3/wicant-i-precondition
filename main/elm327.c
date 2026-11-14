@@ -450,6 +450,42 @@ static char* elm327_set_fc_data(const char* command_str)
 	return (char*)ok_str;
 }
 
+// While MITM forwarding is locked, the CAN protocol with the same ID width as
+// `protocol` at bus 0's bitrate: on a 500k bus 9 (29-bit, 250k) becomes 7
+// (29-bit, 500k). Other protocols, other bitrates and an unlocked bus keep
+// `protocol` as it is.
+static char elm327_locked_protocol(char protocol)
+{
+	bool extd;
+
+	if(!can_bridge_locked())
+	{
+		return protocol;
+	}
+	if(protocol == '6' || protocol == '8')
+	{
+		extd = false;
+	}
+	else if(protocol == '7' || protocol == '9')
+	{
+		extd = true;
+	}
+	else
+	{
+		return protocol;
+	}
+
+	switch(can_get_bitrate(CAN_BUS_0))
+	{
+		case CAN_500K:
+			return extd ? '7' : '6';
+		case CAN_250K:
+			return extd ? '9' : '8';
+		default:
+			return protocol;
+	}
+}
+
 static char* elm327_set_protocol(const char* command_str)
 {
 	char new_protocol;
@@ -470,6 +506,21 @@ static char* elm327_set_protocol(const char* command_str)
 	else
 	{
 		new_protocol = command_str[2];
+	}
+
+	// MITM forwarding has bus 0's bitrate fixed: leave the bus alone and
+	// answer OK with the protocol that keeps the ID width asked for. A "?"
+	// would leave autopid, which doesn't read replies, sending its 29-bit
+	// headers cut to 11 bits.
+	if(can_bridge_locked())
+	{
+		new_protocol = elm327_locked_protocol(new_protocol);
+		if(new_protocol != elm327_config.protocol)
+		{
+			elm327_config.protocol = new_protocol;
+			ESP_LOGI(TAG, "elm327_config.protocol: %c", elm327_config.protocol);
+		}
+		return (char*)ok_str;
 	}
 
 	if(new_protocol == elm327_config.protocol)
@@ -834,10 +885,9 @@ static int8_t elm327_request(char *cmd, char *rsp, QueueHandle_t *queue)
 	{
 		elm327_can_log(&txframe, ELM327_CAN_TX);
 	}
+	// Drain ELM's own queue only. The shared RX queue behind it also feeds
+	// forwarding and the precondition hooks, on both buses.
 	while( xQueueReceive(*can_rx_queue, ( void * ) &rx_frame, pdMS_TO_TICKS(1)) == pdPASS );
-	// Drains the shared RX queue, i.e. all buses--fine, since nothing
-	// consumes bus-1 frames while the ELM327/AutoPID protocol is active.
-	can_flush_rx();
 	can_send(CAN_BUS_0, &txframe, 1);
 	xEventGroupSetBits(elm327_event_group, ELM327_READY_TO_RECEIVE_CAN);
 
@@ -1192,6 +1242,8 @@ void elm327_init(void (*send_to_host)(char*, uint32_t, QueueHandle_t *q), QueueH
     }
 	
 	elm327_set_default_config(true);
+	// Under MITM forwarding, start on the protocol that matches bus 0
+	elm327_config.protocol = elm327_locked_protocol(elm327_config.protocol);
 	elm327_response = send_to_host;
 	can_rx_queue = rx_queue;
 	elm327_can_log = can_log;

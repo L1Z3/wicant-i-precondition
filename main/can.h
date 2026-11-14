@@ -25,8 +25,11 @@
 #include "hw_config.h"
 
 typedef enum {
-	CAN_BUS_0 = 0,   /* on-chip TWAI controller (OBD-II pins 6/14) */
-	CAN_BUS_1 = 1,   /* MCP2515 over SPI, custom board only (OBD-II pins 12/13) */
+	// OBD-II pins, on the WiCAN's own plug: bus 0 is 6 (H)/14 (L). On eb-fd,
+	// bus 1 is 12 (H)/13 (L). The harness socket's numbering is mirrored; see
+	// README.md.
+	CAN_BUS_0 = 0,   // on-chip TWAI controller
+	CAN_BUS_1 = 1,   // SPI CAN: MCP2515 on proto, MCP2518FD on eb-fd
 } can_bus_t;
 
 #define CAN_5K				0
@@ -54,6 +57,15 @@ typedef struct {
 void can_init(void);
 void can_enable(can_bus_t bus);
 void can_disable(can_bus_t bus);
+// MITM: brings every bus up in normal mode, accepting every frame, and keeps
+// it so: can_disable() and the config setters refuse, and a bus that goes
+// down is brought back. Until can_park().
+void can_lock_bridge(void);
+// Sleep: takes every bus down and unlocks MITM forwarding. No bus comes back
+// up until the board wakes, which is a restart.
+void can_park(void);
+// So clients can tell a refused change from one that took
+bool can_bridge_locked(void);
 void can_set_silent(can_bus_t bus, uint8_t flag);
 void can_set_loopback(can_bus_t bus, uint8_t flag);
 void can_set_auto_retransmit(can_bus_t bus, uint8_t flag);
@@ -64,7 +76,7 @@ esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_w
 esp_err_t can_receive(twai_message_t *message, can_bus_t *bus, TickType_t ticks_to_wait);
 uint8_t can_is_silent(can_bus_t bus);
 bool can_is_enabled(can_bus_t bus);
+bool can_is_forwardable(can_bus_t bus);
 bool can_any_enabled(void);
 uint8_t can_get_bitrate(can_bus_t bus);
-void can_flush_rx(void);
 #endif
