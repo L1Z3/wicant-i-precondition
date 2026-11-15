@@ -192,6 +192,18 @@ static void can_tx_task(void *pvParameters)
 		uint8_t* msg_ptr = ucTCP_RX_Buffer.ucElement;
 		int temp_len = ucTCP_RX_Buffer.usLen;
 
+        // OTA control is a BLE service, independent of the selected CAN protocol.
+        if (ucTCP_RX_Buffer.dev_channel == DEV_BLE)
+        {
+            const char *reply = ble_ota_process_control(msg_ptr, temp_len);
+            if (reply != NULL)
+            {
+                send_to_host((char *)reply, 0, &xmsg_ble_tx_queue);
+                send_to_host("\r\r>", 0, &xmsg_ble_tx_queue);
+                continue;
+            }
+        }
+
 		if(config_server_ws_connected())
 		{
 			if(ucTCP_RX_Buffer.dev_channel == DEV_WIFI_WS)

@@ -24,7 +24,7 @@ MAIN := ../../main
 FW_FILES := utf8_utf16_converter.c utf8_utf16_converter.h hsm.c hsm.h beep.c beep.h \
 	isotp_tx.c isotp_tx.h track_popup.c track_popup.h \
 	precondition.c precondition.h persistent_settings.c persistent_settings.h \
-	slcan.c slcan.h
+	slcan.c slcan.h ble_ota_control.c ble_ota.h
 # firmware sources linked into every test binary (tests that #include a
 # source instead, for introspection, don't list it here)
 LINK_SRCS := build/src/hsm.c

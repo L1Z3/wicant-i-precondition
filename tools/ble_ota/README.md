@@ -4,7 +4,7 @@
 
 ## Protocol
 
-On the command characteristic (service `FEE0`, characteristic `FEE1`), the one the ELM327 commands use:
+On the command characteristic (service `FEE0`, characteristic `FEE1`), independently of the selected CAN protocol, including the default SavvyCAN mode. BLE must be enabled; changing to ELM327 mode is unnecessary.
 
 | Send | Reply |
 |---|---|
@@ -13,6 +13,7 @@ On the command characteristic (service `FEE0`, characteristic `FEE1`), the one t
 | `<size>` bytes of the `.bin`, as writes with response | none; `$XOB:ERR,<reason>` if a write fails |
 | `ATXOBEND` | `XOB:DONE` (reboots 500 ms later), or `XOB:ERR,IMAGE` / `XOB:ERR,VARIANT` / `XOB:ERR,INCOMPLETE` |
 
+- Send each control command (`ATXOB`, `ATXOB<size>`, `ATXOBEND`) in a separate BLE write, terminated by CR. Commands are case-insensitive and fit in the minimum 20-byte ATT payload. Replies end with `\r\r>`. Partial commands and combined commands are passed to the selected CAN parser, not interpreted as OTA.
 - Writes can be up to 244 bytes (one ATT payload at a 247-byte MTU). Smaller writes work, just more slowly.
 - While image bytes are expected, every write on the characteristic goes to flash, so send nothing else until the last byte is written.
 - Dropping the link abandons the transfer. The running firmware is untouched until `ATXOBEND` passes.

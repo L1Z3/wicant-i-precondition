@@ -46,9 +46,11 @@ class Link:
 
     async def command(self, text, timeout=5.0):
         data = (text + "\r").encode("ascii")
-        # Commands go in pieces of 60 bytes or fewer: the WiCAN joins them at the CR.
-        for i in range(0, len(data), 60):
-            await self.client.write_gatt_char(COMMAND_CHAR, data[i:i + 60], response=True)
+        # OTA controls are standalone writes, independent of the CAN protocol.
+        # Probe, 32-bit size and END all fit the minimum ATT payload.
+        if len(data) > 20:
+            raise ValueError("OTA control command exceeds the 20-byte payload")
+        await self.client.write_gatt_char(COMMAND_CHAR, data, response=True)
         deadline = asyncio.get_running_loop().time() + timeout
         while True:
             remaining = deadline - asyncio.get_running_loop().time()

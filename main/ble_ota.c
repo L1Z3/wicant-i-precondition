@@ -42,7 +42,7 @@ static esp_ota_handle_t s_handle;
 static const esp_partition_t *s_partition;
 static uint32_t s_expected;
 static uint32_t s_received;
-// Image bytes expected. Set by ble_ota_command (the ELM327 task) once the
+// Image bytes expected. Set by ble_ota_command (the CAN TX task) once the
 // handle is open, cleared by the BTC task on the last byte, a failed write or
 // a drop.
 static volatile bool s_active;
