@@ -3441,7 +3441,6 @@ function loadAutoTable(jsonData) {
                 carSelect.value = "auto";
             }
             updatePreconButtonVisibility();
-            syncPreconButtonToggle();
             // log_level is missing from older configs; the firmware
             // defaults it to "warn"
             document.getElementById("log_level").value = obj.log_level || "warn";
