@@ -317,15 +317,26 @@ static void precondition_task_start(void)
 // can_send(). A dead or slow target bus (MCP2518FD error-passive at startup,
 // 14 ms SPI transfers) must not block the RX task: dropping a forwarded frame
 // is preferable to dropping bus-0 traffic and the GVRET stream.
+//
+// Only two-bus (MITM) builds need any of this. A single-bus build has no second
+// bus to forward to, so it injects a modified duplicate straight from the RX
+// task. The queue and its task cost 6 KB of queue plus a 3 KB stack, and on the
+// 4 MB single-bus board (OBD-C3) those 9 KB were the difference between the
+// config page loading and the WiFi driver running out of packet buffers
+// mid-page.
 // ---------------------------------------------------------------------------
-#define CAN_FWD_QUEUE_LEN 256
 #define CAN_FWD_DROP_LOG_INTERVAL_US (60LL * 1000 * 1000)
+
+#if CAN_BUS_COUNT > 1
+#define CAN_FWD_QUEUE_LEN 256
 typedef struct {
 	twai_message_t message;
 	can_bus_t bus;
 } can_fwd_item_t;
 
 static QueueHandle_t can_fwd_queue = NULL;
+#endif
+
 static uint32_t can_fwd_dropped = 0;
 static int64_t can_fwd_drop_log_us = 0;
 
@@ -344,6 +355,7 @@ static void can_fwd_count_drop(const char *why)
 	}
 }
 
+#if CAN_BUS_COUNT > 1
 static void can_fwd_task(void *pvParameters)
 {
 	(void)pvParameters;
@@ -366,6 +378,7 @@ static void can_fwd_task(void *pvParameters)
 		}
 	}
 }
+#endif /* CAN_BUS_COUNT > 1 */
 
 static void can_rx_task(void *pvParameters)
 {
@@ -459,6 +472,7 @@ static void can_rx_task(void *pvParameters)
                     {
                         can_fwd_count_drop("target bus not forwardable");
                     }
+#if CAN_BUS_COUNT > 1
                     else
                     {
                         can_fwd_item_t fwd_item = {
@@ -471,6 +485,16 @@ static void can_rx_task(void *pvParameters)
                             can_fwd_count_drop("forward queue full");
                         }
                     }
+#else
+                    else if (can_send(fwd_bus, &fwd_msg, pdMS_TO_TICKS(2)) != ESP_OK)
+                    {
+                        // Single-bus: no forwarding task, so the modified
+                        // duplicate goes out from here. can_send() fails fast
+                        // (2 ms) rather than blocking the RX task on a stalled
+                        // bus.
+                        can_fwd_count_drop("send failed");
+                    }
+#endif
                 }
             }
 //        	num_msg++;
@@ -741,6 +765,7 @@ void app_main(void)
 	// 256-entry RX queue filled during boot in the can_re log (255 bus-0
 	// and 38 bus-1 frames dropped) because can_rx_task was created after
 	// the transports and Wi-Fi started.
+#if CAN_BUS_COUNT > 1
 	can_fwd_queue = xQueueCreate(CAN_FWD_QUEUE_LEN, sizeof(can_fwd_item_t));
 	if (can_fwd_queue != NULL)
 	{
@@ -750,6 +775,7 @@ void app_main(void)
 	{
 		ESP_LOGE(TAG, "can_fwd_queue create failed; forwarding disabled");
 	}
+#endif /* CAN_BUS_COUNT > 1 */
 
 	// Prio 7: the CAN datapath must preempt the TCP streaming tasks (prio 5)
 	// instead of timeslicing with them. Safe only because can_rx_task blocks
