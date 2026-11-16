@@ -1,6 +1,7 @@
 // host-test stub for main/can.h: the real one drags in hw_config.h and the
 // ESP-IDF driver headers. tests provide their own can_send (e.g. a recorder).
 #pragma once
+#include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
 #include "driver/twai.h"
@@ -39,3 +40,7 @@ void can_set_loopback(can_bus_t bus, uint8_t flag);
 void can_set_bitrate(can_bus_t bus, uint8_t rate);
 void can_set_filter(can_bus_t bus, uint32_t f);
 void can_set_mask(can_bus_t bus, uint32_t m);
+// MITM forwarding's bus lock: slcan.c asks before letting a host change bus 0
+// out from under the bridge.
+bool can_bridge_locked(void);
+uint8_t can_get_bitrate(can_bus_t bus);

@@ -64,6 +64,11 @@ void can_lock_bridge(void);
 // Sleep: takes every bus down and unlocks MITM forwarding. No bus comes back
 // up until the board wakes, which is a restart.
 void can_park(void);
+// An OTA upload: true holds every task-side send, and the stall scan, off the
+// TX slot spinlock while the flash writes park the other core; false gives TX
+// back. Reception keeps working either way. Any path that abandons an upload
+// must clear it.
+void can_quiet_tx(bool quiet);
 // So clients can tell a refused change from one that took
 bool can_bridge_locked(void);
 void can_set_silent(can_bus_t bus, uint8_t flag);

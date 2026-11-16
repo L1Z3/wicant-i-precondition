@@ -1165,7 +1165,6 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	cJSON_AddStringToObject(root, "can1_mode", device_config.can1_mode);
 	cJSON_AddStringToObject(root, "can1_en", device_config.can1_en);
 	cJSON_AddStringToObject(root, "can_fwd_mode", device_config.can_fwd_mode);
-	cJSON_AddStringToObject(root, "can_fwd_state", !config_server_get_fwd_en() ? "parallel" : "mitm");
 #endif
 	cJSON_AddStringToObject(root, "port_type", device_config.port_type);
 	cJSON_AddStringToObject(root, "port", device_config.port);
@@ -1471,13 +1470,13 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     	ble_disable();
     }
     /* MITM forwarding holds the buses: can_disable() refuses while the bridge
-     * is locked, and the recovery task brings a bus that did go down back
-     * within a second anyway, so asking here only pretends to quiet them. Bus
-     * 0 keeps receiving through the flash writes (CONFIG_TWAI_ISR_CACHE_SAFE)
-     * and bus 1's SPI driver just stalls them, so the upload does not need
-     * them off. If a quiet bus is wanted during the write, add a maintenance
-     * teardown in can.c (take the nodes down despite the lock, until the
-     * reboot that follows every upload that gets this far) and call it here. */
+     * is locked (can_lock_bridge), so they stay up for the upload and the
+     * forwarding task keeps calling can_send() throughout it. The flash writes
+     * below park the other core with its caches off, and a task spinning on
+     * the TX slot lock across that park trips the interrupt watchdog, so the
+     * write window quiesces TX instead (can_quiet_tx): bus 0 keeps receiving
+     * (CONFIG_TWAI_ISR_CACHE_SAFE), nothing transmits, and every path that
+     * abandons the upload turns TX back on. */
     /* Skip leading "/upload" from URI to get filename */
     /* Note sizeof() counts NULL termination hence the -1 */
     const char *filename = get_path_from_uri(filepath, ((struct file_server_data *)req->user_ctx)->base_path,
@@ -1541,9 +1540,13 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     assert(update_partition != NULL);
     ESP_LOGI(TAG, "Writing to partition subtype %d at offset 0x%lx",
              update_partition->subtype, update_partition->address);
+    /* esp_ota_begin()'s erase and every esp_ota_write() below park the other
+     * core, so TX stays off the slot lock for the whole window. */
+    can_quiet_tx(true);
     err = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &update_handle);
     if (err != ESP_OK)
     {
+        can_quiet_tx(false);
         ESP_LOGE(TAG, "esp_ota_begin failed (%s)", esp_err_to_name(err));
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "esp_ota_begin failed");
         return ESP_FAIL;
@@ -1568,6 +1571,7 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
 
 
             ESP_LOGE(TAG, "File reception failed!");
+            can_quiet_tx(false);
             /* Respond with 500 Internal Server Error */
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive file");
             return ESP_FAIL;
@@ -1602,6 +1606,7 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
         {
             ESP_LOGE(TAG, "File write failed!");
             esp_ota_abort(update_handle);
+            can_quiet_tx(false);
             /* Respond with 500 Internal Server Error */
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to write file to storage");
             return ESP_FAIL;
@@ -1624,6 +1629,7 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     {
         ESP_LOGE(TAG, "File reception failed!");
         esp_ota_abort(update_handle);
+        can_quiet_tx(false);
         /* Respond with 500 Internal Server Error */
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive file");
         return ESP_FAIL;
@@ -1636,6 +1642,7 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
         {
             ESP_LOGE(TAG, "Image validation failed, image is corrupted");
         }
+        can_quiet_tx(false);
         ESP_LOGE(TAG, "esp_ota_end failed (%s)!", esp_err_to_name(err));
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "esp_ota_end failed");
         return ESP_FAIL;
@@ -1691,6 +1698,7 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     err = esp_ota_set_boot_partition(update_partition);
     if (err != ESP_OK)
     {
+        can_quiet_tx(false);
         ESP_LOGE(TAG, "esp_ota_set_boot_partition failed (%s)!", esp_err_to_name(err));
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "esp_ota_set_boot_partition failed");
         return ESP_FAIL;
