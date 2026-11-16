@@ -3,3 +3,17 @@ CONFIG_ESPTOOLPY_NO_STUB=y
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="wican_partitions_table.csv"
+
+# The C3 has only ~17-37 KB of heap, so a 20 KB TCP send buffer lets one
+# httpd_resp_send() queue more than the board can hold.  Serving the 164 KB
+# config page with SND_BUF_DEFAULT=20480 dropped the heap 20,100 B in 150 ms to
+# 2,148 B, the WiFi driver could not allocate packet buffers, and the response
+# died with ESP_ERR_HTTPD_RESP_SEND after 5 s.  At 8 KB the same burst is
+# 16,224 B, so this is headroom rather than a complete fix - the single-bus
+# forward-queue guard and the 4 KB C3 log ring are the other half.
+#
+# Do not rebuild build.v300/sdkconfig from scratch without this: an existing
+# sdkconfig is never rewritten from the defaults files, which is how
+# build.v300/sdkconfig sat at 20480 from 2026-07-23 while the shared
+# sdkconfig.defaults asked for 49152.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=8192
