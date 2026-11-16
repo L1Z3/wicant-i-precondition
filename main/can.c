@@ -200,6 +200,14 @@ static int64_t lock_log_us[CAN_BUS_COUNT];
 static int64_t lock_retry_at_us[CAN_BUS_COUNT];
 static uint8_t lock_retry_backoff[CAN_BUS_COUNT];
 
+// Set for the length of a flash write (can_quiet_tx). Every esp_ota_write()
+// parks the other core with its caches and interrupts off, and a task that
+// spins on tx_slot_mux (the portENTER_CRITICAL in can_send_frame) across such
+// a park can stay there past the 300 ms interrupt watchdog, resetting the chip
+// in the middle of an upload. Receiving stays up (CONFIG_TWAI_ISR_CACHE_SAFE);
+// sending waits for the upload to end.
+static bool tx_quiet;
+
 static void can_disable_node(can_bus_t bus);
 
 // Driver callbacks run in ISR context for the on-chip controller and in a
@@ -356,6 +364,13 @@ static CAN_ISR_ATTR bool can_on_state_change(twai_node_handle_t handle, const tw
 // over its stall threshold (see CAN_TX_STALL_BACKOFF_MAX).
 static void can_check_tx_stalls(void)
 {
+	// Nothing can stall while TX is quiesced for an upload, and the scan's
+	// own spin on tx_slot_mux is what tx_quiet keeps off this window.
+	if (__atomic_load_n(&tx_quiet, __ATOMIC_RELAXED))
+	{
+		return;
+	}
+
 	int64_t now = esp_timer_get_time();
 
 	for (int bus = 0; bus < CAN_BUS_COUNT; bus++)
@@ -915,6 +930,25 @@ void can_park(void)
 	}
 }
 
+// Quiesces CAN TX for the length of a flash write (an OTA upload). The nodes
+// stay up, so reception keeps working, but can_send_frame() returns before it
+// takes tx_slot_mux and the stall scan stays out of it too: a task parked on
+// that spinlock while the flash operation has the other core stopped with its
+// caches off trips the interrupt watchdog (see tx_quiet). Every path that
+// abandons an upload must clear it; a completed upload reboots.
+void can_quiet_tx(bool quiet)
+{
+	__atomic_store_n(&tx_quiet, quiet, __ATOMIC_RELAXED);
+	if (quiet)
+	{
+		ESP_LOGI(TAG, "CAN TX quiesced for an upload");
+	}
+	else
+	{
+		ESP_LOGI(TAG, "CAN TX back on");
+	}
+}
+
 void can_lock_bridge(void)
 {
 	// Set first, so nothing reconfigures a bus between here and its enable
@@ -1177,6 +1211,13 @@ esp_err_t can_send(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_w
 static esp_err_t can_send_frame(can_bus_t bus, twai_message_t *message, TickType_t ticks_to_wait)
 {
 	if (bus >= CAN_BUS_COUNT || s_can_event_group == NULL)
+	{
+		return ESP_ERR_INVALID_STATE;
+	}
+
+	// An upload quiesces TX (see tx_quiet). Silent, unlike the "bus down"
+	// path below: forwarding would otherwise log a drop for every frame.
+	if (__atomic_load_n(&tx_quiet, __ATOMIC_RELAXED))
 	{
 		return ESP_ERR_INVALID_STATE;
 	}
