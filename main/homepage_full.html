@@ -575,7 +575,7 @@
                     <td>
                         <div style="display: flex; align-items: center; gap: 0.5rem;">
                             <div id="battery_temp_status">Waiting for CAN data</div>
-                            <select id="battery_temp_unit" name="battery_temp_unit" onchange="submit_enable();"
+                            <select id="battery_temp_unit" name="battery_temp_unit" onchange="updatePreconModeHelp(); submit_enable();"
                                 style="width: auto; padding: 0.25rem 0.5rem; font-size: 0.85rem;">
                                 <option value="c">°C</option>
                                 <option value="f">°F</option>
@@ -1493,16 +1493,24 @@
                 || carClasses.includes(`precon_button_car_${carModel}`);
         }
 
-        const PRECON_MODE_HELP = {
-            once: "Runs one session.",
-            continuous: "Keeps it running until you turn it off or the car turns off.",
-            persistent: "Keeps it running until you turn it off, even across drives.",
-        };
+        // Battery temperature the firmware holds during preconditioning, in
+        // Celsius: PRECONDITION_BATTERY_TEMPERATURE_CUTOFF_C in
+        // main/precondition.c.
+        const PRECON_TARGET_BATTERY_TEMP_C = 21;
 
-        // Show what the selected preconditioning mode does.
+        // Show what the selected preconditioning mode does. The maintained
+        // temperature follows the battery temperature unit setting.
         function updatePreconModeHelp() {
             const mode = document.getElementById("precon_mode").value;
-            document.getElementById("precon_mode_help").textContent = PRECON_MODE_HELP[mode] || "";
+            const targetTemp = formatBatteryTemperature(
+                PRECON_TARGET_BATTERY_TEMP_C,
+                document.getElementById("battery_temp_unit").value);
+            const help = {
+                once: "Runs one session.",
+                continuous: `Car maintains ${targetTemp} until you turn it off or the car turns off.`,
+                persistent: `Car maintains ${targetTemp} until you turn it off, even across drives.`,
+            };
+            document.getElementById("precon_mode_help").textContent = help[mode] || "";
         }
 
         // Client-side only: recompute which preconditioning button options
