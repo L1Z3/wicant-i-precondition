@@ -1,4 +1,4 @@
-# Custom board has 16MB flash. Bigger OTA slots + storage from V300.
+# Proto / EB-FD have 16MB flash. Bigger OTA slots + storage from V300.
 # Name,   Type, SubType,  Offset,   Size,  Flags
 nvs,      data, nvs,      0x9000,   0x4000,
 otadata,  data, ota,      0xd000,   0x2000,

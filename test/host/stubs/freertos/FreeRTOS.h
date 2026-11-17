@@ -11,4 +11,6 @@ typedef unsigned int UBaseType_t;
 #define pdPASS 1
 #define portMAX_DELAY UINT32_MAX
 #define pdMS_TO_TICKS(ms) ((TickType_t)(ms))
+// 1 tick == 1 ms, so slcan_get_time()'s pdTICKS_TO_MS() is the identity
+#define pdTICKS_TO_MS(t) ((uint32_t)(t))
 #define configASSERT(x) assert(x)

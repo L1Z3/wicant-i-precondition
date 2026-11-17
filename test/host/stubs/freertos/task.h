@@ -5,6 +5,13 @@
 #include <stdint.h>
 #include "freertos/FreeRTOS.h"
 
+// the fake clock in support/test_support.h also drives FreeRTOS ticks (1 ms
+// per tick), so parser timing code can be stepped from a test
+extern int64_t fake_now;
+static inline TickType_t xTaskGetTickCount(void) {
+    return (TickType_t)(fake_now / 1000);
+}
+
 typedef void *TaskHandle_t;
 typedef void (*TaskFunction_t)(void *);
 

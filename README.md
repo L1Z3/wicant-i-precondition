@@ -12,6 +12,19 @@ This is a fork of the [WiCAN firmware repository](https://github.com/meatpihq/wi
 4. Open project and build: `cd .. && ./build.sh v300`
 5. Flash: use http interface or if using USB: `idf.py flash`
 
+# Hardware notes
+
+## The harness OBD-II socket's pin numbers are mirrored compared to the WiCAN's pin numbers
+
+The harness's OBD-II socket, the one the WiCAN plugs into, is numbered as a mirror image of the WiCAN's own plug, which uses the standard (J1962) numbering. Each row counts from the opposite end: harness pin 1 mates with WiCAN pin 8, and harness pin 9 with WiCAN pin 16.
+
+| Signal | WiCAN plug | Harness socket |
+|---|---|---|
+| Bus 0 CAN-H (rest of M-CAN) | 6 | 3 |
+| Bus 0 CAN-L | 14 | 11 |
+| Bus 1 CAN-H (head unit) | 12 | 13 |
+| Bus 1 CAN-L | 13 | 12 |
+
 # WiCAN-OBD-C3 Information
 
 The WiCAN original shipped with the beta preconditioning kit is a powerful ESP32-C3-based CAN adapter for car hacking and general CAN-bus development. WiCAN connects to your existing Wi-Fi network and any device on that network, where it allows you to configure Wi-Fi and CAN settings through a built-in web interface. The WiCAN has a power-saving mode that detects when the voltage drops under 13 V or some other preset value. When this power-saving mode is engaged, WiCAN is capable of entering sleep mode, which drops current consumption below 1 mA.

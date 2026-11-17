@@ -113,6 +113,14 @@ static char can_datarate_str[11][7] = {
 								"1000K",
 };
 
+// Sleep is opt-in on every board, including the EB-FD and proto boards that
+// can sense the car's ignition. Defaulting those to car-off sleep reached any
+// board that falls back to these defaults (missing, unreadable or invalid
+// config.json): on the bench, a board fed below sleep_volt with nothing on the
+// car-on pin slept after sleep_time (2 min by default) and took Wi-Fi, BLE and
+// CAN forwarding with it, which reads as a brick. Car-off sleep is one
+// settings save away, and the status tab shows it.
+
 const char device_config_default[] = R"json({
 "wifi_mode":"AP",
 "ap_ch":"6",
@@ -1268,6 +1276,37 @@ static esp_err_t ws_handler(httpd_req_t *req)
     return ret;
 }
 
+/* Copies an image's board variant, the field after "wican-fw_" (CMakeLists.txt
+ * names images wican-fw_<variant>_<version>), into out. Images from before the
+ * proto variant was renamed say "custom". Returns false for any other name. */
+static bool app_variant(const esp_app_desc_t *app, char *out, size_t out_len)
+{
+    static const char prefix[] = "wican-fw_";
+    const size_t prefix_len = sizeof(prefix) - 1;
+    const char *name = app->project_name;
+    size_t name_len = strnlen(name, sizeof(app->project_name));
+
+    if (name_len <= prefix_len || strncmp(name, prefix, prefix_len) != 0)
+    {
+        return false;
+    }
+    const char *field = name + prefix_len;
+    const char *end = memchr(field, '_', name_len - prefix_len);
+    size_t len = end ? (size_t)(end - field) : name_len - prefix_len;
+
+    if (len == 0 || len >= out_len)
+    {
+        return false;
+    }
+    memcpy(out, field, len);
+    out[len] = '\0';
+    if (strcmp(out, "custom") == 0)
+    {
+        strlcpy(out, "proto", out_len);
+    }
+    return true;
+}
+
 /* Handler to upload a file onto the server */
 static esp_err_t upload_post_handler(httpd_req_t *req)
 {
@@ -1278,10 +1317,14 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     {
     	ble_disable();
     }
-    for(int bus = 0; bus < CAN_BUS_COUNT; bus++)
-    {
-        can_disable(bus);
-    }
+    /* MITM forwarding holds the buses: can_disable() refuses while the bridge
+     * is locked (can_lock_bridge), so they stay up for the upload and the
+     * forwarding task keeps calling can_send() throughout it. The flash writes
+     * below park the other core with its caches off, and a task spinning on
+     * the TX slot lock across that park trips the interrupt watchdog, so the
+     * write window quiesces TX instead (can_quiet_tx): bus 0 keeps receiving
+     * (CONFIG_TWAI_ISR_CACHE_SAFE), nothing transmits, and every path that
+     * abandons the upload turns TX back on. */
     /* Skip leading "/upload" from URI to get filename */
     /* Note sizeof() counts NULL termination hence the -1 */
     const char *filename = get_path_from_uri(filepath, ((struct file_server_data *)req->user_ctx)->base_path,
@@ -1345,9 +1388,13 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     assert(update_partition != NULL);
     ESP_LOGI(TAG, "Writing to partition subtype %d at offset 0x%lx",
              update_partition->subtype, update_partition->address);
+    /* esp_ota_begin()'s erase and every esp_ota_write() below park the other
+     * core, so TX stays off the slot lock for the whole window. */
+    can_quiet_tx(true);
     err = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &update_handle);
     if (err != ESP_OK)
     {
+        can_quiet_tx(false);
         ESP_LOGE(TAG, "esp_ota_begin failed (%s)", esp_err_to_name(err));
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "esp_ota_begin failed");
         return ESP_FAIL;
@@ -1372,6 +1419,7 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
 
 
             ESP_LOGE(TAG, "File reception failed!");
+            can_quiet_tx(false);
             /* Respond with 500 Internal Server Error */
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive file");
             return ESP_FAIL;
@@ -1406,6 +1454,7 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
         {
             ESP_LOGE(TAG, "File write failed!");
             esp_ota_abort(update_handle);
+            can_quiet_tx(false);
             /* Respond with 500 Internal Server Error */
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to write file to storage");
             return ESP_FAIL;
@@ -1428,6 +1477,7 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     {
         ESP_LOGE(TAG, "File reception failed!");
         esp_ota_abort(update_handle);
+        can_quiet_tx(false);
         /* Respond with 500 Internal Server Error */
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive file");
         return ESP_FAIL;
@@ -1440,14 +1490,63 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
         {
             ESP_LOGE(TAG, "Image validation failed, image is corrupted");
         }
+        can_quiet_tx(false);
         ESP_LOGE(TAG, "esp_ota_end failed (%s)!", esp_err_to_name(err));
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "esp_ota_end failed");
+        return ESP_FAIL;
+    }
+
+    /* An image built for another board variant (a proto image on an EB-FD,
+     * say) installs and boots, then drives CAN hardware that isn't there:
+     * refuse it. Fail closed when either side's project name does not carry a
+     * board variant, because then "not for this board" cannot be ruled out.
+     * A USB flash still installs anything. */
+    char running_variant[16];
+    bool running_known = app_variant(esp_app_get_description(), running_variant,
+                                     sizeof(running_variant));
+    esp_app_desc_t new_app;
+    char new_variant[16];
+    err = esp_ota_get_partition_description(update_partition, &new_app);
+    bool new_known = err == ESP_OK &&
+                     app_variant(&new_app, new_variant, sizeof(new_variant));
+    if (!running_known || !new_known || strcmp(new_variant, running_variant) != 0)
+    {
+        char msg[96];
+        if (!running_known)
+        {
+            ESP_LOGE(TAG, "Refusing firmware: this build has no board variant in its project name");
+            snprintf(msg, sizeof(msg), "This firmware cannot tell its own board variant; flash over USB");
+        }
+        else if (!new_known)
+        {
+            ESP_LOGE(TAG, "Refusing firmware %.32s: no board variant in its project name",
+                     err == ESP_OK ? new_app.project_name : "(unreadable)");
+            snprintf(msg, sizeof(msg), "Firmware has no board variant; not installing it");
+        }
+        else
+        {
+            ESP_LOGE(TAG, "Refusing firmware %.32s: not for this %s board",
+                     new_app.project_name, running_variant);
+            snprintf(msg, sizeof(msg), "Firmware is not for this board (this is %s)", running_variant);
+        }
+        /* Erase the whole image, not just its header: keep it from ever
+         * booting, then reboot into this one, still selected, which brings
+         * back the BLE turned off above. */
+        esp_err_t erase_err = esp_partition_erase_range(update_partition, 0,
+                                                        update_partition->size);
+        if (erase_err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Couldn't erase the refused firmware (%s)", esp_err_to_name(erase_err));
+        }
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
+        xTimerStart(xrestartTimer, 0);
         return ESP_FAIL;
     }
 
     err = esp_ota_set_boot_partition(update_partition);
     if (err != ESP_OK)
     {
+        can_quiet_tx(false);
         ESP_LOGE(TAG, "esp_ota_set_boot_partition failed (%s)!", esp_err_to_name(err));
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "esp_ota_set_boot_partition failed");
         return ESP_FAIL;
