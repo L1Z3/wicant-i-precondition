@@ -210,6 +210,25 @@ static bool is_utility_request(const twai_message_t *frame) {
 #define IS_BATTERY_SOC_FRAME(frame_id) \
     ((frame_id) == 0x2FCU || (frame_id) == 0x0BC2FA02U)
 
+// Battery conditioning mode is a latched vehicle setting. The car broadcasts
+// it on 0x25D D6 bit 7, so the check needs no probe: 0x80 = enabled,
+// 0x40 = disabled. The Ioniq 6 CCU hub re-addresses the frame to the 29-bit
+// 0x09425A03 (BMS_04_100ms_1..4 family, base 0x25A, index 3); same bytes.
+#define CONDITIONING_MODE_FRAME_ID 0x25DU
+#define CONDITIONING_MODE_FRAME_ID_IONIQ6 0x09425A03U
+#define CONDITIONING_MODE_INDEX 5U
+#define CONDITIONING_MODE_DATA_LENGTH 6U
+#define CONDITIONING_MODE_ENABLED_MASK 0x80U
+
+// Enabling the mode is a 0x0C7 command pair, the same shape and cadence as the
+// preconditioning start burst.
+#define CONDITIONING_MODE_PHASE1_TICKS 3U // F007 message
+#define CONDITIONING_MODE_PHASE2_TICKS 3U // E007 message
+#define CONDITIONING_MODE_TICKS (CONDITIONING_MODE_PHASE1_TICKS + CONDITIONING_MODE_PHASE2_TICKS)
+
+#define IS_CONDITIONING_MODE_FRAME(frame_id) \
+    ((frame_id) == CONDITIONING_MODE_FRAME_ID || (frame_id) == CONDITIONING_MODE_FRAME_ID_IONIQ6)
+
 #define CAR_BUS CAN_BUS_0
 #if CAN_BUS_COUNT > 1
 #define HEAD_UNIT_BUS CAN_BUS_1
@@ -297,6 +316,13 @@ typedef enum {
     READY_STATUS_READY,
 } ready_status_t;
 
+// Battery conditioning mode as most recently reported by the car on 0x25D.
+typedef enum {
+    CONDITIONING_MODE_UNKNOWN = 0, // no 0x25D seen yet
+    CONDITIONING_MODE_DISABLED,
+    CONDITIONING_MODE_ENABLED,
+} conditioning_mode_t;
+
 // why the current start attempt was launched. MANUAL must be zero: it is the
 // entry argument plain sm_transition supplies
 typedef enum {
@@ -314,6 +340,7 @@ typedef enum {
     STOP_REASON_UNEXPECTED_IDLE,
     STOP_REASON_TEMPERATURE_REACHED,
     STOP_REASON_LOW_SOC,
+    STOP_REASON_CONDITIONING_MODE_OFF,
     STOP_REASON_START_BLOCKED,
     STOP_REASON_RETRIES_EXHAUSTED,
     STOP_REASON_UTILITY_MODE,
@@ -324,10 +351,23 @@ typedef uint8_t precondition_blockers_t;
 enum {
     PRECONDITION_BLOCK_NONE = 0U,
     // Higher bits have higher display and stop-reason priority.
-    PRECONDITION_BLOCK_BATTERY_WARM = 1U << 0,
-    PRECONDITION_BLOCK_BATTERY_LOW_SOC = 1U << 1,
-    PRECONDITION_BLOCK_UTILITY_MODE = 1U << 2,
+    // The car's conditioning mode being off only ranks above nothing: the
+    // firmware turns it back on itself (see PRECONDITION_BLOCK_ABORTS), so a
+    // car-imposed condition is the more useful thing to report.
+    PRECONDITION_BLOCK_CONDITIONING_MODE_OFF = 1U << 0,
+    PRECONDITION_BLOCK_BATTERY_WARM = 1U << 1,
+    PRECONDITION_BLOCK_BATTERY_LOW_SOC = 1U << 2,
+    PRECONDITION_BLOCK_UTILITY_MODE = 1U << 3,
 };
+
+// Blockers that stop a start attempt outright. Conditioning mode off is absent
+// on purpose: the start burst turns the mode back on before its first start
+// frame, so aborting on it would make that fix unreachable and leave the mode
+// off for good. It is still ranked and reported, which is what names the failure
+// when the mode never comes back.
+#define PRECONDITION_BLOCK_ABORTS \
+    (PRECONDITION_BLOCK_BATTERY_WARM | PRECONDITION_BLOCK_BATTERY_LOW_SOC \
+     | PRECONDITION_BLOCK_UTILITY_MODE)
 
 // owned by IDLE
 static struct {
@@ -346,6 +386,10 @@ static struct {
     int64_t last_attempt_ts;
     // number of times we've re-sent the start burst within the current request
     uint8_t retries;
+    // does this attempt have to turn battery conditioning mode on before the
+    // start command? latched on entry to START_BURST so the car's own reply to
+    // the enable burst cannot cut that burst short
+    bool conditioning_mode_first;
 } requested;
 
 // owned by MANAGED: scheduling for periodic start bursts while a repeating
@@ -375,6 +419,8 @@ static struct {
     // other shared data is ready to read.
     _Atomic ready_status_t ready_status;
     bool car_in_utility;
+    // most recent battery conditioning mode reported by the car
+    conditioning_mode_t conditioning_mode;
 } platform;
 
 static bool precon_status_available(void) {
@@ -384,6 +430,14 @@ static bool precon_status_available(void) {
 static bool ready_status_available(void) {
     return atomic_load_explicit(&platform.ready_status, memory_order_relaxed)
            != READY_STATUS_UNKNOWN;
+}
+
+// Does a start attempt have to turn battery conditioning mode on first? Only a
+// confirmed "enabled" reading skips the enable burst: with no 0x25D yet (or a
+// platform that never broadcasts one) it is sent anyway, since the command is
+// idempotent and preconditioning depends on the mode being on.
+static bool conditioning_mode_enable_needed(void) {
+    return platform.conditioning_mode != CONDITIONING_MODE_ENABLED;
 }
 
 // activation button edge tracking, owned by the global hooks
@@ -624,6 +678,8 @@ static stop_reason_t once_stop_reason(void) {
             return STOP_REASON_TEMPERATURE_REACHED;
         case PRECONDITION_BLOCK_UTILITY_MODE:
             return STOP_REASON_UTILITY_MODE;
+        case PRECONDITION_BLOCK_CONDITIONING_MODE_OFF:
+            return STOP_REASON_CONDITIONING_MODE_OFF;
         default:
             return STOP_REASON_UNEXPECTED_IDLE;
     }
@@ -670,8 +726,19 @@ static void show_stopping_notice(stop_reason_t reason) {
         case STOP_REASON_START_BLOCKED:
             show_once_blocker_notice(primary_precon_blocker());
             break;
+        case STOP_REASON_CONDITIONING_MODE_OFF:
+            // The session ended and the car reports the mode off: the start
+            // burst's enable phase did not stick.
+            track_popup_show_warning("Once: stopping (cond. mode off)");
+            break;
         case STOP_REASON_RETRIES_EXHAUSTED:
-            track_popup_show_error("Once: start failed (out of retries)");
+            // A mode that never came back is the likelier cause than the retry
+            // budget, so name it instead of blaming the retries.
+            if ((precon_blockers & PRECONDITION_BLOCK_CONDITIONING_MODE_OFF) != 0U) {
+                track_popup_show_error("Once: start failed (cond. mode off)");
+            } else {
+                track_popup_show_error("Once: start failed (out of retries)");
+            }
             break;
         case STOP_REASON_UTILITY_MODE:
             track_popup_show_info("Once: utility mode stopped precon.");
@@ -680,6 +747,22 @@ static void show_stopping_notice(stop_reason_t reason) {
 }
 
 // ********************* CAN tx helpers *********************
+
+// burst_tick counts up from 0 within the burst
+static void send_conditioning_mode_enable_msg(uint32_t burst_tick) {
+    twai_message_t packet = {0};
+    packet.identifier = 0x0C7U;
+    packet.data_length_code = 8U;
+    if (burst_tick < CONDITIONING_MODE_PHASE1_TICKS) {
+        // send 000000F007000000 to 0x0C7
+        packet.data[3] = 0xF0U;
+    } else {
+        // send 000000E007000000 to 0x0C7
+        packet.data[3] = 0xE0U;
+    }
+    packet.data[4] = 0x07U;
+    can_send(CAR_BUS, &packet, 1);
+}
 
 // burst_tick counts up from 0 within the burst
 static void send_precondition_start_msg(uint32_t burst_tick) {
@@ -934,10 +1017,12 @@ static void car_start_delay_tick(sm_t *sm) {
 
 // ********************* REQUESTED / START_BURST *********************
 
-// Abort an in-progress start attempt when precon is known to be blocked.
+// Abort an in-progress start attempt when precon is known to be blocked. The
+// conditioning-mode blocker is deliberately not one of these: the start burst
+// turns the mode back on, so aborting would make that unreachable.
 static bool abort_start_if_blocked(sm_t *sm) {
     precondition_blockers_t blocker = primary_precon_blocker();
-    if (blocker == PRECONDITION_BLOCK_NONE) {
+    if ((blocker & PRECONDITION_BLOCK_ABORTS) == PRECONDITION_BLOCK_NONE) {
         return false;
     }
 
@@ -968,6 +1053,10 @@ static bool abort_start_if_blocked(sm_t *sm) {
 // retry timers and the countdown display measure from the moment the burst began
 static void start_burst_enter(sm_t *sm) {
     requested.last_attempt_ts = sm_now(sm);
+    // Latch the conditioning-mode check for the whole burst: the car's reply to
+    // our own enable command flips 0x25D within one frame period, and that must
+    // not truncate the burst still in flight.
+    requested.conditioning_mode_first = conditioning_mode_enable_needed();
     abort_start_if_blocked(sm);
 }
 
@@ -976,6 +1065,16 @@ static void start_burst_tick(sm_t *sm) {
         return;
     }
     uint32_t t = sm_ticks_in_state(sm);
+    // turn the car's battery conditioning mode on before asking it to start
+    // preconditioning; the enable burst keeps the check's pace, one frame per
+    // tick
+    if (requested.conditioning_mode_first) {
+        if (t < CONDITIONING_MODE_TICKS) {
+            send_conditioning_mode_enable_msg(t);
+            return;
+        }
+        t -= CONDITIONING_MODE_TICKS;
+    }
     send_precondition_start_msg(t);
     // Status events deliberately do not cut the burst short. After all start
     // messages are sent, route using the car's latest reported status.
@@ -1101,7 +1200,9 @@ static void managed_enter(sm_t *sm) {
 
 static void managed_tick(sm_t *sm) {
     if (car_in_ready() && managed.nudge_at_us != 0
-            && precon_blockers == PRECONDITION_BLOCK_NONE
+            // only car-imposed blockers hold nudges back: a nudge is how the
+            // mode-off blocker gets retried
+            && (precon_blockers & PRECONDITION_BLOCK_ABORTS) == PRECONDITION_BLOCK_NONE
             && sm_now(sm) >= managed.nudge_at_us) {
         // targets the parent, so REQUESTED exits and re-enters: fresh attempt
         // ctx, kind set from the entry argument, descend into START_BURST
@@ -1468,6 +1569,24 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
         if (became_low) {
             sm_send_event(sm, EV_SOC_BECAME_LOW);
         }
+    }
+
+    // 0x25D D6 bit 7: the car's latched battery conditioning mode. The frame is
+    // broadcast, so the check needs no probe; only the car's own copy is
+    // trusted.
+    if (IS_CONDITIONING_MODE_FRAME(to_push->identifier)
+            && rx_bus == CAR_BUS
+            && to_push->data_length_code >= CONDITIONING_MODE_DATA_LENGTH) {
+        platform.conditioning_mode =
+            (to_push->data[CONDITIONING_MODE_INDEX] & CONDITIONING_MODE_ENABLED_MASK) != 0U
+            ? CONDITIONING_MODE_ENABLED : CONDITIONING_MODE_DISABLED;
+        // Recognized but never pre-empted: a start attempt enables the mode
+        // itself (PRECONDITION_BLOCK_ABORTS), so this only surfaces when the
+        // mode stays off anyway.
+        (void)update_precon_blocker(
+            PRECONDITION_BLOCK_CONDITIONING_MODE_OFF,
+            platform.conditioning_mode == CONDITIONING_MODE_DISABLED
+        );
     }
 
     int8_t precon_button_type = precon_config.button_type;
