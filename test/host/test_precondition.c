@@ -1001,7 +1001,7 @@ static void run_conditioning_mode_blocker(void) {
     }
     advance_until_state("stop-burst", 11000000);
     CHECK(stopping.reason == STOP_REASON_RETRIES_EXHAUSTED);
-    CHECK(strcmp(popup_text, "‼ Once: start failed (conditioning mode off)") == 0);
+    CHECK(strcmp(popup_text, "‼ Once: start failed (cond. mode off)") == 0);
     for (int i = 0; i < (int)PRECONDITION_STOP_TICKS; i++) tick1();
     expect_state("wait-stopped");
     car_status(0x01, CAN_BUS_0);
@@ -1020,7 +1020,7 @@ static void run_conditioning_mode_blocker(void) {
     expect_state("stop-burst");
     CHECK(stopping.reason == STOP_REASON_CONDITIONING_MODE_OFF);
     CHECK(popup_show_count == popups_before + 1);
-    CHECK(strcmp(popup_text, "⚠ Once: stopping (conditioning mode off)") == 0);
+    CHECK(strcmp(popup_text, "⚠ Once: stopping (cond. mode off)") == 0);
 }
 
 // In a repeating mode the mode-off blocker must not hold back the periodic
