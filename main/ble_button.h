@@ -14,7 +14,7 @@
  * Association is by service UUID, not by a hard-coded MAC, so another device
  * with the same chip/firmware works without reflashing.  The last associated
  * address is stored in NVS and preferred on the next boot; if it is absent the
- * listener falls back to any 0xFFE3 device and re-binds it.
+ * listener falls back to any 0xFFE0/0xFFE3 device and re-binds it.
  */
 bool ble_button_init(void);
 
@@ -22,7 +22,7 @@ void ble_button_set_paused(bool paused);
 bool ble_button_paused(void);
 
 /* Start a fresh association: forget the stored address and bind the next
- * 0xFFE3 device seen. */
+ * 0xFFE0/0xFFE3 device seen. */
 void ble_button_learn(void);
 
 /* Forget the stored address and disconnect. */
