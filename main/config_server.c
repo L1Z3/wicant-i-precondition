@@ -79,6 +79,7 @@
 #include "precondition.h"
 #include "track_popup.h"
 #include "ble_scan.h"
+#include "ble_button.h"
 #include "esp_timer.h"
 
 #define WIFI_CONNECTED_BIT			BIT0
@@ -1008,6 +1009,55 @@ static esp_err_t ble_scan_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    free(json);
+    return ESP_OK;
+}
+
+static esp_err_t ble_button_handler(httpd_req_t *req)
+{
+    char qbuf[128] = {0};
+    char action[16] = "status";
+
+    if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) == ESP_OK)
+    {
+        if (httpd_query_key_value(qbuf, "action", action, sizeof(action)) != ESP_OK)
+        {
+            snprintf(action, sizeof(action), "status");
+        }
+    }
+
+    if (strcmp(action, "learn") == 0)
+    {
+        ble_button_learn();
+    }
+    else if (strcmp(action, "forget") == 0)
+    {
+        ble_button_forget();
+    }
+    else if (strcmp(action, "pause") == 0)
+    {
+        ble_button_set_paused(true);
+    }
+    else if (strcmp(action, "resume") == 0)
+    {
+        ble_button_set_paused(false);
+    }
+    else if (strcmp(action, "status") != 0)
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "action must be status, learn, forget, pause or resume");
+        return ESP_FAIL;
+    }
+
+    char *json = ble_button_status_json();
+    if (json == NULL)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "BLE button status unavailable");
+        return ESP_FAIL;
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
     free(json);
@@ -2172,6 +2222,12 @@ static const httpd_uri_t ble_scan_uri = {
     .handler   = ble_scan_handler,
     .user_ctx  = NULL
 };
+static const httpd_uri_t ble_button_uri = {
+    .uri       = "/ble_button",
+    .method    = HTTP_GET,
+    .handler   = ble_button_handler,
+    .user_ctx  = NULL
+};
 static const httpd_uri_t track_popup = {
     .uri       = "/track_popup",
     .method    = HTTP_POST,
@@ -3012,6 +3068,7 @@ static httpd_handle_t config_server_init(void)
 		httpd_register_uri_handler(server, &system_reboot);
 		httpd_register_uri_handler(server, &precondition_toggle);
 		httpd_register_uri_handler(server, &ble_scan_uri);
+		httpd_register_uri_handler(server, &ble_button_uri);
 		httpd_register_uri_handler(server, &track_popup);
 		httpd_register_uri_handler(server, &store_canflt_uri);
 		httpd_register_uri_handler(server, &load_canflt_uri);
@@ -3055,6 +3112,7 @@ void config_server_restart(void)
 		httpd_register_uri_handler(server, &system_reboot);
 		httpd_register_uri_handler(server, &precondition_toggle);
 		httpd_register_uri_handler(server, &ble_scan_uri);
+		httpd_register_uri_handler(server, &ble_button_uri);
 		httpd_register_uri_handler(server, &track_popup);
 		httpd_register_uri_handler(server, &store_canflt_uri);
 		httpd_register_uri_handler(server, &load_canflt_uri);

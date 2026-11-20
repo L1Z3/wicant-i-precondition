@@ -42,13 +42,25 @@ typedef struct {
 static scan_dev_t s_devs[MAX_DEVICES];
 static uint8_t s_dev_count;
 static SemaphoreHandle_t s_lock;
+static SemaphoreHandle_t s_scan_lock;
 static bool s_stack_ready;
+static bool s_scan_active;
+static ble_scan_report_cb_t s_obs;
+static void *s_obs_ctx;
 
 static void ensure_lock(void)
 {
     if (s_lock == NULL) {
         s_lock = xSemaphoreCreateMutex();
     }
+}
+
+static bool ensure_scan_lock(void)
+{
+    if (s_scan_lock == NULL) {
+        s_scan_lock = xSemaphoreCreateMutex();
+    }
+    return s_scan_lock != NULL;
 }
 
 static void addr_to_str(const uint8_t bda[6], char out[18])
@@ -245,6 +257,22 @@ static void add_report(const struct ble_scan_result_evt_param *r)
         d.uuid[sizeof(d.uuid) - 1] = '\0';
     }
 
+    if (s_obs != NULL) {
+        ble_scan_report_t rep = {
+            .bda = {0},
+            .addr_type = d.addr_type,
+            .rssi = d.rssi,
+            .adv = d.adv,
+            .adv_len = d.adv_len,
+            .rsp = d.rsp,
+            .rsp_len = d.rsp_len,
+            .name = d.name,
+            .uuid = d.uuid,
+        };
+        memcpy(rep.bda, d.bda, sizeof(rep.bda));
+        s_obs(&rep, s_obs_ctx);
+    }
+
     ensure_lock();
     xSemaphoreTake(s_lock, portMAX_DELAY);
     for (uint8_t i = 0; i < s_dev_count; i++) {
@@ -378,6 +406,52 @@ bool ble_scan_stack_ready(void)
     return s_stack_ready;
 }
 
+bool ble_scan_ensure_stack(void)
+{
+    return stack_ensure();
+}
+
+bool ble_scan_start(uint32_t seconds, ble_scan_report_cb_t cb, void *ctx)
+{
+    if (!ensure_scan_lock()) {
+        return false;
+    }
+    if (xSemaphoreTake(s_scan_lock, 0) != pdTRUE) {
+        return false;
+    }
+    if (!stack_ensure()) {
+        xSemaphoreGive(s_scan_lock);
+        return false;
+    }
+    if (seconds == 0) {
+        seconds = 1;
+    }
+    s_obs = cb;
+    s_obs_ctx = ctx;
+    esp_err_t ret = esp_ble_gap_start_scanning(seconds);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "start async scan failed: %s", esp_err_to_name(ret));
+        s_obs = NULL;
+        s_obs_ctx = NULL;
+        xSemaphoreGive(s_scan_lock);
+        return false;
+    }
+    s_scan_active = true;
+    return true;
+}
+
+void ble_scan_stop(void)
+{
+    if (s_scan_lock == NULL || !s_scan_active) {
+        return;
+    }
+    esp_ble_gap_stop_scanning();
+    s_obs = NULL;
+    s_obs_ctx = NULL;
+    s_scan_active = false;
+    xSemaphoreGive(s_scan_lock);
+}
+
 static bool collect(uint32_t ms)
 {
     if (!stack_ensure()) {
@@ -408,9 +482,18 @@ char *ble_scan_json(uint32_t ms, const char *name, const char *uuid)
     if (ms < 1000) {
         ms = 1000;
     }
-    if (!collect(ms)) {
+    if (!ensure_scan_lock()) {
         return NULL;
     }
+    if (xSemaphoreTake(s_scan_lock, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "scan busy (button listener is scanning)");
+        return NULL;
+    }
+    if (!collect(ms)) {
+        xSemaphoreGive(s_scan_lock);
+        return NULL;
+    }
+    xSemaphoreGive(s_scan_lock);
 
     cJSON *root = cJSON_CreateObject();
     if (root == NULL) {
