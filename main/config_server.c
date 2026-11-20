@@ -77,6 +77,7 @@
 #include "ha_webhooks.h"
 #include "precondition.h"
 #include "track_popup.h"
+#include "ble_scan.h"
 #include "esp_timer.h"
 
 #define WIFI_CONNECTED_BIT			BIT0
@@ -939,6 +940,48 @@ static esp_err_t precondition_toggle_handler(httpd_req_t *req)
 	precondition_toggle_request();
 	const char *resp_str = "Preconditioning toggled";
     httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t ble_scan_handler(httpd_req_t *req)
+{
+    char qbuf[512] = {0};
+    char val[128] = {0};
+    char name[128] = {0};
+    char uuid[128] = {0};
+    uint32_t ms = 15000;
+
+    if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) == ESP_OK)
+    {
+        if (httpd_query_key_value(qbuf, "ms", val, sizeof(val)) == ESP_OK)
+        {
+            long v = atol(val);
+            if (v > 0 && v <= 300000)
+            {
+                ms = (uint32_t)v;
+            }
+        }
+        if (httpd_query_key_value(qbuf, "name", name, sizeof(name)) != ESP_OK)
+        {
+            name[0] = '\0';
+        }
+        if (httpd_query_key_value(qbuf, "uuid", uuid, sizeof(uuid)) != ESP_OK)
+        {
+            uuid[0] = '\0';
+        }
+    }
+
+    char *json = ble_scan_json(ms, name[0] ? name : NULL, uuid[0] ? uuid : NULL);
+    if (json == NULL)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "BLE scan failed (is ble_status=enable?)");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    free(json);
     return ESP_OK;
 }
 
@@ -2094,6 +2137,12 @@ static const httpd_uri_t precondition_toggle = {
     .handler   = precondition_toggle_handler,
     .user_ctx  = NULL
 };
+static const httpd_uri_t ble_scan_uri = {
+    .uri       = "/ble_scan",
+    .method    = HTTP_GET,
+    .handler   = ble_scan_handler,
+    .user_ctx  = NULL
+};
 static const httpd_uri_t track_popup = {
     .uri       = "/track_popup",
     .method    = HTTP_POST,
@@ -2933,6 +2982,7 @@ static httpd_handle_t config_server_init(void)
         httpd_register_uri_handler(server, &file_upload);
 		httpd_register_uri_handler(server, &system_reboot);
 		httpd_register_uri_handler(server, &precondition_toggle);
+		httpd_register_uri_handler(server, &ble_scan_uri);
 		httpd_register_uri_handler(server, &track_popup);
 		httpd_register_uri_handler(server, &store_canflt_uri);
 		httpd_register_uri_handler(server, &load_canflt_uri);
@@ -2975,6 +3025,7 @@ void config_server_restart(void)
         httpd_register_uri_handler(server, &file_upload);
 		httpd_register_uri_handler(server, &system_reboot);
 		httpd_register_uri_handler(server, &precondition_toggle);
+		httpd_register_uri_handler(server, &ble_scan_uri);
 		httpd_register_uri_handler(server, &track_popup);
 		httpd_register_uri_handler(server, &store_canflt_uri);
 		httpd_register_uri_handler(server, &load_canflt_uri);
