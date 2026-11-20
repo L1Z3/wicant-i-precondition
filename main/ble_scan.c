@@ -22,7 +22,7 @@
 #define TAG "BLE_SCAN"
 #define MAX_DEVICES 64
 #define AD_MAX 31
-#define UUID_MAX 96
+#define UUID_MAX 160
 
 typedef struct {
     uint8_t bda[6];
@@ -84,9 +84,31 @@ static void append_uuid(char *dst, const char *s)
     dst[used + add] = '\0';
 }
 
-/* Parse the AD structures: name (0x08/0x09), 16-bit service UUIDs (0x02/0x03).
- * 128-bit UUID lists (0x07) are deliberately skipped; the button case is
- * identified by name and/or the short service UUIDs. */
+/* Canonical 128-bit Bluetooth UUID strings. 16- and 32-bit service UUIDs are
+ * expanded with the Bluetooth base UUID so they match what nRF Connect shows. */
+static void uuid16_to_str(uint16_t u, char *out, size_t cap)
+{
+    snprintf(out, cap, "0000%04x-0000-1000-8000-00805f9b34fb", u);
+}
+
+static void uuid32_to_str(uint32_t u, char *out, size_t cap)
+{
+    snprintf(out, cap, "%08x-0000-1000-8000-00805f9b34fb", (unsigned)u);
+}
+
+static void uuid128_to_str(const uint8_t v[16], char *out, size_t cap)
+{
+    /* Advertising data stores the 128-bit UUID least-significant byte first. */
+    snprintf(out, cap, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             v[15], v[14], v[13], v[12],
+             v[11], v[10],
+             v[9], v[8],
+             v[7], v[6],
+             v[5], v[4], v[3], v[2], v[1], v[0]);
+}
+
+/* Parse the AD structures: name (0x08/0x09), 16-bit UUIDs (0x02/0x03),
+ * 32-bit UUIDs (0x04/0x05), 128-bit UUIDs (0x06/0x07). */
 static void parse_ad(const uint8_t *data, uint8_t len, char *name, char *uuid)
 {
     uint8_t i = 0;
@@ -111,13 +133,39 @@ static void parse_ad(const uint8_t *data, uint8_t len, char *name, char *uuid)
         } else if (type == 0x03 || type == 0x02) {
             for (uint8_t j = 0; j + 1 < l; j += 2) {
                 uint16_t u = (uint16_t)v[j] | ((uint16_t)v[j + 1] << 8);
-                char tmp[8];
-                snprintf(tmp, sizeof(tmp), "%04x", u);
+                char tmp[40];
+                uuid16_to_str(u, tmp, sizeof(tmp));
+                append_uuid(uuid, tmp);
+            }
+        } else if (type == 0x05 || type == 0x04) {
+            for (uint8_t j = 0; j + 3 < l; j += 4) {
+                uint32_t u = (uint32_t)v[j] | ((uint32_t)v[j + 1] << 8)
+                             | ((uint32_t)v[j + 2] << 16) | ((uint32_t)v[j + 3] << 24);
+                char tmp[40];
+                uuid32_to_str(u, tmp, sizeof(tmp));
+                append_uuid(uuid, tmp);
+            }
+        } else if (type == 0x07 || type == 0x06) {
+            for (uint8_t j = 0; j + 15 < l; j += 16) {
+                char tmp[40];
+                uuid128_to_str(v + j, tmp, sizeof(tmp));
                 append_uuid(uuid, tmp);
             }
         }
         i += 2 + l;
     }
+}
+
+static void normalize_uuid(const char *src, char *out, size_t cap)
+{
+    size_t j = 0;
+    for (size_t i = 0; src[i] != '\0' && j < cap - 1; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (isxdigit(c)) {
+            out[j++] = (char)tolower(c);
+        }
+    }
+    out[j] = '\0';
 }
 
 static bool name_equal(const char *a, const char *b)
@@ -133,16 +181,11 @@ static bool uuid_contains(const char *haystack, const char *needle)
     if (haystack == NULL || needle == NULL || needle[0] == '\0') {
         return false;
     }
-    char low[UUID_MAX];
-    size_t n = strlen(needle);
-    if (n >= UUID_MAX) {
-        n = UUID_MAX - 1;
-    }
-    for (size_t i = 0; i < n; i++) {
-        low[i] = (char)tolower((unsigned char)needle[i]);
-    }
-    low[n] = '\0';
-    return strstr(haystack, low) != NULL;
+    char h[UUID_MAX];
+    char n[UUID_MAX];
+    normalize_uuid(haystack, h, sizeof(h));
+    normalize_uuid(needle, n, sizeof(n));
+    return n[0] != '\0' && strstr(h, n) != NULL;
 }
 
 static void add_report(const struct ble_scan_result_evt_param *r)
