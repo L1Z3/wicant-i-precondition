@@ -33,7 +33,11 @@
 #define NOTIFY_SETTLE_US (2000 * 1000)
 #define CONNECT_TIMEOUT_US (15 * 1000 * 1000)
 #define PRESS_GAP_US (3000 * 1000)
-#define PRESS_QUIET_US (2000 * 1000)
+/* A long press makes the tag advertise continuously (about every 3.6 s on the
+ * iTAG), so a quiet window shorter than the advertising interval would count
+ * one press as many.  Six seconds keeps a whole burst to a single toggle while
+ * still allowing a deliberate second press. */
+#define PRESS_QUIET_US (6000 * 1000)
 #define NVS_NAMESPACE "ble_btn"
 #define NVS_KEY_BDA "bda"
 
@@ -77,6 +81,7 @@ static uint8_t s_notify_count;
 static int64_t s_subscribed_us;
 static int64_t s_last_notify_us;
 static int64_t s_last_press_us;
+static int64_t s_last_trigger_us;
 static int64_t s_last_seen_us;
 static uint32_t s_press_count;
 static uint8_t s_last_value[20];
@@ -217,6 +222,7 @@ static void scan_cb(const ble_scan_report_t *r, void *ctx)
         return;
     }
     s_last_press_us = now;
+    s_last_trigger_us = now;
     s_press_count++;
     ESP_LOGI(TAG, "press advertisement from %s (rssi %d, count %u)",
              astr, r->rssi, (unsigned)s_press_count);
@@ -550,6 +556,7 @@ void ble_button_learn(void)
     s_scan_round = 0;
     s_paused = false;
     s_last_press_us = 0;
+    s_last_trigger_us = 0;
     s_last_seen_us = 0;
     s_press_count = 0;
     s_found_flag = false;
@@ -587,9 +594,14 @@ char *ble_button_status_json(void)
     cJSON_AddStringToObject(root, "service_uuid", "0000ffe0-0000-1000-8000-00805f9b34fb");
     cJSON_AddStringToObject(root, "service_uuid_alt", "0000ffe3-0000-1000-8000-00805f9b34fb");
     cJSON_AddStringToObject(root, "bound_addr", bound);
+    cJSON_AddBoolToObject(root, "paired", s_have_bound);
     cJSON_AddNumberToObject(root, "notify_chars", s_notify_count);
     cJSON_AddStringToObject(root, "trigger", "advertisement");
     cJSON_AddNumberToObject(root, "press_count", s_press_count);
+    if (s_last_trigger_us != 0) {
+        cJSON_AddNumberToObject(root, "last_press_age_ms",
+                                (double)(esp_timer_get_time() - s_last_trigger_us) / 1000.0);
+    }
     if (s_last_seen_us != 0) {
         cJSON_AddNumberToObject(root, "last_seen_age_ms",
                                 (double)(esp_timer_get_time() - s_last_seen_us) / 1000.0);
