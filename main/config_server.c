@@ -49,6 +49,7 @@
 #include "dev_status.h"
 #include<stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 
 #include <esp_wifi.h>
 #include <esp_event.h>
@@ -943,6 +944,32 @@ static esp_err_t precondition_toggle_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* httpd_query_key_value() returns the raw query value; decode %XX and '+' so
+ * names with spaces (common on BLE buttons) match what the phone shows. */
+static void ble_scan_url_decode(char *s)
+{
+    char *dst = s;
+    for (char *src = s; *src != '\0'; src++)
+    {
+        if (src[0] == '%' && src[1] != '\0' && src[2] != '\0'
+            && isxdigit((unsigned char)src[1]) && isxdigit((unsigned char)src[2]))
+        {
+            char hex[3] = {src[1], src[2], '\0'};
+            *dst++ = (char)strtol(hex, NULL, 16);
+            src += 2;
+        }
+        else if (src[0] == '+')
+        {
+            *dst++ = ' ';
+        }
+        else
+        {
+            *dst++ = *src;
+        }
+    }
+    *dst = '\0';
+}
+
 static esp_err_t ble_scan_handler(httpd_req_t *req)
 {
     char qbuf[512] = {0};
@@ -969,6 +996,8 @@ static esp_err_t ble_scan_handler(httpd_req_t *req)
         {
             uuid[0] = '\0';
         }
+        ble_scan_url_decode(name);
+        ble_scan_url_decode(uuid);
     }
 
     char *json = ble_scan_json(ms, name[0] ? name : NULL, uuid[0] ? uuid : NULL);

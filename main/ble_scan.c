@@ -113,14 +113,18 @@ static void parse_ad(const uint8_t *data, uint8_t len, char *name, char *uuid)
 {
     uint8_t i = 0;
     while (i + 1 < len) {
-        uint8_t type = data[i];
-        uint8_t l = data[i + 1];
-        if ((size_t)i + 2 + l > len) {
+        uint8_t l = data[i];       /* AD length, includes the type byte */
+        if (l == 0) {
             break;
         }
+        if ((size_t)i + 1 + l > len) {
+            break;
+        }
+        uint8_t type = data[i + 1];
         const uint8_t *v = data + i + 2;
+        uint8_t vlen = (uint8_t)(l - 1);
         if (type == 0x09 || type == 0x08) {
-            uint8_t n = (l < 31) ? l : 31;
+            uint8_t n = (vlen < 31) ? vlen : 31;
             memcpy(name, v, n);
             name[n] = '\0';
             for (uint8_t k = n; k > 0; k--) {
@@ -131,14 +135,14 @@ static void parse_ad(const uint8_t *data, uint8_t len, char *name, char *uuid)
                 }
             }
         } else if (type == 0x03 || type == 0x02) {
-            for (uint8_t j = 0; j + 1 < l; j += 2) {
+            for (uint8_t j = 0; j + 1 < vlen; j += 2) {
                 uint16_t u = (uint16_t)v[j] | ((uint16_t)v[j + 1] << 8);
                 char tmp[40];
                 uuid16_to_str(u, tmp, sizeof(tmp));
                 append_uuid(uuid, tmp);
             }
         } else if (type == 0x05 || type == 0x04) {
-            for (uint8_t j = 0; j + 3 < l; j += 4) {
+            for (uint8_t j = 0; j + 3 < vlen; j += 4) {
                 uint32_t u = (uint32_t)v[j] | ((uint32_t)v[j + 1] << 8)
                              | ((uint32_t)v[j + 2] << 16) | ((uint32_t)v[j + 3] << 24);
                 char tmp[40];
@@ -146,13 +150,13 @@ static void parse_ad(const uint8_t *data, uint8_t len, char *name, char *uuid)
                 append_uuid(uuid, tmp);
             }
         } else if (type == 0x07 || type == 0x06) {
-            for (uint8_t j = 0; j + 15 < l; j += 16) {
+            for (uint8_t j = 0; j + 15 < vlen; j += 16) {
                 char tmp[40];
                 uuid128_to_str(v + j, tmp, sizeof(tmp));
                 append_uuid(uuid, tmp);
             }
         }
-        i += 2 + l;
+        i += (uint8_t)(1 + l);
     }
 }
 
@@ -292,12 +296,23 @@ static void gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
     add_report(&param->scan_rst);
 }
 
+static void stack_teardown(void)
+{
+    esp_bluedroid_disable();
+    esp_bluedroid_deinit();
+    esp_bt_controller_disable();
+    esp_bt_controller_deinit();
+    s_stack_ready = false;
+}
+
 static bool stack_ensure(void)
 {
     if (s_stack_ready) {
         return true;
     }
-    if (config_server_get_ble_config() == 1) {
+    /* main.c treats any non-zero value (including -1) as "start the GATT
+     * server", so refuse in that case too: ble.c then owns the GAP callback. */
+    if (config_server_get_ble_config() != 0) {
         ESP_LOGW(TAG, "GATT server (ble_status=enable) owns the stack; scan refused");
         return false;
     }
@@ -332,6 +347,7 @@ static bool stack_ensure(void)
     ret = esp_ble_gap_register_callback(gap_cb);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "gap callback registration failed: %s", esp_err_to_name(ret));
+        stack_teardown();
         return false;
     }
 
@@ -347,6 +363,7 @@ static bool stack_ensure(void)
     ret = esp_ble_gap_set_scan_params(&params);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "set scan params failed: %s", esp_err_to_name(ret));
+        stack_teardown();
         return false;
     }
 
@@ -400,6 +417,10 @@ char *ble_scan_json(uint32_t ms, const char *name, const char *uuid)
         return NULL;
     }
     cJSON *arr = cJSON_CreateArray();
+    if (arr == NULL) {
+        cJSON_Delete(root);
+        return NULL;
+    }
 
     ensure_lock();
     xSemaphoreTake(s_lock, portMAX_DELAY);
