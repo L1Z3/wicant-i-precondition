@@ -6,10 +6,11 @@
 /*
  * BLE button listener.
  *
- * Associates with a device that advertises service UUID 0xFFE3 (the generic
- * iTag/selfie-button service), connects as a GATT client, subscribes to every
- * notify/indicate characteristic in that service, and calls
- * precondition_toggle_request() on the first notification of a press.
+ * The 0xFFE0/0xFFE3 button advertises once when pressed and does not stay
+ * connected, so a press is detected from the advertisement itself: associate
+ * with the first matching device, then toggle preconditioning on each later
+ * isolated advertisement (debounced, so a burst or periodic advertising does
+ * not toggle repeatedly).
  *
  * Association is by service UUID, not by a hard-coded MAC, so another device
  * with the same chip/firmware works without reflashing.  The last associated

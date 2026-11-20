@@ -32,6 +32,8 @@
 #define NOTIFY_DEBOUNCE_US (1500 * 1000)
 #define NOTIFY_SETTLE_US (2000 * 1000)
 #define CONNECT_TIMEOUT_US (15 * 1000 * 1000)
+#define PRESS_GAP_US (3000 * 1000)
+#define PRESS_QUIET_US (2000 * 1000)
 #define NVS_NAMESPACE "ble_btn"
 #define NVS_KEY_BDA "bda"
 
@@ -74,6 +76,9 @@ static notify_char_t s_notify[MAX_NOTIFY_CHARS];
 static uint8_t s_notify_count;
 static int64_t s_subscribed_us;
 static int64_t s_last_notify_us;
+static int64_t s_last_press_us;
+static int64_t s_last_seen_us;
+static uint32_t s_press_count;
 static uint8_t s_last_value[20];
 static uint16_t s_last_len;
 static char s_last_addr[18];
@@ -164,36 +169,58 @@ static void scan_cb(const ble_scan_report_t *r, void *ctx)
     bool addr_match = s_have_bound && memcmp(r->bda, s_bound_bda, 6) == 0;
     bool hint_match = memcmp(r->bda, s_hint_a, 6) == 0 || memcmp(r->bda, s_hint_b, 6) == 0;
     bool uuid_match = uuid_text_has_button_service(r->uuid);
-
-    /* When an address is already associated, give it the first scan window;
-     * only fall back to "any 0xFFE0/0xFFE3 device" on the next round.  This keeps a
-     * second identical button nearby from stealing the association. */
-    if (s_have_bound && !addr_match && !hint_match && !s_learning && s_scan_round == 0) {
-        return;
-    }
     if (!addr_match && !hint_match && !uuid_match) {
         return;
     }
 
-    portENTER_CRITICAL(&s_mux);
-    if (!s_found_flag) {
-        memcpy(s_found.bda, r->bda, 6);
-        s_found.addr_type = r->addr_type;
-        if (r->name != NULL) {
-            strncpy(s_found.name, r->name, sizeof(s_found.name) - 1);
-            s_found.name[sizeof(s_found.name) - 1] = '\0';
-        } else {
-            s_found.name[0] = '\0';
-        }
-        if (r->uuid != NULL) {
-            strncpy(s_found.uuid, r->uuid, sizeof(s_found.uuid) - 1);
-            s_found.uuid[sizeof(s_found.uuid) - 1] = '\0';
-        } else {
-            s_found.uuid[0] = '\0';
-        }
-        s_found_flag = true;
+    int64_t now = esp_timer_get_time();
+    char astr[18];
+    addr_to_str(r->bda, astr);
+    s_found_flag = true;
+
+    /* Learn, or associate with the first button service seen.  The press that
+     * wakes the device is consumed by the association, so the next press is the
+     * first real toggle. */
+    if (s_learning || !s_have_bound) {
+        save_bound(r->bda);
+        s_learning = false;
+        s_scan_round = 0;
+        s_last_press_us = now;
+        s_last_seen_us = now;
+        ESP_LOGI(TAG, "associated %s (addr_type %u, rssi %d)",
+                 astr, r->addr_type, r->rssi);
+        return;
     }
-    portEXIT_CRITICAL(&s_mux);
+
+    /* A different 0xFFE0/0xFFE3 device is only adopted after a full round in
+     * which the learned address was absent. */
+    if (!addr_match && !hint_match) {
+        if (s_scan_round == 0) {
+            return;
+        }
+        save_bound(r->bda);
+        s_scan_round = 0;
+        s_last_press_us = now;
+        s_last_seen_us = now;
+        ESP_LOGI(TAG, "re-associated %s", astr);
+        return;
+    }
+
+    int64_t prev_seen = s_last_seen_us;
+    s_last_seen_us = now;
+    if (now - s_last_press_us < PRESS_GAP_US) {
+        return;
+    }
+    /* A real press is an isolated advertisement after a quiet period; a
+     * device that advertises periodically must not toggle repeatedly. */
+    if (prev_seen != 0 && now - prev_seen < PRESS_QUIET_US) {
+        return;
+    }
+    s_last_press_us = now;
+    s_press_count++;
+    ESP_LOGI(TAG, "press advertisement from %s (rssi %d, count %u)",
+             astr, r->rssi, (unsigned)s_press_count);
+    precondition_toggle_request();
 }
 
 static void disconnect_now(void)
@@ -397,7 +424,7 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
     }
 }
 
-static void connect_found(void)
+__attribute__((unused)) static void connect_found(void)
 {
     found_dev_t f;
     portENTER_CRITICAL(&s_mux);
@@ -472,20 +499,17 @@ static void button_task(void *arg)
             continue;
         }
 
-        int64_t deadline = esp_timer_get_time() + (int64_t)SCAN_SECONDS * 1000 * 1000;
-        while (!s_found_flag && esp_timer_get_time() < deadline) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
+        /* The callback does the work: it associates on the first matching
+         * advertisement and toggles preconditioning on later ones.  There is no
+         * GATT connection because this button advertises once per press and
+         * does not stay connected. */
+        vTaskDelay(pdMS_TO_TICKS(SCAN_SECONDS * 1000));
         ble_scan_stop();
 
-        if (s_found_flag) {
-            connect_found();
-        } else {
-            if (s_have_bound && s_scan_round == 0) {
-                s_scan_round = 1; /* next pass accepts any 0xFFE0/0xFFE3 device */
-            }
-            vTaskDelay(pdMS_TO_TICKS(1000));
+        if (!s_found_flag && s_have_bound && s_scan_round == 0) {
+            s_scan_round = 1; /* next pass accepts any 0xFFE0/0xFFE3 device */
         }
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
 
@@ -525,6 +549,10 @@ void ble_button_learn(void)
     s_learning = true;
     s_scan_round = 0;
     s_paused = false;
+    s_last_press_us = 0;
+    s_last_seen_us = 0;
+    s_press_count = 0;
+    s_found_flag = false;
     disconnect_now();
 }
 
@@ -560,6 +588,12 @@ char *ble_button_status_json(void)
     cJSON_AddStringToObject(root, "service_uuid_alt", "0000ffe3-0000-1000-8000-00805f9b34fb");
     cJSON_AddStringToObject(root, "bound_addr", bound);
     cJSON_AddNumberToObject(root, "notify_chars", s_notify_count);
+    cJSON_AddStringToObject(root, "trigger", "advertisement");
+    cJSON_AddNumberToObject(root, "press_count", s_press_count);
+    if (s_last_seen_us != 0) {
+        cJSON_AddNumberToObject(root, "last_seen_age_ms",
+                                (double)(esp_timer_get_time() - s_last_seen_us) / 1000.0);
+    }
 
     char hex[20 * 2 + 1] = "";
     size_t pos = 0;
