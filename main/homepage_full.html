@@ -3212,7 +3212,7 @@ function loadAutoTable(jsonData) {
 			blePairTimer = null;
 		}
 		pairBtn.disabled = true;
-		statusEl.textContent = 'Searching for a BLE button… press its button once.';
+		statusEl.textContent = 'Searching… long-press the button to wake it, then short-press once.';
 
 		fetch('/ble_button?action=learn')
 			.then(response => response.json())
