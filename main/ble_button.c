@@ -62,6 +62,7 @@ static bool s_registered;
 static bool s_connected;
 static bool s_connecting;
 static volatile bool s_closing;
+static volatile bool s_cancel_open;
 static bool s_subscribed;
 static uint16_t s_gattc_if;
 static uint16_t s_conn_id;
@@ -230,13 +231,16 @@ static void scan_cb(const ble_scan_report_t *r, void *ctx)
 
 static void disconnect_now(void)
 {
-    if ((s_connected || s_connecting) && !s_closing) {
+    if (s_connected && !s_closing) {
         s_closing = true;
         esp_err_t err = esp_ble_gattc_close(s_gattc_if, s_conn_id);
         if (err != ESP_OK) {
             s_closing = false;
             ESP_LOGW(TAG, "close failed: %s", esp_err_to_name(err));
         }
+    } else if (s_connecting) {
+        /* No conn_id exists until OPEN_EVT; cannot close a pending open. */
+        s_cancel_open = true;
     }
 }
 
@@ -380,12 +384,19 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
             s_conn_id = p->open.conn_id;
             s_connected = true;
             s_connect_fails = 0;
+            if (s_cancel_open) {
+                s_cancel_open = false;
+                ESP_LOGI(TAG, "cancelled pending connect, conn_id %u", s_conn_id);
+                disconnect_now();
+                break;
+            }
             s_svc_found = false;
             s_notify_count = 0;
             ESP_LOGI(TAG, "connected, conn_id %u", s_conn_id);
             esp_ble_gattc_search_service(gattc_if, s_conn_id, NULL);
         } else {
             s_connected = false;
+            s_cancel_open = false;
             s_connect_fails++;
             ESP_LOGW(TAG, "connect failed: %d (attempt %u)", p->open.status, s_connect_fails);
         }
@@ -469,12 +480,14 @@ static void connect_found(void)
     s_learning = false;
     s_scan_round = 0;
 
+    s_cancel_open = false;
     s_connecting = true;
     s_connect_us = esp_timer_get_time();
     esp_err_t ret = esp_ble_gattc_open(s_gattc_if, f.bda,
                                        (esp_ble_addr_type_t)f.addr_type, true);
     if (ret != ESP_OK) {
         s_connecting = false;
+        s_cancel_open = false;
         s_connect_fails++;
         ESP_LOGW(TAG, "open failed: %s (attempt %u)", esp_err_to_name(ret), s_connect_fails);
         vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
@@ -527,7 +540,7 @@ static void button_task(void *arg)
                 ESP_LOGW(TAG, "connect timeout (attempt %u)", s_connect_fails + 1);
                 s_connect_fails++;
                 s_connecting = false;
-                disconnect_now();
+                s_cancel_open = true;
             }
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
