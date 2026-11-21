@@ -518,24 +518,6 @@ static void button_task(void *arg)
             continue;
         }
 
-        /* Prefer the learned address so a press is not delayed by a scan.
-         * After repeated failures, fall back to scanning so the tag can be
-         * re-found if it changed address or was re-paired. */
-        if (s_have_bound && s_connect_fails < 3) {
-            s_connecting = true;
-            s_connect_us = esp_timer_get_time();
-            ret = esp_ble_gattc_open(s_gattc_if, s_bound_bda,
-                                     (esp_ble_addr_type_t)s_bound_type, true);
-            if (ret != ESP_OK) {
-                s_connecting = false;
-                s_connect_fails++;
-                ESP_LOGW(TAG, "open bound failed: %s (attempt %u)",
-                         esp_err_to_name(ret), s_connect_fails);
-                vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
-            }
-            continue;
-        }
-
         s_found_flag = false;
         if (!ble_scan_start(SCAN_SECONDS, scan_cb, NULL)) {
             vTaskDelay(pdMS_TO_TICKS(1000));
