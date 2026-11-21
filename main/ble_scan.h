@@ -23,6 +23,7 @@ bool ble_scan_ensure_stack(void);
 typedef struct {
     uint8_t bda[6];
     uint8_t addr_type;
+    uint8_t evt_type;
     int rssi;
     const uint8_t *adv;
     uint8_t adv_len;

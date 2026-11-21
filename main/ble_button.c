@@ -30,16 +30,16 @@
 #define SCAN_SECONDS 6
 #define MAX_NOTIFY_CHARS 8
 #define NOTIFY_DEBOUNCE_US (1500 * 1000)
-#define NOTIFY_SETTLE_US (2000 * 1000)
-#define CONNECT_TIMEOUT_US (15 * 1000 * 1000)
-#define PRESS_GAP_US (3000 * 1000)
-/* A long press makes the tag advertise continuously (about every 3.6 s on the
- * iTAG), so a quiet window shorter than the advertising interval would count
- * one press as many.  Six seconds keeps a whole burst to a single toggle while
- * still allowing a deliberate second press. */
-#define PRESS_QUIET_US (6000 * 1000)
+#define NOTIFY_SETTLE_US (2500 * 1000)
+#define CONNECT_TIMEOUT_US (20 * 1000 * 1000)
+#define RECONNECT_DELAY_MS 3000
+/* The iTAG advertises continuously even when untouched, and the advertisement
+ * is byte-identical for idle and pressed.  A press is only visible as a GATT
+ * notification on 0xFFE1 (value 0x01).  Keep a connection open and trigger on
+ * that notification; reconnect on the periodic disconnects. */
 #define NVS_NAMESPACE "ble_btn"
 #define NVS_KEY_BDA "bda"
+#define NVS_KEY_TYPE "bda_type"
 
 typedef struct {
     uint8_t bda[6];
@@ -70,7 +70,9 @@ static found_dev_t s_found;
 static volatile bool s_found_flag;
 
 static uint8_t s_bound_bda[6];
+static uint8_t s_bound_type;
 static bool s_have_bound;
+static uint8_t s_connect_fails;
 
 static uint16_t s_svc_start;
 static uint16_t s_svc_end;
@@ -80,7 +82,6 @@ static notify_char_t s_notify[MAX_NOTIFY_CHARS];
 static uint8_t s_notify_count;
 static int64_t s_subscribed_us;
 static int64_t s_last_notify_us;
-static int64_t s_last_press_us;
 static int64_t s_last_trigger_us;
 static int64_t s_last_seen_us;
 static uint32_t s_press_count;
@@ -138,22 +139,29 @@ static void load_bound(void)
     size_t len = sizeof(s_bound_bda);
     if (nvs_get_blob(h, NVS_KEY_BDA, s_bound_bda, &len) == ESP_OK && len == sizeof(s_bound_bda)) {
         s_have_bound = true;
+        uint8_t type = 0;
+        if (nvs_get_u8(h, NVS_KEY_TYPE, &type) == ESP_OK) {
+            s_bound_type = type;
+        }
     }
     nvs_close(h);
 }
 
-static void save_bound(const uint8_t bda[6])
+static void save_bound(const uint8_t bda[6], uint8_t addr_type)
 {
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
         ESP_LOGW(TAG, "nvs open failed; association not saved");
         return;
     }
-    if (nvs_set_blob(h, NVS_KEY_BDA, bda, 6) != ESP_OK || nvs_commit(h) != ESP_OK) {
+    if (nvs_set_blob(h, NVS_KEY_BDA, bda, 6) != ESP_OK ||
+        nvs_set_u8(h, NVS_KEY_TYPE, addr_type) != ESP_OK ||
+        nvs_commit(h) != ESP_OK) {
         ESP_LOGW(TAG, "nvs write failed; association not saved");
     }
     nvs_close(h);
     memcpy(s_bound_bda, bda, 6);
+    s_bound_type = addr_type;
     s_have_bound = true;
 }
 
@@ -162,6 +170,7 @@ static void clear_bound(void)
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
         nvs_erase_key(h, NVS_KEY_BDA);
+        nvs_erase_key(h, NVS_KEY_TYPE);
         nvs_commit(h);
         nvs_close(h);
     }
@@ -181,17 +190,25 @@ static void scan_cb(const ble_scan_report_t *r, void *ctx)
     int64_t now = esp_timer_get_time();
     char astr[18];
     addr_to_str(r->bda, astr);
+    s_last_seen_us = now;
     s_found_flag = true;
 
+    portENTER_CRITICAL(&s_mux);
+    memcpy(s_found.bda, r->bda, 6);
+    s_found.addr_type = r->addr_type;
+    strlcpy(s_found.name, r->name, sizeof(s_found.name));
+    strlcpy(s_found.uuid, r->uuid, sizeof(s_found.uuid));
+    portEXIT_CRITICAL(&s_mux);
+
+    ESP_LOGI(TAG, "ad %s type %u rssi %d uuid '%s'", astr, r->addr_type, r->rssi, r->uuid);
+
     /* Learn, or associate with the first button service seen.  The press that
-     * wakes the device is consumed by the association, so the next press is the
-     * first real toggle. */
+     * wakes the device is consumed by the association; after the connection is
+     * up, every 0xFFE1 notification is a real press. */
     if (s_learning || !s_have_bound) {
-        save_bound(r->bda);
+        save_bound(r->bda, r->addr_type);
         s_learning = false;
         s_scan_round = 0;
-        s_last_press_us = now;
-        s_last_seen_us = now;
         ESP_LOGI(TAG, "associated %s (addr_type %u, rssi %d)",
                  astr, r->addr_type, r->rssi);
         return;
@@ -203,30 +220,10 @@ static void scan_cb(const ble_scan_report_t *r, void *ctx)
         if (s_scan_round == 0) {
             return;
         }
-        save_bound(r->bda);
+        save_bound(r->bda, r->addr_type);
         s_scan_round = 0;
-        s_last_press_us = now;
-        s_last_seen_us = now;
         ESP_LOGI(TAG, "re-associated %s", astr);
-        return;
     }
-
-    int64_t prev_seen = s_last_seen_us;
-    s_last_seen_us = now;
-    if (now - s_last_press_us < PRESS_GAP_US) {
-        return;
-    }
-    /* A real press is an isolated advertisement after a quiet period; a
-     * device that advertises periodically must not toggle repeatedly. */
-    if (prev_seen != 0 && now - prev_seen < PRESS_QUIET_US) {
-        return;
-    }
-    s_last_press_us = now;
-    s_last_trigger_us = now;
-    s_press_count++;
-    ESP_LOGI(TAG, "press advertisement from %s (rssi %d, count %u)",
-             astr, r->rssi, (unsigned)s_press_count);
-    precondition_toggle_request();
 }
 
 static void disconnect_now(void)
@@ -300,7 +297,7 @@ static void discover_chars(void)
             any = true;
 
             esp_err_t ret = esp_ble_gattc_register_for_notify(
-                s_gattc_if, s_found.bda, chars[i].char_handle);
+                s_gattc_if, s_bound_bda, chars[i].char_handle);
             if (ret != ESP_OK) {
                 ESP_LOGW(TAG, "register_for_notify(0x%04x) failed: %s",
                          chars[i].char_handle, esp_err_to_name(ret));
@@ -328,9 +325,14 @@ static void handle_notify(esp_ble_gattc_cb_param_t *p)
     if (s_subscribed_us != 0 && now - s_subscribed_us < NOTIFY_SETTLE_US) {
         return; /* initial value pushed right after CCCD write */
     }
+    if (p->notify.value_len == 0) {
+        return;
+    }
     if (now - s_last_notify_us < NOTIFY_DEBOUNCE_US) {
         return;
     }
+
+    uint8_t value = p->notify.value[0];
     s_last_notify_us = now;
     s_last_len = p->notify.value_len > sizeof(s_last_value)
                      ? sizeof(s_last_value)
@@ -338,8 +340,15 @@ static void handle_notify(esp_ble_gattc_cb_param_t *p)
     memcpy(s_last_value, p->notify.value, s_last_len);
     addr_to_str(p->notify.remote_bda, s_last_addr);
 
-    ESP_LOGI(TAG, "button press from %s (handle 0x%04x, %u bytes)",
-             s_last_addr, p->notify.handle, p->notify.value_len);
+    if (value != 0x01) {
+        ESP_LOGI(TAG, "notification 0x%02x ignored (not a press)", value);
+        return;
+    }
+
+    s_last_trigger_us = now;
+    s_press_count++;
+    ESP_LOGI(TAG, "button press from %s (handle 0x%04x, count %u)",
+             s_last_addr, p->notify.handle, (unsigned)s_press_count);
     precondition_toggle_request();
 }
 
@@ -362,13 +371,15 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         if (p->open.status == ESP_GATT_OK) {
             s_conn_id = p->open.conn_id;
             s_connected = true;
+            s_connect_fails = 0;
             s_svc_found = false;
             s_notify_count = 0;
             ESP_LOGI(TAG, "connected, conn_id %u", s_conn_id);
             esp_ble_gattc_search_service(gattc_if, s_conn_id, NULL);
         } else {
             s_connected = false;
-            ESP_LOGW(TAG, "connect failed: %d", p->open.status);
+            s_connect_fails++;
+            ESP_LOGW(TAG, "connect failed: %d (attempt %u)", p->open.status, s_connect_fails);
         }
         break;
 
@@ -430,7 +441,7 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
     }
 }
 
-__attribute__((unused)) static void connect_found(void)
+static void connect_found(void)
 {
     found_dev_t f;
     portENTER_CRITICAL(&s_mux);
@@ -439,14 +450,12 @@ __attribute__((unused)) static void connect_found(void)
 
     char astr[18];
     addr_to_str(f.bda, astr);
-    ESP_LOGI(TAG, "associating %s (addr_type %u, name '%s')", astr, f.addr_type, f.name);
+    ESP_LOGI(TAG, "connecting %s (addr_type %u, name '%s')", astr, f.addr_type, f.name);
 
-    if (s_learning) {
-        save_bound(f.bda);
-        s_learning = false;
-    } else if (!s_have_bound || memcmp(s_bound_bda, f.bda, 6) != 0) {
-        save_bound(f.bda);
+    if (s_learning || !s_have_bound || memcmp(s_bound_bda, f.bda, 6) != 0) {
+        save_bound(f.bda, f.addr_type);
     }
+    s_learning = false;
     s_scan_round = 0;
 
     s_connecting = true;
@@ -455,7 +464,9 @@ __attribute__((unused)) static void connect_found(void)
                                        (esp_ble_addr_type_t)f.addr_type, true);
     if (ret != ESP_OK) {
         s_connecting = false;
-        ESP_LOGW(TAG, "open failed: %s", esp_err_to_name(ret));
+        s_connect_fails++;
+        ESP_LOGW(TAG, "open failed: %s (attempt %u)", esp_err_to_name(ret), s_connect_fails);
+        vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
     }
 }
 
@@ -482,20 +493,46 @@ static void button_task(void *arg)
 
     while (1) {
         if (s_paused) {
-            vTaskDelay(pdMS_TO_TICKS(500));
-            continue;
-        }
-        if (s_connected || s_connecting) {
-            if (s_connecting && esp_timer_get_time() - s_connect_us > CONNECT_TIMEOUT_US) {
-                ESP_LOGW(TAG, "connect timeout");
-                s_connecting = false;
+            if (s_connected || s_connecting) {
                 disconnect_now();
             }
-            vTaskDelay(pdMS_TO_TICKS(200));
+            vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
         if (!s_registered) {
             vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+        if (s_connected) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+        if (s_connecting) {
+            if (esp_timer_get_time() - s_connect_us > CONNECT_TIMEOUT_US) {
+                ESP_LOGW(TAG, "connect timeout (attempt %u)", s_connect_fails + 1);
+                s_connect_fails++;
+                s_connecting = false;
+                disconnect_now();
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        /* Prefer the learned address so a press is not delayed by a scan.
+         * After repeated failures, fall back to scanning so the tag can be
+         * re-found if it changed address or was re-paired. */
+        if (s_have_bound && s_connect_fails < 3) {
+            s_connecting = true;
+            s_connect_us = esp_timer_get_time();
+            ret = esp_ble_gattc_open(s_gattc_if, s_bound_bda,
+                                     (esp_ble_addr_type_t)s_bound_type, true);
+            if (ret != ESP_OK) {
+                s_connecting = false;
+                s_connect_fails++;
+                ESP_LOGW(TAG, "open bound failed: %s (attempt %u)",
+                         esp_err_to_name(ret), s_connect_fails);
+                vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
+            }
             continue;
         }
 
@@ -505,15 +542,15 @@ static void button_task(void *arg)
             continue;
         }
 
-        /* The callback does the work: it associates on the first matching
-         * advertisement and toggles preconditioning on later ones.  There is no
-         * GATT connection because this button advertises once per press and
-         * does not stay connected. */
         vTaskDelay(pdMS_TO_TICKS(SCAN_SECONDS * 1000));
         ble_scan_stop();
+        vTaskDelay(pdMS_TO_TICKS(300));
 
-        if (!s_found_flag && s_have_bound && s_scan_round == 0) {
+        if (s_found_flag) {
+            connect_found();
+        } else {
             s_scan_round = 1; /* next pass accepts any 0xFFE0/0xFFE3 device */
+            s_connect_fails = 0;
         }
         vTaskDelay(pdMS_TO_TICKS(200));
     }
@@ -555,10 +592,10 @@ void ble_button_learn(void)
     s_learning = true;
     s_scan_round = 0;
     s_paused = false;
-    s_last_press_us = 0;
     s_last_trigger_us = 0;
     s_last_seen_us = 0;
     s_press_count = 0;
+    s_connect_fails = 0;
     s_found_flag = false;
     disconnect_now();
 }
@@ -596,8 +633,9 @@ char *ble_button_status_json(void)
     cJSON_AddStringToObject(root, "bound_addr", bound);
     cJSON_AddBoolToObject(root, "paired", s_have_bound);
     cJSON_AddNumberToObject(root, "notify_chars", s_notify_count);
-    cJSON_AddStringToObject(root, "trigger", "advertisement");
+    cJSON_AddStringToObject(root, "trigger", "notification");
     cJSON_AddNumberToObject(root, "press_count", s_press_count);
+    cJSON_AddNumberToObject(root, "connect_fails", s_connect_fails);
     if (s_last_trigger_us != 0) {
         cJSON_AddNumberToObject(root, "last_press_age_ms",
                                 (double)(esp_timer_get_time() - s_last_trigger_us) / 1000.0);

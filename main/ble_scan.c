@@ -27,6 +27,7 @@
 typedef struct {
     uint8_t bda[6];
     uint8_t addr_type;
+    uint8_t evt_type;
     int rssi;
     uint32_t count;
     int64_t first_us;
@@ -210,6 +211,7 @@ static void add_report(const struct ble_scan_result_evt_param *r)
     memset(&d, 0, sizeof(d));
     memcpy(d.bda, r->bda, 6);
     d.addr_type = (uint8_t)r->ble_addr_type;
+    d.evt_type = (uint8_t)r->ble_evt_type;
     d.rssi = r->rssi;
     d.count = 1;
     d.first_us = esp_timer_get_time();
@@ -261,6 +263,7 @@ static void add_report(const struct ble_scan_result_evt_param *r)
         ble_scan_report_t rep = {
             .bda = {0},
             .addr_type = d.addr_type,
+            .evt_type = d.evt_type,
             .rssi = d.rssi,
             .adv = d.adv,
             .adv_len = d.adv_len,
@@ -279,6 +282,7 @@ static void add_report(const struct ble_scan_result_evt_param *r)
         scan_dev_t *e = &s_devs[i];
         if (memcmp(e->bda, d.bda, 6) == 0) {
             e->count++;
+            e->evt_type = d.evt_type;
             e->last_us = d.last_us;
             e->rssi = d.rssi;
             if (d.adv_len > 0) {
@@ -526,6 +530,7 @@ char *ble_scan_json(uint32_t ms, const char *name, const char *uuid)
         addr_to_str(d->bda, astr);
         cJSON_AddStringToObject(o, "addr", astr);
         cJSON_AddNumberToObject(o, "addr_type", d->addr_type);
+        cJSON_AddNumberToObject(o, "evt_type", d->evt_type);
         cJSON_AddNumberToObject(o, "rssi", d->rssi);
         cJSON_AddNumberToObject(o, "count", d->count);
         cJSON_AddStringToObject(o, "name", d->name);
