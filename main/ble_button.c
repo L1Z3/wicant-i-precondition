@@ -56,6 +56,7 @@ typedef struct {
 static TaskHandle_t s_task;
 static bool s_started;
 static bool s_paused;
+static volatile bool s_disconnect_req;
 static bool s_learning;
 static bool s_registered;
 static bool s_connected;
@@ -492,6 +493,10 @@ static void button_task(void *arg)
     }
 
     while (1) {
+        if (s_disconnect_req) {
+            s_disconnect_req = false;
+            disconnect_now();
+        }
         if (s_paused) {
             if (s_connected || s_connecting) {
                 disconnect_now();
@@ -579,7 +584,7 @@ void ble_button_learn(void)
     s_press_count = 0;
     s_connect_fails = 0;
     s_found_flag = false;
-    disconnect_now();
+    s_disconnect_req = true;
 }
 
 void ble_button_forget(void)
@@ -588,7 +593,7 @@ void ble_button_forget(void)
     s_learning = false;
     s_scan_round = 0;
     s_paused = true;
-    disconnect_now();
+    s_disconnect_req = true;
 }
 
 char *ble_button_status_json(void)
