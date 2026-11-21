@@ -61,6 +61,7 @@ static bool s_learning;
 static bool s_registered;
 static bool s_connected;
 static bool s_connecting;
+static volatile bool s_closing;
 static bool s_subscribed;
 static uint16_t s_gattc_if;
 static uint16_t s_conn_id;
@@ -229,8 +230,13 @@ static void scan_cb(const ble_scan_report_t *r, void *ctx)
 
 static void disconnect_now(void)
 {
-    if (s_connected || s_connecting) {
-        esp_ble_gattc_close(s_gattc_if, s_conn_id);
+    if ((s_connected || s_connecting) && !s_closing) {
+        s_closing = true;
+        esp_err_t err = esp_ble_gattc_close(s_gattc_if, s_conn_id);
+        if (err != ESP_OK) {
+            s_closing = false;
+            ESP_LOGW(TAG, "close failed: %s", esp_err_to_name(err));
+        }
     }
 }
 
@@ -369,6 +375,7 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
 
     case ESP_GATTC_OPEN_EVT:
         s_connecting = false;
+        s_closing = false;
         if (p->open.status == ESP_GATT_OK) {
             s_conn_id = p->open.conn_id;
             s_connected = true;
@@ -428,13 +435,16 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
 
     case ESP_GATTC_CLOSE_EVT:
     case ESP_GATTC_DISCONNECT_EVT:
+        if (s_connected || s_connecting || s_closing) {
+            ESP_LOGW(TAG, "disconnected");
+        }
         s_connected = false;
         s_connecting = false;
+        s_closing = false;
         s_subscribed = false;
         s_svc_found = false;
         s_notify_count = 0;
         s_subscribed_us = 0;
-        ESP_LOGW(TAG, "disconnected");
         break;
 
     default:
