@@ -173,10 +173,15 @@ static bool is_utility_request(const twai_message_t *frame) {
 #define POWER_STATUS_MASK 0x0FU
 #define POWER_STATUS_READY(power_status_byte) \
     (((power_status_byte) & POWER_STATUS_MASK) == 0x04U)
-// plugged in: read while charging and while ON but not READY with the charge
-// cable connected, where the same state unplugged reads 0x02 (EV6, Ioniq 6)
-#define POWER_STATUS_PLUGGED_IN(power_status_byte) \
+// Byte 1 disambiguates the low nibble's 0x06, which is either "charging/plugged
+// in" or "remotely woken up": 0x8D means the charge cable is connected (whether
+// charging or not), 0xAB is the 1-6 frame VCU boot/wake transient after a
+// remote wake. The 0x06 nibble alone cannot tell those apart.
+#define POWER_STATUS_CHARGING_OR_WAKE(power_status_byte) \
     (((power_status_byte) & POWER_STATUS_MASK) == 0x06U)
+#define POWER_STATUS_BYTE1_PLUGGED_IN 0x8DU
+#define POWER_STATUS_PLUGGED_IN(power_status_byte1) \
+    ((power_status_byte1) == POWER_STATUS_BYTE1_PLUGGED_IN)
 
 #define PRECONDITION_DEBOUNCE_US 1000000U  // 1 second
 #define PRECONDITION_LONG_PRESS_US 1000000U  // short/long press threshold: 1 second
@@ -1457,12 +1462,17 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
     if (IS_POWER_STATUS_FRAME(to_push->identifier)
             && rx_bus == CAR_BUS
             && to_push->data_length_code >= 1U) {
-        precondition_power_t power = {
-            .raw = to_push->data[0],
-            .plugged_in = POWER_STATUS_PLUGGED_IN(to_push->data[0]),
-            .updated_at_us = sm_now(sm),
-        };
-        xQueueOverwrite(car_power_queue, &power);
+        // byte 1 carries the plug state; a frame too short to have it is not
+        // enough to decode, so leave the last published value alone.
+        if (to_push->data_length_code >= 2U) {
+            precondition_power_t power = {
+                .raw = ((uint16_t)to_push->data[0] << 8) | to_push->data[1],
+                .plugged_in = POWER_STATUS_CHARGING_OR_WAKE(to_push->data[0])
+                              && POWER_STATUS_PLUGGED_IN(to_push->data[1]),
+                .updated_at_us = sm_now(sm),
+            };
+            xQueueOverwrite(car_power_queue, &power);
+        }
 
         ready_status_t ready = POWER_STATUS_READY(to_push->data[0])
                                ? READY_STATUS_READY : READY_STATUS_NOT_READY;

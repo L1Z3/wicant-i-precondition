@@ -142,10 +142,12 @@ static void ioniq6_status(uint8_t b, can_bus_t bus) { uint8_t d[8] = {0}; d[1] =
 static void car_power(bool ready) { uint8_t d[8] = {0}; d[0] = ready ? 0x04 : 0x00; rx_frame(0x038, d, CAN_BUS_0); }
 // Ioniq 6 carries the power status on the 29-bit 0x00C03503 (the CCU-hub remap
 // of the 11-bit 0x038). Byte 0's low nibble reads 0x04 in READY and 0x01 awake
-// but off, so this takes the raw byte rather than a bool.
-static void ioniq6_power(uint8_t byte0, can_bus_t bus) {
+// but off; byte 1 carries the plug state (0x8D plugged in, 0xAB remote wake),
+// so this takes both raw bytes rather than a bool.
+static void ioniq6_power(uint8_t byte0, uint8_t byte1, can_bus_t bus) {
     uint8_t d[8] = {0};
     d[0] = byte0;
+    d[1] = byte1;
     rx_frame(0x00C03503, d, bus);
 }
 // Ioniq 5/EV6 broadcast battery temperature on 0x152 and SoC on 0x2FC; Ioniq 6
@@ -713,12 +715,13 @@ static void run_ioniq6_battery_frames(void) {
           == (PRECONDITION_BLOCK_BATTERY_WARM | PRECONDITION_BLOCK_BATTERY_LOW_SOC));
 }
 
-// The power-status byte is published on every car-side frame from either
-// identifier, with the plug state decoded from the low nibble.
+// The power-status frame is published on every car-side frame from either
+// identifier, with the plug state decoded from both bytes together: byte 0's
+// ambiguous 0x06 nibble plus byte 1 0x8D, rather than byte 1 alone.
 static void run_car_power_state(void) {
     precondition_init();
     precondition_power_t power;
-    uint8_t d[8] = {0x06};
+    uint8_t d[8] = {0x06, 0x8D};
 
     CHECK(!precondition_get_car_power(&power));
     // car-side only, like the READY tracking
@@ -728,28 +731,47 @@ static void run_car_power_state(void) {
     fake_now = 123456;
     rx_frame(0x038, d, CAN_BUS_0);
     CHECK(precondition_get_car_power(&power));
-    CHECK(power.raw == 0x06 && power.plugged_in);
+    CHECK(power.raw == 0x068D && power.plugged_in);
     CHECK(power.updated_at_us == fake_now);
     CHECK(!car_in_ready());
 
-    // ON but not READY, unplugged
-    d[0] = 0x02;
+    // 0x06 also covers a remote wake: byte 1 0xAB is the VCU boot/wake
+    // transient (1-6 frames), not a plug state.
+    d[1] = 0xAB;
     rx_frame(0x038, d, CAN_BUS_0);
     CHECK(precondition_get_car_power(&power));
-    CHECK(power.raw == 0x02 && !power.plugged_in);
+    CHECK(power.raw == 0x06AB && !power.plugged_in);
+
+    // ON but not READY, unplugged
+    d[0] = 0x02;
+    d[1] = 0x00;
+    rx_frame(0x038, d, CAN_BUS_0);
+    CHECK(precondition_get_car_power(&power));
+    CHECK(power.raw == 0x0200 && !power.plugged_in);
 
     // READY reads 0x04, and a repeated frame still refreshes the age
     car_power(true);
     fake_now += 1000;
     car_power(true);
     CHECK(precondition_get_car_power(&power));
-    CHECK(power.raw == 0x04 && !power.plugged_in);
+    CHECK(power.raw == 0x0400 && !power.plugged_in);
     CHECK(power.updated_at_us == fake_now);
 
-    // the Ioniq 6 identifier decodes the same way
-    ioniq6_power(0x06, CAN_BUS_0);
+    // The decode only accepts 0x8D together with byte 0's 0x06, so a READY
+    // (0x04) frame carrying 0x8D is not treated as plugged in.
+    d[0] = 0x04;
+    d[1] = 0x8D;
+    rx_frame(0x038, d, CAN_BUS_0);
     CHECK(precondition_get_car_power(&power));
-    CHECK(power.raw == 0x06 && power.plugged_in);
+    CHECK(power.raw == 0x048D && !power.plugged_in);
+
+    // the Ioniq 6 identifier decodes the same way
+    ioniq6_power(0x06, 0x8D, CAN_BUS_0);
+    CHECK(precondition_get_car_power(&power));
+    CHECK(power.raw == 0x068D && power.plugged_in);
+    ioniq6_power(0x06, 0xAB, CAN_BUS_0);
+    CHECK(precondition_get_car_power(&power));
+    CHECK(power.raw == 0x06AB && !power.plugged_in);
 }
 
 // The Ioniq 6 form of the precondition status frame, 0x0A82AA03. It must drive
@@ -849,7 +871,7 @@ static void run_ioniq6_power_status(void) {
     CHECK(!car_in_ready());
 
     // Wrong bus: a head-unit copy of the Ioniq 6 id is not the car's READY.
-    ioniq6_power(0x04, CAN_BUS_1);
+    ioniq6_power(0x04, 0x00, CAN_BUS_1);
     CHECK(platform.ready_status == READY_STATUS_UNKNOWN);
     CHECK(!car_in_ready());
 
@@ -861,13 +883,13 @@ static void run_ioniq6_power_status(void) {
 
     // ...and the Ioniq 6 id sets READY from byte 0's low nibble, then drops it
     // again for the 0x01 an awake-but-off car reports.
-    ioniq6_power(0x04, CAN_BUS_0);
+    ioniq6_power(0x04, 0x00, CAN_BUS_0);
     CHECK(platform.ready_status == READY_STATUS_READY);
     CHECK(car_in_ready());
-    ioniq6_power(0x01, CAN_BUS_0);
+    ioniq6_power(0x01, 0x00, CAN_BUS_0);
     CHECK(platform.ready_status == READY_STATUS_NOT_READY);
     CHECK(!car_in_ready());
-    ioniq6_power(0x04, CAN_BUS_0);                 // READY again for the relaunch
+    ioniq6_power(0x04, 0x00, CAN_BUS_0);           // READY again for the relaunch
     CHECK(car_in_ready());
 
     // READY on this ID is what relaunches a persistent session: start one, take
@@ -880,7 +902,7 @@ static void run_ioniq6_power_status(void) {
     car_status(0x15, CAN_BUS_0);
     expect_state("active");
 
-    ioniq6_power(0x01, CAN_BUS_0);                 // car off
+    ioniq6_power(0x01, 0x00, CAN_BUS_0);           // car off
     expect_state("managed");
     CHECK(!car_in_ready());
     sent_count = 0;
@@ -888,7 +910,7 @@ static void run_ioniq6_power_status(void) {
     CHECK(sent_count == 0);                        // no nudge while not READY
     expect_state("managed");
 
-    ioniq6_power(0x04, CAN_BUS_0);                 // READY edge
+    ioniq6_power(0x04, 0x00, CAN_BUS_0);           // READY edge
     expect_state("car-start-delay");
     advance_us(PRECONDITION_CAR_START_DELAY_US - 40000);
     expect_state("car-start-delay");
