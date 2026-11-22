@@ -1639,9 +1639,13 @@ static void push_precondition_state(void) {
     // derive the display state straight from the machine's current leaf:
     // requested is any state under REQUESTED (incl. MANAGED), starting is the
     // two wait states, active only once fully running in ACTIVE
+    bool active = sm_in(&precon_sm, &S_ACTIVE);
     precondition_state_t state = {
         .requested = sm_in(&precon_sm, &S_REQUESTED),
-        .active = sm_in(&precon_sm, &S_ACTIVE),
+        .active = active,
+        // it seems worthwhile to note that we can't confirm that
+        // preconditioning is actually active.
+        .unconfirmed = active && !precon_status_available(),
         .starting = sm_in(&precon_sm, &S_WAIT_STARTING) || sm_in(&precon_sm, &S_WAIT_STARTED),
     };
     xQueueOverwrite(precondition_state_queue, &state);

@@ -1066,6 +1066,7 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	if (precondition_get_state(&pstate)) {
         cJSON_AddBoolToObject(root, "precondition_requested", pstate.requested);
         cJSON_AddBoolToObject(root, "precondition_active", pstate.active);
+        cJSON_AddBoolToObject(root, "precondition_unconfirmed", pstate.unconfirmed);
         cJSON_AddBoolToObject(root, "precondition_starting", pstate.starting);
 	}
 
