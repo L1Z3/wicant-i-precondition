@@ -39,6 +39,15 @@ typedef struct {
 
 bool precondition_get_battery_soc(precondition_soc_t *out);
 
+// Charging power in kW. 0x30E byte 6 on Ioniq 5/EV6, or the 29-bit
+// 0x0C030A04 CCU-hub remap on Ioniq 6.
+typedef struct {
+    uint8_t kw;
+    int64_t updated_at_us;
+} precondition_charging_power_t;
+
+bool precondition_get_charging_power(precondition_charging_power_t *out);
+
 // E-GMP model identified from the precondition status frame. The web UI's
 // button filter uses it when the vehicle setting is "auto"; an Ioniq 6 also gets
 // a longer start timeout and its own popup fallback media type.

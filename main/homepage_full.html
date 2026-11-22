@@ -588,6 +588,10 @@
                     </td>
                 </tr>
                 <tr>
+                    <td>Charging Power:</td>
+                    <td><div id="charging_power_status">Waiting for CAN data</div></td>
+                </tr>
+                <tr>
                     <td>Preconditioning Requested:</td>
                     <td><div id="precondition_requested_status">Loading...</div></td>
                 </tr>
@@ -2745,6 +2749,11 @@ function loadAutoTable(jsonData) {
 				document.getElementById("battery_temp_status").textContent = `Min: ${formatBatteryTemperature(obj.battery_temp_min_c, obj.battery_temp_unit)}; Max: ${formatBatteryTemperature(obj.battery_temp_max_c, obj.battery_temp_unit)}; (${formatAge(obj.battery_temp_age_ms)} ago)`;
 			} else {
 				document.getElementById("battery_temp_status").textContent = "Waiting for CAN data";
+			}
+			if (obj.charging_power_valid) {
+				document.getElementById("charging_power_status").textContent = `${obj.charging_power_kw} kW; (${formatAge(obj.charging_power_age_ms)} ago)`;
+			} else {
+				document.getElementById("charging_power_status").textContent = "Waiting for CAN data";
 			}
 			document.getElementById("precondition_requested_status").textContent = obj.precondition_requested ? "Yes" : "No";
 			document.getElementById("precondition_active_status").textContent = obj.precondition_starting ? "Starting" : (obj.precondition_active ? "Yes" : "No");

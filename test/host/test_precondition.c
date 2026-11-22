@@ -166,6 +166,12 @@ static void battery_soc_frame(uint32_t frame_id, uint8_t raw, can_bus_t bus) {
     uint8_t d[8] = {[7] = raw};
     rx_frame(frame_id, d, bus);
 }
+// Charging power is 0x30E byte 6 on Ioniq 5/EV6, and the same payload on the
+// 29-bit 0x0C030A04 CCU-hub remap used by the Ioniq 6.
+static void charging_power_frame(uint32_t frame_id, uint8_t kw, can_bus_t bus) {
+    uint8_t d[8] = {[6] = kw};
+    rx_frame(frame_id, d, bus);
+}
 static void battery_soc(uint8_t raw) {
     battery_soc_frame(0x2FC, raw, CAN_BUS_0);
 }
@@ -772,6 +778,46 @@ static void run_car_power_state(void) {
     ioniq6_power(0x06, 0xAB, CAN_BUS_0);
     CHECK(precondition_get_car_power(&power));
     CHECK(power.raw == 0x06AB && !power.plugged_in);
+}
+
+// Charging power is published from either identifier, car-side only, and a
+// frame too short for byte 6 is not decoded.
+static void run_charging_power(void) {
+    precondition_init();
+    precondition_charging_power_t power;
+
+    CHECK(!precondition_get_charging_power(&power));
+
+    // car-side only
+    charging_power_frame(0x30E, 120, CAN_BUS_1);
+    CHECK(!precondition_get_charging_power(&power));
+
+    fake_now = 654321;
+    charging_power_frame(0x30E, 120, CAN_BUS_0);
+    CHECK(precondition_get_charging_power(&power));
+    CHECK(power.kw == 120);
+    CHECK(power.updated_at_us == fake_now);
+
+    // 0 kW is a real reading while not charging, not a missing value
+    fake_now += 1000;
+    charging_power_frame(0x30E, 0, CAN_BUS_0);
+    CHECK(precondition_get_charging_power(&power));
+    CHECK(power.kw == 0);
+    CHECK(power.updated_at_us == fake_now);
+
+    // Ioniq 6 CCU-hub remap of 0x30E
+    charging_power_frame(0x0C030A04, 235, CAN_BUS_0);
+    CHECK(precondition_get_charging_power(&power));
+    CHECK(power.kw == 235);
+
+    // A frame too short for byte 6 leaves the last reading alone.
+    twai_message_t short_frame = {0};
+    short_frame.identifier = 0x30E;
+    short_frame.data_length_code = 6;
+    short_frame.data[6] = 99;
+    precondition_can_rx_hook(&short_frame, CAN_BUS_0);
+    CHECK(precondition_get_charging_power(&power));
+    CHECK(power.kw == 235);
 }
 
 // The Ioniq 6 form of the precondition status frame, 0x0A82AA03. It must drive
@@ -2248,6 +2294,7 @@ static const suite_t suites[] = {
     {"precondition conditioning mode blocker", ONCE, PRESS_SHORT, run_conditioning_mode_blocker},
     {"precondition conditioning mode blocker repeating", CONTINUOUS, PRESS_SHORT, run_conditioning_mode_blocker_repeating},
     {"precondition car power state", ONCE, PRESS_SHORT, run_car_power_state},
+    {"precondition charging power", ONCE, PRESS_SHORT, run_charging_power},
     {"precondition automatic temperature cutoff", CONTINUOUS, PRESS_SHORT, run_automatic_temperature_cutoff},
     {"precondition persistent temperature cutoff", PERSISTENT, PRESS_SHORT, run_automatic_temperature_cutoff},
     {"precondition continuous cool wait", CONTINUOUS, PRESS_SHORT, run_managed_cool_wait},

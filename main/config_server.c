@@ -1062,6 +1062,20 @@ char *config_server_get_status_json(bool remove_sensitive_info)
         cJSON_AddBoolToObject(root, "battery_temp_valid", false);
 	}
 
+	precondition_charging_power_t charging_power;
+
+	if (precondition_get_charging_power(&charging_power)) {
+        cJSON_AddBoolToObject(root, "charging_power_valid", true);
+        cJSON_AddNumberToObject(root, "charging_power_kw", charging_power.kw);
+        cJSON_AddNumberToObject(
+            root,
+            "charging_power_age_ms",
+            (esp_timer_get_time() - charging_power.updated_at_us) / 1000
+        );
+	} else {
+        cJSON_AddBoolToObject(root, "charging_power_valid", false);
+	}
+
 	precondition_state_t pstate;
 	if (precondition_get_state(&pstate)) {
         cJSON_AddBoolToObject(root, "precondition_requested", pstate.requested);
