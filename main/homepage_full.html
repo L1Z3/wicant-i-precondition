@@ -2735,7 +2735,8 @@ function loadAutoTable(jsonData) {
 				document.getElementById("battery_temp_status").textContent = "Waiting for CAN data";
 			}
 			document.getElementById("precondition_requested_status").textContent = obj.precondition_requested ? "Yes" : "No";
-			document.getElementById("precondition_active_status").textContent = obj.precondition_starting ? "Starting" : (obj.precondition_active ? "Yes" : "No");
+			document.getElementById("precondition_active_status").textContent = obj.precondition_starting ? "Starting"
+				: (obj.precondition_active ? (obj.precondition_unconfirmed ? "Yes (unconfirmed)" : "Yes") : "No");
 			// the button toggles, so label it with the action it will take
 			document.getElementById("precon_activate_button").value = obj.precondition_requested ? "Stop Preconditioning" : "Activate";
 			// car identified from CAN; the button filter uses it when the

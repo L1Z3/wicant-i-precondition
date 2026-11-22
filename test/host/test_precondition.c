@@ -281,6 +281,7 @@ static void run_short_press(void) {
     expect_state("active");
     CHECK(sent_count == 0);                    // no retries without status frames
     CHECK(precondition_display().active);
+    CHECK(precondition_display().unconfirmed); // never saw a status frame
     CHECK(!precondition_display().starting);
     CHECK(fwd(0x4E8, CAN_BUS_0, NULL) == FWD_PASSTHROUGH);  // display off in active
     CHECK(fwd(0x0C7, CAN_BUS_0, NULL) == FWD_BLOCK);        // still blocking
@@ -323,6 +324,7 @@ static void run_short_press(void) {
     car_status(0x55, CAN_BUS_0);               // EV6-style "started"
     expect_state("active");
     CHECK(precondition_display().active);
+    CHECK(!precondition_display().unconfirmed); // confirmed by 0x2AD
     CHECK(!precondition_display().starting);
     // A later "starting" report does not reopen startup or its retry timer.
     int sent_before_starting = sent_count;
@@ -483,6 +485,34 @@ static void run_short_press(void) {
     egmp_car_model_t model;
     CHECK(precondition_get_car_model(&model) && model == EGMP_CAR_IONIQ5);
     CHECK(popup_fallback_media_type == 0U);
+}
+
+// An unconfirmed session is one the optimistic no-status path started. It must
+// still be reported active (a car whose status frame id the firmware does not
+// know yet must keep working), and must stop being unconfirmed as soon as a
+// recognised status frame arrives.
+static void run_unconfirmed_status(void) {
+    precondition_init();
+    expect_state("idle");
+    CHECK(!precondition_display().active);
+    CHECK(!precondition_display().unconfirmed);
+
+    toggle();
+    expect_state("start-burst");
+    for (int i = 0; i < 6; i++) tick1();
+    expect_state("wait-starting");
+    CHECK(!precondition_display().unconfirmed); // not active yet
+
+    advance_us(PRECONDITION_STARTED_TIMEOUT_US + 80000);
+    expect_state("active");
+    CHECK(precondition_display().active);
+    CHECK(precondition_display().unconfirmed);
+
+    // a late status frame confirms the session without changing the state
+    car_status(0x15, CAN_BUS_0);                // "started"
+    expect_state("active");
+    CHECK(precondition_display().active);
+    CHECK(!precondition_display().unconfirmed);
 }
 
 static void run_long_press(void) {
@@ -1953,6 +1983,7 @@ static const suite_t suites[] = {
     {"fahrenheit continuous cutoff", CONTINUOUS, PRESS_SHORT, run_fahrenheit_automatic_cutoff},
     {"fahrenheit persistent cutoff", PERSISTENT, PRESS_SHORT, run_fahrenheit_automatic_cutoff},
     {"precondition short-press once", ONCE, PRESS_SHORT, run_short_press},
+    {"precondition unconfirmed status", ONCE, PRESS_SHORT, run_unconfirmed_status},
     {"precondition long-press once", ONCE, PRESS_LONG, run_long_press},
     {"precondition battery temperature cutoff", ONCE, PRESS_SHORT, run_battery_temperature_cutoff},
     {"precondition battery state of charge", ONCE, PRESS_SHORT, run_battery_soc},

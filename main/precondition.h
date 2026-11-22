@@ -22,6 +22,10 @@ typedef struct {
     bool requested;
     bool active;
     bool starting;
+    // active, but no recognised status frame has ever been seen: the session
+    // was started optimistically. the car may not publish one, or may publish
+    // an id the firmware does not know yet. or maybe we're on a bench.
+    bool unconfirmed;
 } precondition_state_t;
 
 void precondition_toggle_request(void);
