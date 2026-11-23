@@ -1072,7 +1072,6 @@ static bool abort_start_if_blocked(sm_t *sm) {
 
 // retry timers and the countdown display measure from the moment the burst began
 static void start_burst_enter(sm_t *sm) {
-    requested.last_attempt_ts = sm_now(sm);
     // The enable burst is sent once per start command: WAIT_CONDITIONING_MODE
     // sets this when it gave up waiting, so the follow-up burst goes straight to
     // the start sequence instead of enabling the mode again.
@@ -1085,6 +1084,11 @@ static void start_burst_enter(sm_t *sm) {
     if (requested.conditioning_mode_first) {
         // an earlier attempt's report must not shorten this attempt's settle
         requested.mode_confirmed_ts = 0;
+    } else {
+        // Only the start sequence itself starts the retry and countdown clocks:
+        // an attempt that has to enable the mode first must not spend that time
+        // out of its retry budget.
+        requested.last_attempt_ts = sm_now(sm);
     }
     abort_start_if_blocked(sm);
 }
