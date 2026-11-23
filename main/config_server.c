@@ -1062,6 +1062,20 @@ char *config_server_get_status_json(bool remove_sensitive_info)
         cJSON_AddBoolToObject(root, "battery_temp_valid", false);
 	}
 
+	precondition_charging_power_t charging_power;
+
+	if (precondition_get_charging_power(&charging_power)) {
+        cJSON_AddBoolToObject(root, "charging_power_valid", true);
+        cJSON_AddNumberToObject(root, "charging_power_kw", charging_power.kw);
+        cJSON_AddNumberToObject(
+            root,
+            "charging_power_age_ms",
+            (esp_timer_get_time() - charging_power.updated_at_us) / 1000
+        );
+	} else {
+        cJSON_AddBoolToObject(root, "charging_power_valid", false);
+	}
+
 	precondition_state_t pstate;
 	if (precondition_get_state(&pstate)) {
         cJSON_AddBoolToObject(root, "precondition_requested", pstate.requested);
@@ -1116,6 +1130,20 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	// shown by the web UI in place of the car-on sense voltage on boards
 	// without the sense pin.
 	cJSON_AddStringToObject(root, "can_ready_state", car_in_ready() ? "Ready" : "Not Ready");
+
+	precondition_power_t car_power;
+
+	if (precondition_get_car_power(&car_power)) {
+        cJSON_AddBoolToObject(root, "car_power_valid", true);
+        cJSON_AddBoolToObject(root, "plugged_in", car_power.plugged_in);
+        cJSON_AddNumberToObject(
+            root,
+            "car_power_age_ms",
+            (esp_timer_get_time() - car_power.updated_at_us) / 1000
+        );
+	} else {
+        cJSON_AddBoolToObject(root, "car_power_valid", false);
+	}
 
 	char uptime_str[32];
 	dev_status_format_uptime(uptime_str, sizeof(uptime_str));

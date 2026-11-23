@@ -173,6 +173,15 @@ static bool is_utility_request(const twai_message_t *frame) {
 #define POWER_STATUS_MASK 0x0FU
 #define POWER_STATUS_READY(power_status_byte) \
     (((power_status_byte) & POWER_STATUS_MASK) == 0x04U)
+// Byte 1 disambiguates the low nibble's 0x06, which is either "charging/plugged
+// in" or "remotely woken up": 0x8D means the charge cable is connected (whether
+// charging or not), 0xAB is the 1-6 frame VCU boot/wake transient after a
+// remote wake. The 0x06 nibble alone cannot tell those apart.
+#define POWER_STATUS_CHARGING_OR_WAKE(power_status_byte) \
+    (((power_status_byte) & POWER_STATUS_MASK) == 0x06U)
+#define POWER_STATUS_BYTE1_PLUGGED_IN 0x8DU
+#define POWER_STATUS_PLUGGED_IN(power_status_byte1) \
+    ((power_status_byte1) == POWER_STATUS_BYTE1_PLUGGED_IN)
 
 #define PRECONDITION_DEBOUNCE_US 1000000U  // 1 second
 #define PRECONDITION_LONG_PRESS_US 1000000U  // short/long press threshold: 1 second
@@ -228,6 +237,14 @@ static bool is_utility_request(const twai_message_t *frame) {
 
 #define IS_CONDITIONING_MODE_FRAME(frame_id) \
     ((frame_id) == CONDITIONING_MODE_FRAME_ID || (frame_id) == CONDITIONING_MODE_FRAME_ID_IONIQ6)
+
+// Charging power: byte 6 is kW on 0x30E (Ioniq 5/EV6). The Ioniq 6 uses the
+// CCU-hub remap 0x0C030A04 (family base 0x30A, index 4), seen in its captures
+// and defined in gv60-2024.dbc; ioniq6-2024.dbc does not list the frame.
+#define CHARGING_POWER_INDEX 6U
+#define CHARGING_POWER_DATA_LENGTH 7U
+#define IS_CHARGING_POWER_FRAME(frame_id) \
+    ((frame_id) == 0x30EU || (frame_id) == 0x0C030A04U)
 
 #define CAR_BUS CAN_BUS_0
 #if CAN_BUS_COUNT > 1
@@ -452,7 +469,9 @@ static struct {
 
 static QueueHandle_t battery_temperature_queue = NULL;
 static QueueHandle_t battery_soc_queue = NULL;
+static QueueHandle_t charging_power_queue = NULL;
 static QueueHandle_t car_model_queue = NULL;
+static QueueHandle_t car_power_queue = NULL;
 static QueueHandle_t precondition_state_queue = NULL;
 static QueueHandle_t precondition_toggle_queue = NULL;
 
@@ -1452,6 +1471,17 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
     if (IS_POWER_STATUS_FRAME(to_push->identifier)
             && rx_bus == CAR_BUS
             && to_push->data_length_code >= 1U) {
+        // byte 1 carries the plug state; a frame too short to have it is not
+        // enough to decode, so leave the last published value alone.
+        if (to_push->data_length_code >= 2U) {
+            precondition_power_t power = {
+                .plugged_in = POWER_STATUS_CHARGING_OR_WAKE(to_push->data[0])
+                              && POWER_STATUS_PLUGGED_IN(to_push->data[1]),
+                .updated_at_us = sm_now(sm),
+            };
+            xQueueOverwrite(car_power_queue, &power);
+        }
+
         ready_status_t ready = POWER_STATUS_READY(to_push->data[0])
                                ? READY_STATUS_READY : READY_STATUS_NOT_READY;
         // UNKNOWN counts as not-ready, preserving the plain-bool edge behavior:
@@ -1589,6 +1619,17 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
         );
     }
 
+    if (IS_CHARGING_POWER_FRAME(to_push->identifier)
+            && rx_bus == CAR_BUS
+            && to_push->data_length_code >= CHARGING_POWER_DATA_LENGTH) {
+        precondition_charging_power_t charging_power = {
+            .kw = to_push->data[CHARGING_POWER_INDEX],
+            .updated_at_us = sm_now(sm),
+        };
+
+        xQueueOverwrite(charging_power_queue, &charging_power);
+    }
+
     int8_t precon_button_type = precon_config.button_type;
     if (precon_button_type == BUTTON_DISABLED) {
         // activation button disabled in config; don't listen for any button press
@@ -1682,8 +1723,12 @@ void precondition_init(void) {
     configASSERT(battery_temperature_queue != NULL);
     battery_soc_queue = xQueueCreate(1, sizeof(precondition_soc_t));
     configASSERT(battery_soc_queue != NULL);
+    charging_power_queue = xQueueCreate(1, sizeof(precondition_charging_power_t));
+    configASSERT(charging_power_queue != NULL);
     car_model_queue = xQueueCreate(1, sizeof(egmp_car_model_t));
     configASSERT(car_model_queue != NULL);
+    car_power_queue = xQueueCreate(1, sizeof(precondition_power_t));
+    configASSERT(car_power_queue != NULL);
     precondition_state_queue = xQueueCreate(1, sizeof(precondition_state_t));
     configASSERT(precondition_state_queue != NULL);
     precondition_toggle_queue = xQueueCreate(1, sizeof(uint8_t));
@@ -1725,6 +1770,22 @@ bool precondition_get_battery_soc(precondition_soc_t *out) {
     }
 
     return xQueuePeek(battery_soc_queue, out, 0) == pdTRUE;
+}
+
+bool precondition_get_charging_power(precondition_charging_power_t *out) {
+    if (out == NULL || charging_power_queue == NULL) {
+        return false;
+    }
+
+    return xQueuePeek(charging_power_queue, out, 0) == pdTRUE;
+}
+
+bool precondition_get_car_power(precondition_power_t *out) {
+    if (out == NULL || car_power_queue == NULL) {
+        return false;
+    }
+
+    return xQueuePeek(car_power_queue, out, 0) == pdTRUE;
 }
 
 bool precondition_get_car_model(egmp_car_model_t *out) {
