@@ -36,6 +36,7 @@
 #include <esp_http_server.h>
 #include "freertos/timers.h"
 #include "esp_err.h"
+#include "esp_timer.h"
 #include <stdio.h>
 #include <string.h>
 #include <sys/unistd.h>
@@ -448,6 +449,114 @@ static esp_err_t index_handler(httpd_req_t *req)
     return (ret == ESP_OK) ? ESP_OK : ESP_FAIL;
 }
 
+// Secrets stay on the device, following the WiCAN v6 rule: reads
+// (/load_config, /check_status) return each secret as "", and a save
+// (/store_config) that sends "" for one keeps the stored value. The one
+// exception is the explicit Settings -> "Show passwords" action: POST
+// /reveal_config returns the stored values and opens a REVEAL_WINDOW_US window
+// during which /load_config returns them too. The BLE passkey is included in
+// all of this. The lists below come from this one table so they cannot drift.
+typedef struct {
+	const char *key;
+	char *field;
+} config_secret_t;
+
+static const config_secret_t CONFIG_SECRETS[] = {
+	{ "sta_pass",        device_config.sta_pass },
+	{ "ap_pass",         device_config.ap_pass },
+	{ "batt_alert_pass", device_config.batt_alert_pass },
+	{ "batt_mqtt_pass",  device_config.batt_mqtt_pass },
+	{ "mqtt_pass",       device_config.mqtt_pass },
+	{ "ble_pass",        device_config.ble_pass },
+};
+
+#define CONFIG_SECRET_COUNT (sizeof(CONFIG_SECRETS) / sizeof(CONFIG_SECRETS[0]))
+
+// How long a "Show passwords" request stays readable. The page counts the same
+// window down; the device owns the deadline so the secrets are redacted again
+// even if the page is closed or the client never sends another request.
+// 30s
+#define REVEAL_WINDOW_US 30000000
+
+static int64_t reveal_until_us = 0;
+
+static bool config_reveal_active(void)
+{
+	return reveal_until_us != 0 && esp_timer_get_time() < reveal_until_us;
+}
+
+// Replace every secret present in obj with "".
+static void config_redact_secrets(cJSON *obj)
+{
+	for (size_t i = 0; i < CONFIG_SECRET_COUNT; i++)
+	{
+		if (cJSON_GetObjectItem(obj, CONFIG_SECRETS[i].key) == NULL)
+		{
+			continue;
+		}
+
+		cJSON *blank = cJSON_CreateString("");
+		if (blank != NULL && !cJSON_ReplaceItemInObject(obj, CONFIG_SECRETS[i].key, blank))
+		{
+			cJSON_Delete(blank);
+		}
+	}
+}
+
+// Put the stored value back for any secret the body sent as "". Returns 0 and
+// sets *out to a newly allocated body when one had to be restored, 1 when the
+// body can be written as received, and -1 when it cannot be parsed or
+// rewritten. On -1 the caller must refuse the save: persisting the empty
+// values would reset the device to its defaults on the next boot.
+static int config_keep_stored_secrets(const char *body, size_t len, char **out)
+{
+	*out = NULL;
+
+	cJSON *incoming = cJSON_ParseWithLength(body, len);
+	if (incoming == NULL)
+	{
+		return -1;
+	}
+
+	bool changed = false;
+	for (size_t i = 0; i < CONFIG_SECRET_COUNT; i++)
+	{
+		cJSON *item = cJSON_GetObjectItem(incoming, CONFIG_SECRETS[i].key);
+		if (!cJSON_IsString(item) || item->valuestring[0] != 0)
+		{
+			continue;
+		}
+
+		const char *stored = CONFIG_SECRETS[i].field;
+		if (stored[0] == 0)
+		{
+			continue; // nothing stored, so an empty value is already correct
+		}
+
+		cJSON *replacement = cJSON_CreateString(stored);
+		if (replacement == NULL ||
+		    !cJSON_ReplaceItemInObject(incoming, CONFIG_SECRETS[i].key, replacement))
+		{
+			cJSON_Delete(replacement);
+			cJSON_Delete(incoming);
+			return -1;
+		}
+		changed = true;
+	}
+
+	if (changed)
+	{
+		*out = cJSON_PrintUnformatted(incoming);
+	}
+
+	cJSON_Delete(incoming);
+
+	if (changed && *out == NULL)
+	{
+		return -1;
+	}
+	return changed ? 0 : 1;
+}
 
 static esp_err_t store_config_handler(httpd_req_t *req)
 {
@@ -465,32 +574,53 @@ static esp_err_t store_config_handler(httpd_req_t *req)
         return ESP_ERR_NO_MEM; // Memory allocation failure
     }
 
-    int ret = httpd_req_recv(req, buf, buf_size);
-
-    if (ret <= 0)
+    // The body can arrive in several pieces; read all of it before writing,
+    // or a partial config gets saved and the device resets to defaults.
+    size_t received = 0;
+    int timeouts = 0;
+    while (received < buf_size)
     {
-        if (ret == HTTPD_SOCK_ERR_TIMEOUT)
+        int ret = httpd_req_recv(req, buf + received, buf_size - received);
+        if (ret == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts < 5)
         {
-            // Retry receiving if timeout occurred
+            continue;
+        }
+        if (ret <= 0)
+        {
             free(buf);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Incomplete configuration");
             return ESP_FAIL;
         }
-        // Handle read error
+        timeouts = 0;
+        received += ret;
+    }
+
+    char *kept = NULL;
+    if (config_keep_stored_secrets(buf, buf_size, &kept) < 0)
+    {
+        // Refuse to write a config whose secrets could not be restored: an
+        // empty sta_pass/ap_pass on disk resets the device on the next boot.
         free(buf);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid configuration");
         return ESP_FAIL;
     }
+    const char *to_write = kept ? kept : buf;
+    size_t to_write_len = kept ? strlen(kept) : buf_size;
 
     FILE *f = fopen(FS_MOUNT_POINT"/config.json", "w");
     if (f)
     {
         // Write the received data into the file
-        fwrite(buf, 1, buf_size, f);
+        fwrite(to_write, 1, to_write_len, f);
         fclose(f);
+        free(kept);
     }
     else
     {
         // Handle file open error
+        free(kept);
         free(buf);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save configuration");
         return ESP_FAIL;
     }
 
@@ -520,32 +650,38 @@ static esp_err_t store_canflt_handler(httpd_req_t *req)
         return ESP_ERR_NO_MEM; // Memory allocation failure
     }
 
-    int ret = httpd_req_recv(req, buf, buf_size);
-
-    if (ret <= 0)
+    // The body can arrive in several pieces; read all of it before writing.
+    size_t received = 0;
+    int timeouts = 0;
+    while (received < buf_size)
     {
-        if (ret == HTTPD_SOCK_ERR_TIMEOUT)
+        int ret = httpd_req_recv(req, buf + received, buf_size - received);
+        if (ret == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts < 5)
         {
-            // Retry receiving if timeout occurred
+            continue;
+        }
+        if (ret <= 0)
+        {
             free(buf);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Incomplete filter list");
             return ESP_FAIL;
         }
-        // Handle read error
-        free(buf);
-        return ESP_FAIL;
+        timeouts = 0;
+        received += ret;
     }
 
     FILE *f = fopen(FS_MOUNT_POINT"/mqtt_canfilt.json", "w");
     if (f)
     {
         // Write the received data into the file
-        fwrite(buf, 1, buf_size, f);
+        fwrite(buf, 1, received, f);
         fclose(f);
     }
     else
     {
         // Handle file open error
         free(buf);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save filter list");
         return ESP_FAIL;
     }
 
@@ -702,15 +838,71 @@ static esp_err_t load_pid_auto_config_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// Serialise the stored config for a read, with the secrets either blanked or
+// left in. Returns NULL when the file cannot be parsed or printed; the caller
+// must not fall back to the raw file, which still holds the real passwords.
+static char *config_json(bool redact)
+{
+	cJSON *cfg = device_config_file ? cJSON_Parse(device_config_file) : NULL;
+	if (cfg == NULL)
+	{
+		return NULL;
+	}
+
+	if (redact)
+	{
+		config_redact_secrets(cfg);
+	}
+
+	char *out = cJSON_PrintUnformatted(cfg);
+	cJSON_Delete(cfg);
+	return out;
+}
+
 static esp_err_t load_config_handler(httpd_req_t *req)
 {
-    const char* resp_str = (const char*)device_config_file;
 	httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, (const char*)resp_str, HTTPD_RESP_USE_STRLEN);
-    ESP_LOGI(TAG, "device_config_file: %s", device_config_file);
+	// The body changes when a reveal window opens or closes.
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+	char *body = config_json(!config_reveal_active());
+	if (body == NULL)
+	{
+		ESP_LOGE(TAG, "Failed to parse " FS_MOUNT_POINT "/config.json; refusing to serve it");
+		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "config unavailable");
+		return ESP_FAIL;
+	}
+
+	httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+	free(body);
 	UBaseType_t stack_high_watermark = uxTaskGetStackHighWaterMark(NULL);
 	ESP_LOGI(TAG, "Task stack high watermark: %u words", stack_high_watermark);
     return ESP_OK;
+}
+
+// Settings -> "Show passwords". Hands out the stored secrets and opens the
+// window /load_config reads them through, so a page that reloads during the
+// reveal stays consistent. The window is armed only after the config
+// serialises, so a broken config cannot leave the device unredacted.
+static esp_err_t reveal_config_handler(httpd_req_t *req)
+{
+	httpd_resp_set_type(req, "application/json");
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+	char *body = config_json(false);
+	if (body == NULL)
+	{
+		ESP_LOGE(TAG, "Failed to parse " FS_MOUNT_POINT "/config.json; refusing to reveal it");
+		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "config unavailable");
+		return ESP_FAIL;
+	}
+
+	reveal_until_us = esp_timer_get_time() + REVEAL_WINDOW_US;
+	ESP_LOGW(TAG, "Secrets revealed for %d seconds", REVEAL_WINDOW_US / 1000000);
+
+	httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+	free(body);
+	return ESP_OK;
 }
 
 static esp_err_t load_car_config_handler(httpd_req_t *req)
@@ -1179,6 +1371,10 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 		cJSON_AddNumberToObject(root, "timestamp", (double)now);
 	}
 
+	// Blanked even when the caller passed remove_sensitive_info=false: that
+	// flag still hides the SSIDs and URLs, but passwords never leave the
+	// device.
+	config_redact_secrets(root);
 	char *resp_str = cJSON_PrintUnformatted(root);
 	cJSON_Delete(root);
 	return resp_str;
@@ -1856,6 +2052,12 @@ static const httpd_uri_t load_config_uri = {
      * context to demonstrate it's usage */
     .user_ctx  = NULL
 };
+static const httpd_uri_t reveal_config_uri = {
+    .uri       = "/reveal_config",
+    .method    = HTTP_POST,
+    .handler   = reveal_config_handler,
+    .user_ctx  = NULL
+};
 static const httpd_uri_t logo_uri = {
     .uri       = "/logo.svg",
     .method    = HTTP_GET,
@@ -1974,7 +2176,6 @@ static void config_server_load_cfg(char *cfg)
 		goto config_error;
 	}
 	strcpy(device_config.sta_pass, key->valuestring);
-	ESP_LOGI(TAG, "device_config.sta_pass: %s", device_config.sta_pass);
 
 	key = cJSON_GetObjectItem(root,"can_datarate");
 	if(key == 0)
@@ -2019,7 +2220,6 @@ static void config_server_load_cfg(char *cfg)
 		goto config_error;
 	}
 	strcpy(device_config.ap_pass, key->valuestring);
-	ESP_LOGE(TAG, "device_config.ap_pass: %s", device_config.ap_pass);
 
 	key = cJSON_GetObjectItem(root,"protocol");
 	if(key == 0)
@@ -2043,7 +2243,6 @@ static void config_server_load_cfg(char *cfg)
 		goto config_error;
 	}
 	strcpy(device_config.ble_pass, key->valuestring);
-	ESP_LOGE(TAG, "device_config.ble_pass: %s", device_config.ble_pass);
 
 	key = cJSON_GetObjectItem(root,"sleep_status");
 	if(key == 0)
@@ -2102,7 +2301,6 @@ static void config_server_load_cfg(char *cfg)
 	}
 
 	strcpy(device_config.batt_alert_pass, key->valuestring);
-	ESP_LOGE(TAG, "device_config.batt_alert_pass: %s", device_config.batt_alert_pass);
 	//*****
 
 	//*****
@@ -2179,7 +2377,6 @@ static void config_server_load_cfg(char *cfg)
 	}
 
 	strcpy(device_config.batt_mqtt_pass, key->valuestring);
-	ESP_LOGE(TAG, "device_config.batt_mqtt_pass: %s", device_config.batt_mqtt_pass);
 	//*****
 
 	//*****
@@ -2247,7 +2444,6 @@ static void config_server_load_cfg(char *cfg)
 	}
 
 	strcpy(device_config.mqtt_pass, key->valuestring);
-	ESP_LOGE(TAG, "device_config.mqtt_pass: %s", device_config.mqtt_pass);
 	//*****
 
 	//*****
@@ -2675,7 +2871,6 @@ static httpd_handle_t config_server_init(void)
 		fread(device_config_file, sizeof(char), filesize, f);
 		device_config_file[filesize] = 0;
 		fseek(f, 0, SEEK_SET);
-		ESP_LOGI(TAG, "config.json: %s", device_config_file);
 		config_server_load_cfg(device_config_file);
 		
 		FILE* f1 = fopen(FS_MOUNT_POINT"/mqtt_canfilt.json", "r");
@@ -2732,6 +2927,7 @@ static httpd_handle_t config_server_init(void)
         httpd_register_uri_handler(server, &store_config_uri);
         httpd_register_uri_handler(server, &check_status_uri);
         httpd_register_uri_handler(server, &load_config_uri);
+        httpd_register_uri_handler(server, &reveal_config_uri);
         httpd_register_uri_handler(server, &logo_uri);
         httpd_register_uri_handler(server, &ws);
         httpd_register_uri_handler(server, &file_upload);
@@ -2773,6 +2969,7 @@ void config_server_restart(void)
         httpd_register_uri_handler(server, &store_config_uri);
         httpd_register_uri_handler(server, &check_status_uri);
         httpd_register_uri_handler(server, &load_config_uri);
+        httpd_register_uri_handler(server, &reveal_config_uri);
         httpd_register_uri_handler(server, &logo_uri);
         httpd_register_uri_handler(server, &ws);
         httpd_register_uri_handler(server, &file_upload);
@@ -3211,16 +3408,22 @@ void config_server_set_ble_config(uint8_t b)
 	{
 		cJSON_SetValuestring(cJSON_GetObjectItem(root,"ble_status"), "disable");
 	}
-	const char *resp_str = cJSON_Print(root);
-	ESP_LOGI(TAG, "resp_str:%s", resp_str);
-	FILE* f = fopen(FS_MOUNT_POINT"/config.json", "w");
-	if (f != NULL)
+	// Don't log the config: it holds every stored password.
+	char *resp_str = cJSON_Print(root);
+	if (resp_str != NULL)
 	{
-		fprintf(f, resp_str);
-		fclose(f);
+		// Only touch the file once the config printed: opening it first would
+		// truncate config.json when the print fails.
+		FILE* f = fopen(FS_MOUNT_POINT"/config.json", "w");
+		if (f != NULL)
+		{
+			// fputs, not fprintf: a "%" in a password must not be read as a format.
+			fputs(resp_str, f);
+			fclose(f);
+		}
+		free(resp_str);
 	}
 	xTimerStart( xrestartTimer, 0 );
-	free((void *)resp_str);
     cJSON_Delete(root);
 }
 

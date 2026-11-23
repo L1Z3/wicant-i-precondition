@@ -608,6 +608,11 @@
         </div>
 
         <div id="wifi_settings" class="tabcontent">
+            <div class="webhook-stats-bottom" style="margin-bottom: 1rem;">
+                <input id="show_passwords_button" name="show_passwords_button" type="button"
+                       onclick="revealPasswords()" value="Show passwords for 30 s" class="system-button" />
+                <span id="show_passwords_status" class="webhook-meta">Passwords are hidden.</span>
+            </div>
             <form id="configForm" name="configForm" action="/action_page" onchange="submit_enable();">
                 <div class="section-title">AP Config</div>
                 <table class="form-table">
@@ -644,7 +649,7 @@
                     <tr>
                         <td>AP Password:</td>
                         <td>
-                            <input type="text" id="ap_pass_value" name="ap_pass_value" value="Testpass" />
+                            <input type="password" autocomplete="new-password" id="ap_pass_value" name="ap_pass_value" placeholder="unchanged" />
                         </td>
                     </tr>
                     <tr>
@@ -671,7 +676,7 @@
                     <tr>
                         <td>Password:</td>
                         <td>
-                            <input type="text" id="pass_value" name="pass_value" value="TomatoSauce" disabled />
+                            <input type="password" autocomplete="new-password" id="pass_value" name="pass_value" disabled placeholder="unchanged" />
                         </td>
                     </tr>
                     <tr>
@@ -798,7 +803,7 @@
                     <tr>
                         <td>Passkey:</td>
                         <td>
-                            <input type="number" id="ble_pass_value" name="ble_pass_value" value="000000" min="0" max="999999" />
+                            <input type="password" inputmode="numeric" autocomplete="new-password" id="ble_pass_value" name="ble_pass_value" placeholder="unchanged" onchange="blePassChanged()" />
                         </td>
                     </tr>
                     <tr>
@@ -842,7 +847,7 @@
                         </tr>
                         <tr>
                             <td><label for="mqtt_pass"><b>MQTT Pass:</b></label></td>
-                            <td><input type="text" id="mqtt_pass" name="mqtt_pass" value="meatpi" /></td>
+                            <td><input type="password" autocomplete="new-password" id="mqtt_pass" name="mqtt_pass" placeholder="unchanged" /></td>
                         </tr>
                         <tr>
                             <td><label for="keep_alive"><b>Keep Alive:</b></label></td>
@@ -1230,7 +1235,7 @@
                     </tr>
                     <tr>
                         <td><label for="batt_alert_pass"><b>Password:</b></label></td>
-                        <td><input type="text" id="batt_alert_pass" name="batt_alert_pass" value="TomatoSauce" /></td>
+                        <td><input type="password" autocomplete="new-password" id="batt_alert_pass" name="batt_alert_pass" placeholder="unchanged" /></td>
                     </tr>
                     <tr>
                         <td><label for="batt_alert_volt"><b>Alert Voltage:</b></label></td>
@@ -1267,7 +1272,7 @@
                     </tr>
                     <tr>
                         <td><label for="batt_mqttpass"><b>Alert MQTT Pass:</b></label></td>
-                        <td><input type="text" id="batt_mqtt_pass" name="batt_mqtt_pass" value="meatpi" /></td>
+                        <td><input type="password" autocomplete="new-password" id="batt_mqtt_pass" name="batt_mqtt_pass" placeholder="unchanged" /></td>
                     </tr>
                     <tr>
                         <td><label for="batt_alert_topic"><b>Alert Topic:</b></label></td>
@@ -2593,7 +2598,9 @@ function loadAutoTable(jsonData) {
 			document.getElementById("mqtt_en").disabled = false;
 			document.getElementById("batt_alert").disabled = false;
 		}
-		if(document.getElementById("ap_pass_value").value.length < 8 || document.getElementById("ap_pass_value").value.length > 63 || document.getElementById("pass_value").value.length < 8 || document.getElementById("pass_value").value.length > 63) {
+		// The device never sends stored passwords: an empty field keeps the stored one.
+		const badPass = (id) => { const n = document.getElementById(id).value.length; return n != 0 && (n < 8 || n > 63); };
+		if(badPass("ap_pass_value") || badPass("pass_value")) {
             showNotification("AP/Station password len, min=0 max=64", "red");
 			document.getElementById("submit_button").disabled = true;
 		} else if(document.getElementById("ssid_value").value.length < 1 || document.getElementById("ssid_value").value.length > 32) {
@@ -2614,8 +2621,8 @@ function loadAutoTable(jsonData) {
 		} else if(document.getElementById("batt_alert_port").value > 65535 || document.getElementById("batt_alert_port").value < 1) {
             showNotification("Port value, min=1 max=65535", "red");
 			document.getElementById("submit_button").disabled = true;
-		} else if(document.getElementById("ble_pass_value").value.length != 6 || document.getElementById("ble_pass_value").value.charAt(0) == "0") {
-            showNotification("Passkey length, min=6 max=6, 1st number not 0", "red");
+		} else if(document.getElementById("ble_pass_value").value.length != 0 && !/^[1-9][0-9]{5}$/.test(document.getElementById("ble_pass_value").value)) {
+            showNotification("Passkey must be 6 digits and not start with 0 (blank keeps the current one)", "red");
 			document.getElementById("submit_button").disabled = true;
 		} else if(document.getElementById("sleep_volt").value < 12 || document.getElementById("sleep_volt").value > 15) {
             showNotification("Sleep Voltage Value, min=12.0 max=15.0", "red");
@@ -3176,6 +3183,88 @@ function loadAutoTable(jsonData) {
         xhttp.send(JSON.stringify(data));
     }
 
+    // The passkey is redacted from every read, so it leaves the page the moment
+    // it is saved. Settings > "Show passwords" can bring it back for 30 s, which
+    // is why this only nudges instead of demanding the user write it down.
+    function blePassChanged() {
+        if (/^[1-9][0-9]{5}$/.test(document.getElementById("ble_pass_value").value)) {
+            showNotification("BLE passkey set. Settings > \"Show passwords\" can display it again.", "yellow", 8000);
+        }
+    }
+
+    // Settings > "Show passwords". POST /reveal_config returns the stored secrets
+    // and keeps them readable on the device for 30 s; the countdown below mirrors
+    // that window and masks the fields again when it runs out.
+    const REVEAL_SECONDS = 30;
+    const REVEAL_FIELDS = {
+        sta_pass: "pass_value",
+        ap_pass: "ap_pass_value",
+        batt_alert_pass: "batt_alert_pass",
+        batt_mqtt_pass: "batt_mqtt_pass",
+        mqtt_pass: "mqtt_pass",
+        ble_pass: "ble_pass_value"
+    };
+    let revealTimer = null;
+
+    async function revealPasswords() {
+        const button = document.getElementById("show_passwords_button");
+        const status = document.getElementById("show_passwords_status");
+        button.disabled = true;
+        status.textContent = "Requesting passwords...";
+
+        try {
+            const response = await fetch("/reveal_config", { method: "POST" });
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+            const cfg = await response.json();
+
+            for (const [key, id] of Object.entries(REVEAL_FIELDS)) {
+                const field = document.getElementById(id);
+                const value = typeof cfg[key] === "string" ? cfg[key] : "";
+                field.dataset.revealedValue = value;
+                field.value = value;
+                field.type = "text";
+            }
+
+            let remaining = REVEAL_SECONDS;
+            const tick = () => {
+                if (remaining <= 0) {
+                    hidePasswords();
+                    return;
+                }
+                status.textContent = `Passwords visible for ${remaining} s`;
+                remaining--;
+            };
+            clearInterval(revealTimer);
+            revealTimer = setInterval(tick, 1000);
+            tick();
+        } catch (error) {
+            button.disabled = false;
+            status.textContent = "Passwords are hidden.";
+            showNotification(`Could not show passwords: ${error.message}`, "red");
+        }
+    }
+
+    function hidePasswords() {
+        clearInterval(revealTimer);
+        revealTimer = null;
+        for (const id of Object.values(REVEAL_FIELDS)) {
+            const field = document.getElementById(id);
+            // Only clear what is still the value the device revealed; an edit
+            // made during the window belongs to the user.
+            if (field.dataset.revealedValue !== undefined &&
+                field.value === field.dataset.revealedValue) {
+                field.value = "";
+            }
+            delete field.dataset.revealedValue;
+            field.type = "password";
+            field.placeholder = "unchanged";
+        }
+        document.getElementById("show_passwords_status").textContent = "Passwords are hidden.";
+        document.getElementById("show_passwords_button").disabled = false;
+    }
+
     async function downloadCfg() {
         const endpoints = [
             '/load_config',
@@ -3214,7 +3303,17 @@ function loadAutoTable(jsonData) {
             if (Object.keys(combinedData).length === 0) {
                 throw new Error('No data was successfully fetched from any endpoint');
             }
-            
+
+            // A backup never carries passwords, even when it is taken while the
+            // reveal window is open and /load_config is answering unredacted.
+            if (combinedData.config) {
+                for (const key of Object.keys(REVEAL_FIELDS)) {
+                    if (key in combinedData.config) {
+                        combinedData.config[key] = "";
+                    }
+                }
+            }
+
             const dataStr = JSON.stringify(combinedData, null, 2);
             const blob = new Blob([dataStr], { type: 'application/json' });
             const url = window.URL.createObjectURL(blob);
