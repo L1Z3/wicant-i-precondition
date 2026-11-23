@@ -600,6 +600,11 @@
         </div>
 
         <div id="wifi_settings" class="tabcontent">
+            <div class="webhook-stats-bottom" style="margin-bottom: 1rem;">
+                <input id="show_passwords_button" name="show_passwords_button" type="button"
+                       onclick="revealPasswords()" value="Show passwords for 30 s" class="system-button" />
+                <span id="show_passwords_status" class="webhook-meta">Passwords are hidden.</span>
+            </div>
             <form id="configForm" name="configForm" action="/action_page" onchange="submit_enable();">
                 <div class="section-title">AP Config</div>
                 <table class="form-table">
@@ -791,11 +796,6 @@
                         <td>Passkey:</td>
                         <td>
                             <input type="password" inputmode="numeric" autocomplete="new-password" id="ble_pass_value" name="ble_pass_value" placeholder="unchanged" onchange="blePassChanged()" />
-                        </td>
-                    </tr>
-                    <tr>
-                        <td colspan="2" style="font-size:0.7rem; color:#555; margin-top:0.5rem;">
-                            Leave blank to keep the current 6-digit passkey. A new passkey is never shown again, so write it down before saving.
                         </td>
                     </tr>
                     <tr>
@@ -3054,9 +3054,6 @@ function loadAutoTable(jsonData) {
         obj["precon_mode"] = document.getElementById("precon_mode").value;
         obj["precon_button"] = document.getElementById("precon_button").value;
         obj["precon_press"] = document.getElementById("precon_press").value;
-		if(obj["ble_pass"].length > 0 && !confirm("You are changing the BLE passkey. Write it down now: the device will not show it again. Continue?")) {
-			return;
-		}
 		var configJSON = JSON.stringify(obj);
         const storeResult = await storeAutoTableData();
         if (!storeResult) {
@@ -3147,12 +3144,86 @@ function loadAutoTable(jsonData) {
         xhttp.send(JSON.stringify(data));
     }
 
-    // The device never sends the stored passkey back, so a new one is gone from
-    // the page the moment it is saved. Warn while the user can still write it down.
+    // The passkey is redacted from every read, so it leaves the page the moment
+    // it is saved. Settings > "Show passwords" can bring it back for 30 s, which
+    // is why this only nudges instead of demanding the user write it down.
     function blePassChanged() {
         if (/^[1-9][0-9]{5}$/.test(document.getElementById("ble_pass_value").value)) {
-            showNotification("Write down your new BLE passkey now: the device will not show it again.", "yellow", 8000);
+            showNotification("BLE passkey set. Settings > \"Show passwords\" can display it again.", "yellow", 8000);
         }
+    }
+
+    // Settings > "Show passwords". POST /reveal_config returns the stored secrets
+    // and keeps them readable on the device for 30 s; the countdown below mirrors
+    // that window and masks the fields again when it runs out.
+    const REVEAL_SECONDS = 30;
+    const REVEAL_FIELDS = {
+        sta_pass: "pass_value",
+        ap_pass: "ap_pass_value",
+        batt_alert_pass: "batt_alert_pass",
+        batt_mqtt_pass: "batt_mqtt_pass",
+        mqtt_pass: "mqtt_pass",
+        ble_pass: "ble_pass_value"
+    };
+    let revealTimer = null;
+
+    async function revealPasswords() {
+        const button = document.getElementById("show_passwords_button");
+        const status = document.getElementById("show_passwords_status");
+        button.disabled = true;
+        status.textContent = "Requesting passwords...";
+
+        try {
+            const response = await fetch("/reveal_config", { method: "POST" });
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+            const cfg = await response.json();
+
+            for (const [key, id] of Object.entries(REVEAL_FIELDS)) {
+                const field = document.getElementById(id);
+                const value = typeof cfg[key] === "string" ? cfg[key] : "";
+                field.dataset.revealedValue = value;
+                field.value = value;
+                field.type = "text";
+            }
+
+            let remaining = REVEAL_SECONDS;
+            const tick = () => {
+                if (remaining <= 0) {
+                    hidePasswords();
+                    return;
+                }
+                status.textContent = `Passwords visible for ${remaining} s`;
+                remaining--;
+            };
+            clearInterval(revealTimer);
+            revealTimer = setInterval(tick, 1000);
+            tick();
+        } catch (error) {
+            button.disabled = false;
+            status.textContent = "Passwords are hidden.";
+            showNotification(`Could not show passwords: ${error.message}`, "red");
+        }
+    }
+
+    function hidePasswords() {
+        clearInterval(revealTimer);
+        revealTimer = null;
+        for (const id of Object.values(REVEAL_FIELDS)) {
+            const field = document.getElementById(id);
+            // Only clear what is still the value the device revealed; an edit
+            // made during the window belongs to the user.
+            if (field.dataset.revealedValue !== undefined &&
+                field.value === field.dataset.revealedValue) {
+                field.value = "";
+            }
+            delete field.dataset.revealedValue;
+            field.type = "password";
+            field.placeholder = "unchanged";
+        }
+        document.getElementById("show_passwords_status").textContent = "Passwords are hidden.";
+        document.getElementById("show_passwords_button").disabled = false;
     }
 
     async function downloadCfg() {
@@ -3193,7 +3264,17 @@ function loadAutoTable(jsonData) {
             if (Object.keys(combinedData).length === 0) {
                 throw new Error('No data was successfully fetched from any endpoint');
             }
-            
+
+            // A backup never carries passwords, even when it is taken while the
+            // reveal window is open and /load_config is answering unredacted.
+            if (combinedData.config) {
+                for (const key of Object.keys(REVEAL_FIELDS)) {
+                    if (key in combinedData.config) {
+                        combinedData.config[key] = "";
+                    }
+                }
+            }
+
             const dataStr = JSON.stringify(combinedData, null, 2);
             const blob = new Blob([dataStr], { type: 'application/json' });
             const url = window.URL.createObjectURL(blob);
