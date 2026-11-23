@@ -892,9 +892,10 @@ static void run_conditioning_mode_check(void) {
     check_conditioning_mode_burst_msgs(0);
     expect_state("wait-conditioning-mode");
     conditioning_mode(0x80);                    // car confirms the enable
-    tick1();                                    // no frame: routes to the start burst
+    advance_us(2900000);                        // ...but it has to settle (~3 s)
     CHECK(sent_count == (int)CONDITIONING_MODE_TICKS);
-    expect_state("start-burst");
+    expect_state("wait-conditioning-mode");
+    advance_until_state("start-burst", 300000);  // settle over: routes to the start burst
     for (int i = 0; i < (int)PRECONDITION_START_TICKS; i++) tick1();
     CHECK(sent_count == (int)(CONDITIONING_MODE_TICKS + PRECONDITION_START_TICKS));
     check_start_burst_msgs((int)CONDITIONING_MODE_TICKS);
@@ -919,7 +920,8 @@ static void run_conditioning_mode_check(void) {
     CHECK(sent_count == (int)CONDITIONING_MODE_TICKS);
     check_conditioning_mode_burst_msgs(0);
     expect_state("wait-conditioning-mode");
-    tick1();                                    // confirmation already reported: routes to the start burst
+    // the confirmation was already reported: only the settle is left
+    advance_until_state("start-burst", CONDITIONING_MODE_SETTLE_US + 80000);
     for (int i = 0; i < (int)PRECONDITION_START_TICKS; i++) tick1();
     CHECK(sent_count == (int)(CONDITIONING_MODE_TICKS + PRECONDITION_START_TICKS));
     check_start_burst_msgs((int)CONDITIONING_MODE_TICKS);
@@ -993,7 +995,7 @@ static void run_conditioning_mode_blocker(void) {
     check_conditioning_mode_burst_msgs(0);
     expect_state("wait-conditioning-mode");
     conditioning_mode(0x80);                    // car confirms the enable
-    tick1();                                    // no frame: routes to the start burst
+    advance_until_state("start-burst", CONDITIONING_MODE_SETTLE_US + 80000);
     for (int i = 0; i < (int)PRECONDITION_START_TICKS; i++) tick1();
     CHECK(sent_count == (int)(CONDITIONING_MODE_TICKS + PRECONDITION_START_TICKS));
     check_start_burst_msgs((int)CONDITIONING_MODE_TICKS);
@@ -1054,7 +1056,7 @@ static void run_conditioning_mode_blocker_repeating(void) {
     for (int i = 0; i < (int)CONDITIONING_MODE_TICKS; i++) tick1();
     expect_state("wait-conditioning-mode");
     conditioning_mode(0x80);                    // car confirms the enable
-    tick1();                                    // no frame: routes to the start burst
+    advance_until_state("start-burst", CONDITIONING_MODE_SETTLE_US + 80000);
     for (int i = 0; i < (int)PRECONDITION_START_TICKS; i++) tick1();
     car_status(0x15, CAN_BUS_0);
     expect_state("active");
