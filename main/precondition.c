@@ -1475,7 +1475,6 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
         // enough to decode, so leave the last published value alone.
         if (to_push->data_length_code >= 2U) {
             precondition_power_t power = {
-                .raw = ((uint16_t)to_push->data[0] << 8) | to_push->data[1],
                 .plugged_in = POWER_STATUS_CHARGING_OR_WAKE(to_push->data[0])
                               && POWER_STATUS_PLUGGED_IN(to_push->data[1]),
                 .updated_at_us = sm_now(sm),

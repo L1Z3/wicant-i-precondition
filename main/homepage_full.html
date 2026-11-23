@@ -2733,10 +2733,7 @@ function loadAutoTable(jsonData) {
 				document.getElementById("port_type_status").innerHTML = "UDP";
 			}
 			if (obj.car_power_valid) {
-				// both bytes as one word (0x068D) so unrecognised states can be
-				// reported without implying byte 1 is a separate status
-				const raw = Number(obj.car_power_raw).toString(16).toUpperCase().padStart(4, "0");
-				document.getElementById("plugged_in_status").textContent = `${obj.plugged_in ? "Yes" : "No"} (0x${raw}); (${formatAge(obj.car_power_age_ms)} ago)`;
+				document.getElementById("plugged_in_status").textContent = `${obj.plugged_in ? "Yes" : "No"}; (${formatAge(obj.car_power_age_ms)} ago)`;
 			} else {
 				document.getElementById("plugged_in_status").textContent = "Waiting for CAN data";
 			}

@@ -1136,7 +1136,6 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	if (precondition_get_car_power(&car_power)) {
         cJSON_AddBoolToObject(root, "car_power_valid", true);
         cJSON_AddBoolToObject(root, "plugged_in", car_power.plugged_in);
-        cJSON_AddNumberToObject(root, "car_power_raw", car_power.raw);
         cJSON_AddNumberToObject(
             root,
             "car_power_age_ms",

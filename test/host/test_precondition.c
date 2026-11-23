@@ -737,7 +737,7 @@ static void run_car_power_state(void) {
     fake_now = 123456;
     rx_frame(0x038, d, CAN_BUS_0);
     CHECK(precondition_get_car_power(&power));
-    CHECK(power.raw == 0x068D && power.plugged_in);
+    CHECK(power.plugged_in);
     CHECK(power.updated_at_us == fake_now);
     CHECK(!car_in_ready());
 
@@ -746,21 +746,21 @@ static void run_car_power_state(void) {
     d[1] = 0xAB;
     rx_frame(0x038, d, CAN_BUS_0);
     CHECK(precondition_get_car_power(&power));
-    CHECK(power.raw == 0x06AB && !power.plugged_in);
+    CHECK(!power.plugged_in);
 
     // ON but not READY, unplugged
     d[0] = 0x02;
     d[1] = 0x00;
     rx_frame(0x038, d, CAN_BUS_0);
     CHECK(precondition_get_car_power(&power));
-    CHECK(power.raw == 0x0200 && !power.plugged_in);
+    CHECK(!power.plugged_in);
 
     // READY reads 0x04, and a repeated frame still refreshes the age
     car_power(true);
     fake_now += 1000;
     car_power(true);
     CHECK(precondition_get_car_power(&power));
-    CHECK(power.raw == 0x0400 && !power.plugged_in);
+    CHECK(!power.plugged_in);
     CHECK(power.updated_at_us == fake_now);
 
     // The decode only accepts 0x8D together with byte 0's 0x06, so a READY
@@ -769,15 +769,15 @@ static void run_car_power_state(void) {
     d[1] = 0x8D;
     rx_frame(0x038, d, CAN_BUS_0);
     CHECK(precondition_get_car_power(&power));
-    CHECK(power.raw == 0x048D && !power.plugged_in);
+    CHECK(!power.plugged_in);
 
     // the Ioniq 6 identifier decodes the same way
     ioniq6_power(0x06, 0x8D, CAN_BUS_0);
     CHECK(precondition_get_car_power(&power));
-    CHECK(power.raw == 0x068D && power.plugged_in);
+    CHECK(power.plugged_in);
     ioniq6_power(0x06, 0xAB, CAN_BUS_0);
     CHECK(precondition_get_car_power(&power));
-    CHECK(power.raw == 0x06AB && !power.plugged_in);
+    CHECK(!power.plugged_in);
 }
 
 // Charging power is published from either identifier, car-side only, and a
