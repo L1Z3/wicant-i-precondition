@@ -234,6 +234,13 @@ static bool is_utility_request(const twai_message_t *frame) {
 #define CONDITIONING_MODE_PHASE1_TICKS 3U // F007 message
 #define CONDITIONING_MODE_PHASE2_TICKS 3U // E007 message
 #define CONDITIONING_MODE_TICKS (CONDITIONING_MODE_PHASE1_TICKS + CONDITIONING_MODE_PHASE2_TICKS)
+// How long the start burst waits for the car to report the mode enabled (0x25D
+// is a ~200 ms broadcast). Falls back to the start command if it never does.
+#define CONDITIONING_MODE_CONFIRM_TIMEOUT_US 2000000U  // 2 seconds
+// The car flips the mode within a frame period of the enable burst, but it keeps
+// refusing start commands for a while after that transaction. Its own processing
+// is what has to finish, so the start sequence waits this long past the report.
+#define CONDITIONING_MODE_SETTLE_US 3000000LL  // 3 seconds
 
 #define IS_CONDITIONING_MODE_FRAME(frame_id) \
     ((frame_id) == CONDITIONING_MODE_FRAME_ID || (frame_id) == CONDITIONING_MODE_FRAME_ID_IONIQ6)
@@ -281,7 +288,8 @@ static int64_t started_timeout_us(void) {
 // IDLE                       Preconditioning is not requested.
 // REQUESTED                  Owns an enabled session and prevents the car from cancelling it.
 // +- CAR_START_DELAY         Waits briefly after READY before a persistent-mode relaunch.
-// +- START_BURST (initial)   Sends the start command sequence.
+// +- START_BURST (initial)   Enables conditioning mode if needed, then the start sequence.
+// +- WAIT_CONDITIONING_MODE  Waits for the car to report conditioning mode on, then for it to settle.
 // +- WAIT_STARTING           Waits for the car to begin starting.
 // +- WAIT_STARTED            Waits for preconditioning to become fully active.
 // +- ACTIVE                  Monitors active preconditioning in every mode.
@@ -305,8 +313,8 @@ enum {
 };
 
 static const sm_state_t S_IDLE, S_REQUESTED, S_CAR_START_DELAY, S_START_BURST,
-                        S_WAIT_STARTING, S_WAIT_STARTED, S_ACTIVE, S_MANAGED,
-                        S_STOPPING, S_STOP_BURST, S_WAIT_STOPPED;
+                        S_WAIT_CONDITIONING_MODE, S_WAIT_STARTING, S_WAIT_STARTED, S_ACTIVE,
+                        S_MANAGED, S_STOPPING, S_STOP_BURST, S_WAIT_STOPPED;
 
 static sm_t precon_sm;
 
@@ -407,6 +415,13 @@ static struct {
     // start command? latched on entry to START_BURST so the car's own reply to
     // the enable burst cannot cut that burst short
     bool conditioning_mode_first;
+    // the enable burst already went out for this start command: the
+    // confirmation wait timed out, so the follow-up start burst must send the
+    // start sequence instead of repeating the enable (which would loop)
+    bool mode_enable_already_sent;
+    // timestamp of the first report that the car latched conditioning mode on
+    // (zero until it arrives); the settle countdown measures from here
+    int64_t mode_confirmed_ts;
 } requested;
 
 // owned by MANAGED: scheduling for periodic start bursts while a repeating
@@ -826,6 +841,11 @@ static fwd_result_t starting_display_fwd(sm_t *sm, twai_message_t *to_send, can_
     if (requested.kind == ATTEMPT_PERIODIC || requested.kind == ATTEMPT_BMU_RESTART) {
         return FWD_PASSTHROUGH;
     }
+    // the countdown belongs to the start command; don't paint it while the mode
+    // is still being enabled
+    if (requested.conditioning_mode_first) {
+        return FWD_PASSTHROUGH;
+    }
     // the display only runs until the car confirms preconditioning fully
     // started, which can happen mid-burst, before we route to ACTIVE
     if (platform.precon_status == PRECON_STATUS_STARTED) {
@@ -1071,11 +1091,24 @@ static bool abort_start_if_blocked(sm_t *sm) {
 
 // retry timers and the countdown display measure from the moment the burst began
 static void start_burst_enter(sm_t *sm) {
-    requested.last_attempt_ts = sm_now(sm);
+    // The enable burst is sent once per start command: WAIT_CONDITIONING_MODE
+    // sets this when it gave up waiting, so the follow-up burst goes straight to
+    // the start sequence instead of enabling the mode again.
+    bool mode_enable_sent = requested.mode_enable_already_sent;
+    requested.mode_enable_already_sent = false;
     // Latch the conditioning-mode check for the whole burst: the car's reply to
     // our own enable command flips 0x25D within one frame period, and that must
     // not truncate the burst still in flight.
-    requested.conditioning_mode_first = conditioning_mode_enable_needed();
+    requested.conditioning_mode_first = !mode_enable_sent && conditioning_mode_enable_needed();
+    if (requested.conditioning_mode_first) {
+        // an earlier attempt's report must not shorten this attempt's settle
+        requested.mode_confirmed_ts = 0;
+    } else {
+        // Only the start sequence itself starts the retry and countdown clocks:
+        // an attempt that has to enable the mode first must not spend that time
+        // out of its retry budget.
+        requested.last_attempt_ts = sm_now(sm);
+    }
     abort_start_if_blocked(sm);
 }
 
@@ -1088,11 +1121,14 @@ static void start_burst_tick(sm_t *sm) {
     // preconditioning; the enable burst keeps the check's pace, one frame per
     // tick
     if (requested.conditioning_mode_first) {
-        if (t < CONDITIONING_MODE_TICKS) {
-            send_conditioning_mode_enable_msg(t);
-            return;
+        send_conditioning_mode_enable_msg(t);
+        // The car refuses the start command while its latched mode still reads
+        // off, so the start sequence has to wait for it to confirm (it reports
+        // the new state a frame period or two after the burst).
+        if (t + 1U >= CONDITIONING_MODE_TICKS) {
+            sm_transition(sm, &S_WAIT_CONDITIONING_MODE);
         }
-        t -= CONDITIONING_MODE_TICKS;
+        return;
     }
     send_precondition_start_msg(t);
     // Status events deliberately do not cut the burst short. After all start
@@ -1109,6 +1145,44 @@ static void start_burst_tick(sm_t *sm) {
                 sm_transition(sm, &S_WAIT_STARTING);
                 break;
         }
+    }
+}
+
+// ********************* REQUESTED / WAIT_CONDITIONING_MODE *********************
+
+// The enable burst asks the car to latch conditioning mode on; it reports the
+// result on 0x25D, and a start command that arrives while the latch still reads
+// off is refused. So the start sequence only goes out once the report agrees.
+// Without this separation the start burst raced the confirmation and the
+// attempt cost a full 10 s retry interval before the car accepted it.
+//
+// The report alone is not enough: the car still refuses a start command sent
+// right after the enable transaction, so the start sequence waits a settle
+// period past the report. Waiting only for the report left the first attempt
+// refused and cost the full retry interval anyway.
+//
+// The timeout is a safety valve: if the car never reports (no 0x25D on this
+// platform, or the enable was ignored), fall back to the start command anyway.
+// The burst's entry flag keeps that fallback from repeating the enable, which
+// would otherwise loop on the enable forever and never send a start frame.
+static void wait_conditioning_mode_tick(sm_t *sm) {
+    if (abort_start_if_blocked(sm)) {
+        return;
+    }
+    if (!conditioning_mode_enable_needed()) {
+        // confirmed: start the settle countdown on the first report seen here
+        if (requested.mode_confirmed_ts == 0) {
+            requested.mode_confirmed_ts = sm_now(sm);
+        }
+        if (ts_elapsed(sm_now(sm), requested.mode_confirmed_ts) < CONDITIONING_MODE_SETTLE_US) {
+            return;
+        }
+        // settled: this entry sees the mode already on, so it sends a bare start
+        // burst
+        sm_transition(sm, &S_START_BURST);
+    } else if (sm_time_in_us(sm, &S_WAIT_CONDITIONING_MODE) >= CONDITIONING_MODE_CONFIRM_TIMEOUT_US) {
+        requested.mode_enable_already_sent = true;
+        sm_transition(sm, &S_START_BURST);
     }
 }
 
@@ -1375,6 +1449,13 @@ static const sm_state_t S_START_BURST = {
     .parent = &S_REQUESTED,
     .enter = start_burst_enter,
     .tick = start_burst_tick,
+    .fwd = starting_display_fwd,
+};
+
+static const sm_state_t S_WAIT_CONDITIONING_MODE = {
+    .name = "wait-conditioning-mode",
+    .parent = &S_REQUESTED,
+    .tick = wait_conditioning_mode_tick,
     .fwd = starting_display_fwd,
 };
 
