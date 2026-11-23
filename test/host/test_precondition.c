@@ -882,14 +882,19 @@ static void run_conditioning_mode_check(void) {
     CHECK(platform.conditioning_mode == CONDITIONING_MODE_DISABLED);
     platform.conditioning_mode = CONDITIONING_MODE_UNKNOWN;  // back to the unknown case
 
-    // Unknown means "not confirmed enabled": the enable burst goes out first
-    // anyway, then the normal start burst.
+    // Unknown means "not confirmed enabled": the enable burst goes out first,
+    // and the start command waits for the car's report before leaving.
     sent_count = 0;
     toggle();
     expect_state("start-burst");
     for (int i = 0; i < (int)CONDITIONING_MODE_TICKS; i++) tick1();
     CHECK(sent_count == (int)CONDITIONING_MODE_TICKS);
     check_conditioning_mode_burst_msgs(0);
+    expect_state("wait-conditioning-mode");
+    conditioning_mode(0x80);                    // car confirms the enable
+    tick1();                                    // no frame: routes to the start burst
+    CHECK(sent_count == (int)CONDITIONING_MODE_TICKS);
+    expect_state("start-burst");
     for (int i = 0; i < (int)PRECONDITION_START_TICKS; i++) tick1();
     CHECK(sent_count == (int)(CONDITIONING_MODE_TICKS + PRECONDITION_START_TICKS));
     check_start_burst_msgs((int)CONDITIONING_MODE_TICKS);
@@ -913,6 +918,8 @@ static void run_conditioning_mode_check(void) {
     for (int i = 0; i < (int)CONDITIONING_MODE_PHASE2_TICKS; i++) tick1();
     CHECK(sent_count == (int)CONDITIONING_MODE_TICKS);
     check_conditioning_mode_burst_msgs(0);
+    expect_state("wait-conditioning-mode");
+    tick1();                                    // confirmation already reported: routes to the start burst
     for (int i = 0; i < (int)PRECONDITION_START_TICKS; i++) tick1();
     CHECK(sent_count == (int)(CONDITIONING_MODE_TICKS + PRECONDITION_START_TICKS));
     check_start_burst_msgs((int)CONDITIONING_MODE_TICKS);
@@ -974,7 +981,8 @@ static void run_conditioning_mode_blocker(void) {
     CHECK(precon_blockers == PRECONDITION_BLOCK_NONE);
 
     // A start attempt with the mode off still runs, enable phase first: the
-    // blocker must not make its own fix unreachable.
+    // blocker must not make its own fix unreachable. The start command then
+    // waits for the car to report the mode on.
     conditioning_mode(0x40);
     CHECK(precon_blockers == PRECONDITION_BLOCK_CONDITIONING_MODE_OFF);
     sent_count = 0;
@@ -983,20 +991,33 @@ static void run_conditioning_mode_blocker(void) {
     for (int i = 0; i < (int)CONDITIONING_MODE_TICKS; i++) tick1();
     CHECK(sent_count == (int)CONDITIONING_MODE_TICKS);
     check_conditioning_mode_burst_msgs(0);
+    expect_state("wait-conditioning-mode");
+    conditioning_mode(0x80);                    // car confirms the enable
+    tick1();                                    // no frame: routes to the start burst
     for (int i = 0; i < (int)PRECONDITION_START_TICKS; i++) tick1();
     CHECK(sent_count == (int)(CONDITIONING_MODE_TICKS + PRECONDITION_START_TICKS));
     check_start_burst_msgs((int)CONDITIONING_MODE_TICKS);
     expect_state("wait-starting");
 
-    // Nor does it stop the retries, which are how the enable gets retried. When
-    // they run out the mode is what gets named, not the retry budget.
+    // Nor does it stop the retries, which are how the enable gets retried. A car
+    // that never reports the mode cannot hold the start command back for good:
+    // after the confirmation timeout the burst sends the start sequence instead
+    // of looping on the enable. When the retries run out the mode is what gets
+    // named, not the retry budget.
     car_status(0x01, CAN_BUS_0);                // status frames arm the retry path
+    conditioning_mode(0x40);                    // the enable never takes
     for (int r = 1; r <= 4; r++) {
         advance_until_state("start-burst", 11000000);
         CHECK(requested.retries == r);
-        for (int i = 0; i < (int)(CONDITIONING_MODE_TICKS + PRECONDITION_START_TICKS); i++) {
-            tick1();
-        }
+        sent_count = 0;
+        for (int i = 0; i < (int)CONDITIONING_MODE_TICKS; i++) tick1();
+        CHECK(sent_count == (int)CONDITIONING_MODE_TICKS);
+        check_conditioning_mode_burst_msgs(0);
+        expect_state("wait-conditioning-mode");
+        advance_until_state("start-burst", (int64_t)CONDITIONING_MODE_CONFIRM_TIMEOUT_US + 80000);
+        for (int i = 0; i < (int)PRECONDITION_START_TICKS; i++) tick1();
+        CHECK(sent_count == (int)(CONDITIONING_MODE_TICKS + PRECONDITION_START_TICKS));
+        check_start_burst_msgs((int)CONDITIONING_MODE_TICKS);
         expect_state("wait-starting");
     }
     advance_until_state("stop-burst", 11000000);
@@ -1030,9 +1051,11 @@ static void run_conditioning_mode_blocker_repeating(void) {
     platform.conditioning_mode = CONDITIONING_MODE_UNKNOWN;
     car_power(true);
     toggle();
-    for (int i = 0; i < (int)(CONDITIONING_MODE_TICKS + PRECONDITION_START_TICKS); i++) {
-        tick1();
-    }
+    for (int i = 0; i < (int)CONDITIONING_MODE_TICKS; i++) tick1();
+    expect_state("wait-conditioning-mode");
+    conditioning_mode(0x80);                    // car confirms the enable
+    tick1();                                    // no frame: routes to the start burst
+    for (int i = 0; i < (int)PRECONDITION_START_TICKS; i++) tick1();
     car_status(0x15, CAN_BUS_0);
     expect_state("active");
     car_status(0x01, CAN_BUS_0);
@@ -1043,11 +1066,12 @@ static void run_conditioning_mode_blocker_repeating(void) {
     sent_count = 0;
     advance_until_state("start-burst", 302000000LL);
     CHECK(requested.kind == ATTEMPT_PERIODIC);
-    for (int i = 0; i < (int)(CONDITIONING_MODE_TICKS + PRECONDITION_START_TICKS); i++) {
-        tick1();
-    }
-    CHECK(sent_count == (int)(CONDITIONING_MODE_TICKS + PRECONDITION_START_TICKS));
+    for (int i = 0; i < (int)CONDITIONING_MODE_TICKS; i++) tick1();
     check_conditioning_mode_burst_msgs(0);
+    expect_state("wait-conditioning-mode");
+    advance_until_state("start-burst", (int64_t)CONDITIONING_MODE_CONFIRM_TIMEOUT_US + 80000);
+    for (int i = 0; i < (int)PRECONDITION_START_TICKS; i++) tick1();
+    CHECK(sent_count == (int)(CONDITIONING_MODE_TICKS + PRECONDITION_START_TICKS));
     check_start_burst_msgs((int)CONDITIONING_MODE_TICKS);
 }
 
