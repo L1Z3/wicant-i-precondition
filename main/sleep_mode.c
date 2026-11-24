@@ -59,6 +59,7 @@
 #include "math.h"
 #include "dev_status.h"
 #include "precondition.h"
+#include "sleep_policy.h"
 
 #define TAG 			  __func__
 
@@ -80,6 +81,12 @@ static adc_channel_t car_on_sense_adc_ch = V_CAR_ON_ADC_CHANNEL;
 static EventGroupHandle_t s_mqtt_event_group = NULL;
 static float sleep_voltage = 13.1f;
 static uint8_t enable_sleep = 0;
+// Sleep follows the buses instead of the battery: MITM forwarding on the
+// EB-FD, whose buses can both wake it (see sleep_policy_decide())
+static bool bus_sleep = false;
+// sleep_policy_polling_allowed(), as of the last battery reading. With bus
+// sleep, false until the first one (sleep_mode_init()).
+static volatile bool polling_allowed = true;
 static QueueHandle_t voltage_queue = NULL;
 static QueueHandle_t car_on_sense_voltage_queue = NULL;
 adc_oneshot_unit_handle_t adc_handle;
@@ -340,6 +347,28 @@ esp_err_t read_ss_adc_voltage(float *voltage_out, adc_channel_t adc_ch)
 #define SLEEP_STATE			2
 #define WAKEUP_STATE		3
 
+// Without this, light sleep keeps the CPU powered: IDF only sets up the CPU's
+// retention memory from esp_pm_configure(), which we don't use. ~650 uA on
+// the S3 (esp_pm Kconfig), for ~13 KB of internal RAM with the cache tags.
+// Taken at the first sleep, not at boot, and never freed: waking is a
+// restart. If it fails, sleep goes on with the CPU powered.
+static void sleep_cpu_power_down_once(void)
+{
+#if ESP_SLEEP_POWER_DOWN_CPU
+	static bool tried = false;
+
+	if(!tried)
+	{
+		tried = true;
+		esp_err_t err = esp_sleep_cpu_retention_init();
+		if(err != ESP_OK)
+		{
+			ESP_LOGE(TAG, "the CPU stays powered in sleep: %s", esp_err_to_name(err));
+		}
+	}
+#endif
+}
+
 static void adc_task(void *pvParameters)
 {
     esp_err_t ret;
@@ -349,8 +378,8 @@ static void adc_task(void *pvParameters)
     static int64_t pub_time = 0;
     static float alert_voltage = 0;
     static uint64_t alert_time;
-    // Wi-Fi/BLE/CAN are torn down once per sleep entry, not on every 2 s
-    // timer wake. The flag survives transitions into and out of WAKEUP_STATE.
+    // Wi-Fi is torn down once per sleep entry, not on every timer wake. The
+    // flag survives transitions into and out of WAKEUP_STATE.
     static bool sleep_teardown_done = false;
 	uint64_t sleep_time = 0;
     alert_time = config_server_get_alert_time();
@@ -369,6 +398,10 @@ static void adc_task(void *pvParameters)
 		sleep_time = 3;
 	}
 	sleep_time *= (60*1000000); //convert to microseconds
+
+	// When a frame was last received, for bus sleep: polled once a loop
+	uint32_t rx_frames = can_rx_frame_count();
+	int64_t rx_seen_us = esp_timer_get_time();
 
     while(1)
     {
@@ -405,6 +438,18 @@ static void adc_task(void *pvParameters)
 
     	xQueueOverwrite( voltage_queue, &battery_voltage );
 
+        int64_t now = esp_timer_get_time();
+        uint32_t frames = can_rx_frame_count();
+        if(frames != rx_frames)
+        {
+            rx_frames = frames;
+            rx_seen_us = now;
+        }
+        bool bus_idle = (now - rx_seen_us) > SLEEP_BUS_IDLE_US;
+
+        // With MITM forwarding on the EB-FD (bus_sleep), both sleep modes
+        // follow the buses instead: see sleep_policy_decide(). Otherwise:
+        //
         // Car-off sleep (mode 2) uses the same setpoint as low-voltage sleep,
         // but a car that looks "on" inhibits sleeping and forces a wake. The
         // car looks on if either the hot-when-on sense pin is above the fixed
@@ -426,21 +471,21 @@ static void adc_task(void *pvParameters)
         // for ready. This distinction probably isn't that important but could 
         // be fixed later.
 #if HW_HAS_CAR_ON_SENSE
-        bool car_awake = (car_on_sense_voltage > CAR_ON_THRESHOLD_V)
-                || car_in_ready();
+        bool car_on_pin = car_on_sense_voltage > CAR_ON_THRESHOLD_V;
 #else
-        bool car_awake = car_in_ready();
+        bool car_on_pin = false;
 #endif
 
-        if(enable_sleep == 1) {
-            // Low-voltage sleep: the battery alone, against the setpoint.
-            sleep_wanted = battery_voltage < sleep_voltage;
-            awake_wanted = battery_voltage > sleep_voltage;
-        } else if(enable_sleep == 2) {
-            // Car-off sleep: same setpoint, but never sleep while the car
-            // looks on, and wake up as soon as it does.
-            sleep_wanted = (battery_voltage < sleep_voltage) && !car_awake;
-            awake_wanted = (battery_voltage > sleep_voltage) || car_awake;
+        sleep_decision_t decision = sleep_policy_decide(enable_sleep, bus_sleep, battery_voltage,
+                                                        sleep_voltage, car_on_pin, car_in_ready(),
+                                                        bus_idle);
+        sleep_wanted = decision.sleep;
+        awake_wanted = decision.wake;
+        bool allowed = sleep_policy_polling_allowed(bus_sleep, battery_voltage, car_on_pin);
+        if(allowed != polling_allowed)
+        {
+            ESP_LOGI(TAG, "AutoPID polling %s", allowed ? "resumed" : "paused: the car looks off");
+            polling_allowed = allowed;
         }
     	if(enable_sleep == 1 || enable_sleep == 2)
     	{
@@ -451,9 +496,9 @@ static void adc_task(void *pvParameters)
 					if(sleep_wanted)
 					{
 #if HW_HAS_CAR_ON_SENSE
-						ESP_LOGI(TAG, "sleep condition met: vbatt=%.2f car_on_sense=%.2f", battery_voltage, car_on_sense_voltage);
+						ESP_LOGI(TAG, "sleep condition met: vbatt=%.2f car_on_sense=%.2f bus_idle=%d", battery_voltage, car_on_sense_voltage, bus_idle);
 #else
-						ESP_LOGI(TAG, "sleep condition met: vbatt=%.2f", battery_voltage);
+						ESP_LOGI(TAG, "sleep condition met: vbatt=%.2f bus_idle=%d", battery_voltage, bus_idle);
 #endif
 						sleep_detect_time = esp_timer_get_time();
 						sleep_state++;
@@ -464,7 +509,7 @@ static void adc_task(void *pvParameters)
 				{
 					if(awake_wanted)
 					{
-						ESP_LOGI(TAG, "sleep condition cleared: vbatt=%.2f", battery_voltage);
+						ESP_LOGI(TAG, "sleep condition cleared: vbatt=%.2f bus_idle=%d", battery_voltage, bus_idle);
 						sleep_state = RUN_STATE;
 					}
 					else if((esp_timer_get_time() - sleep_detect_time) > sleep_time)
@@ -564,24 +609,47 @@ static void adc_task(void *pvParameters)
 	//    	ESP_LOGI(TAG, "value: %u",adc_val);
 			if(sleep_state == SLEEP_STATE)
 			{
-				// The 2 s timer wake re-enters this block; the teardown below
-				// must happen only on the first pass, or Wi-Fi and BLE are
-				// re-deinitialized every 2 s for the whole time the car is
-				// parked.
+				// todo (trh): add config option to leave
+				// can busses up in sleep.
+				// Every pass, not just the first: with bus_sleep it re-arms
+				// the wake pins, and bus 0's once a stuck bus is released.
+				// Sleep is the one thing allowed to take MITM forwarding
+				// down; waking is a restart, which locks it again
+				can_park(bus_sleep);
+				// A timer wake re-enters this block; Wi-Fi is torn down on
+				// the first pass only, or it would be deinitialized again on
+				// every wake for the whole time the car is parked.
 				if(!sleep_teardown_done)
 				{
 					sleep_teardown_done = true;
 					ESP_LOGW(TAG, "sleeping");
-                                // todo (trh): add config option to leave
-                                // can busses up in sleep.
-					// Sleep is the one thing allowed to take MITM forwarding
-					// down; waking is a restart, which locks it again
-					can_park();
 					wifi_network_deinit();
-					ble_disable();
 				}
-				esp_sleep_enable_timer_wakeup(2*1000000);
-				esp_light_sleep_start();;
+				// BLE every pass: an AP client leaving can turn it back on,
+				// and a repeat call returns at once
+				ble_disable();
+				if(bus_sleep)
+				{
+					sleep_cpu_power_down_once();
+				}
+				esp_sleep_enable_timer_wakeup(sleep_policy_timer_us(bus_sleep, can_wake_stuck()));
+				esp_err_t slept = esp_light_sleep_start();
+				// Bus traffic wakes the board at once: the head unit needs
+				// the car now (Bluelink), and with nobody acknowledging its
+				// frames it keeps repeating them until we're up. Light sleep
+				// is refused if a wake pin is already low. The bitmap, since
+				// the single wake cause reports the timer over GPIO.
+				if(bus_sleep && (slept != ESP_OK
+						|| (esp_sleep_get_wakeup_causes() & BIT(ESP_SLEEP_WAKEUP_GPIO))))
+				{
+					if(can_woke_on_traffic())
+					{
+						ESP_LOGI(TAG, "bus traffic, waking up");
+						esp_restart();
+					}
+					// A stuck bus 0, whose wake is off now: back to sleep
+					vTaskDelay(pdMS_TO_TICKS(100));
+				}
 			}
 			else vTaskDelay(pdMS_TO_TICKS(1000));
     	}
@@ -603,6 +671,11 @@ int8_t sleep_mode_get_voltage(float *val)
 		else return -1;
 	}
 	return -1;
+}
+
+bool sleep_mode_polling_allowed(void)
+{
+	return polling_allowed;
 }
 
 int8_t sleep_mode_get_car_on_sense_voltage(float *val)
@@ -631,6 +704,17 @@ int8_t sleep_mode_init(uint8_t enable, float sleep_volt)
 	// indefinitely.
 	sleep_voltage = sleep_volt;
 	ESP_LOGW(TAG, "sleep_volt: %2.2f", sleep_voltage);
+	// The same condition main.c locks MITM forwarding on
+	bus_sleep = (enable == 1 || enable == 2) && HW_HAS_MCP2518FD
+				&& config_server_get_fwd_en();
+	polling_allowed = !bus_sleep;
+	if(bus_sleep)
+	{
+		ESP_LOGW(TAG, "MITM: sleep follows the buses, and their traffic wakes the board");
+		// Now, so a bus that recovery has taken down when sleep comes can
+		// still wake it
+		can_set_bus_wake(true);
+	}
 	s_mqtt_event_group = xEventGroupCreate();
 	voltage_queue = xQueueCreate(1, sizeof( float) );
 	car_on_sense_voltage_queue = xQueueCreate(1, sizeof( float) );

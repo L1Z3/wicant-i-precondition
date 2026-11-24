@@ -1575,9 +1575,15 @@ static void autopid_task(void *pvParameters)
 
         dev_status_wait_for_bits(DEV_AWAKE_BIT, portMAX_DELAY);
 
-        if (xEventGroupGetBits(xautopid_event_group) & AUTOPID_POLLING_DISABLED_BIT) 
+        if (xEventGroupGetBits(xautopid_event_group) & AUTOPID_POLLING_DISABLED_BIT)
         {
             xEventGroupWaitBits(xautopid_event_group, AUTOPID_REQUEST_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+        }
+        // Our requests would keep the car's network, and the board, awake
+        else if (!sleep_mode_polling_allowed())
+        {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
         }
 
         elm327_lock();

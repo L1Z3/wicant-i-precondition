@@ -28,9 +28,10 @@ typedef struct {
 // service. The node reserves the SPI bus for itself.
 //
 // There is a single node, initialized on the first call and never freed:
-// twai_node_delete() releases it and puts the controller in Low Power Mode,
-// and every call resets the controller and applies the new bit timing and
-// mode. SPI, pins and oscillator come from the first call.
+// twai_node_delete() releases it and puts the controller in Low Power Mode
+// (or Sleep mode, see twai_mcp251xfd_set_wake_on_bus()), and every call
+// resets the controller and applies the new bit timing and mode. SPI, pins
+// and oscillator come from the first call.
 //
 // Callbacks run in the driver's thread rather than an ISR, except on_tx_done
 // for frames that twai_node_disable() (or a node_delete() that has to reset
@@ -43,6 +44,19 @@ esp_err_t twai_new_node_mcp251xfd(spi_host_device_t host, const twai_mcp251xfd_n
 // first node. It counts events (the controller's overflow flag seen set), not
 // frames, so it is a lower bound on the frames the controller dropped.
 uint32_t twai_mcp251xfd_get_rx_overflow_count(void);
+
+// Whether twai_node_delete() leaves the controller able to wake on bus
+// activity: Sleep mode instead of Low Power Mode, with CiINT.WAKIE set, so
+// bus activity pulls INT low until the next node creation resets the
+// controller. INT's interrupt stays disabled until the node is enabled.
+// Default off.
+void twai_mcp251xfd_set_wake_on_bus(bool enable);
+
+// Whether the controller is asleep with wake on bus activity armed: the last
+// twai_node_delete() put it to sleep that way and no node was created since.
+// False if its sleep requests weren't written (the driver's thread was busy,
+// or an SPI failure); true if only the check that it's asleep failed.
+bool twai_mcp251xfd_wake_armed(void);
 
 #ifdef __cplusplus
 }

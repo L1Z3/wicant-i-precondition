@@ -28,6 +28,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_attr.h"
+#include "esp_sleep.h"
 #include <stdio.h>
 #include <string.h>
 #include "esp_twai.h"
@@ -116,6 +117,10 @@ static uint32_t tx_slot_used[CAN_BUS_COUNT];
 // we can't use a mutex.
 static portMUX_TYPE tx_slot_mux = portMUX_INITIALIZER_UNLOCKED;
 
+// Every frame the controllers delivered, queued or not: sleep tells a quiet
+// bus from a live one by it. One writer per bus (bus 0's ISR, bus 1's driver
+// task).
+static volatile uint32_t rx_frame_count[CAN_BUS_COUNT];
 // RX frames lost because the shared rx queue was full (rx task too slow).
 // Incremented from can_on_rx_done (driver callback), logged rate-limited from
 // can_receive() in task context.
@@ -259,6 +264,7 @@ static CAN_ISR_ATTR bool can_on_rx_done(twai_node_handle_t handle, const twai_rx
 	// For classic CAN, dlc==len. This will need to be updated if we ever support FD
 	item.msg.data_length_code =
 			(rx_frame.header.dlc > TWAI_FRAME_MAX_DLC) ? TWAI_FRAME_MAX_DLC : rx_frame.header.dlc;
+	rx_frame_count[item.bus]++;
 
 	// Queue full = frame dropped: count it here, log it from task context
 	// task_woken -> tell the driver to context-switch on ISR exit if this
@@ -914,11 +920,82 @@ void can_disable(can_bus_t bus)
 	can_disable_node(bus);
 }
 
-void can_park(void)
+// Bus 0's RX pin read low for this long after a wake is a bus stuck dominant,
+// not traffic: a CAN frame has a recessive bit at least every 6 bits
+#define CAN_WAKE_STUCK_US 1000
+// Set once bus 0's RX pin was found stuck low: its wake stays off until the
+// pin reads high again
+static bool rx_wake_stuck;
+
+void can_set_bus_wake(bool enable)
+{
+#if HW_HAS_MCP2518FD
+	twai_mcp251xfd_set_wake_on_bus(enable);
+#else
+	(void)enable;
+#endif
+}
+
+// Light sleep wakes on bus 0's RX pin, which its transceiver drives in
+// standby too (SN65HVD233: "the receiver remains active"), and on bus 1's
+// INT, which the MCP2518FD pulls low on bus activity once armed. Both pins
+// keep their configuration through light sleep. Repeated every loop of
+// sleep, so idempotent.
+static void can_arm_wake(void)
+{
+	static bool bus1_logged;
+
+	// Released: a long dominant (an ECU powering up) is over
+	if (rx_wake_stuck && gpio_get_level(RX_GPIO_NUM))
+	{
+		rx_wake_stuck = false;
+		ESP_LOGI(TAG, "bus 0 released: it wakes the board again");
+	}
+	if (!rx_wake_stuck)
+	{
+		gpio_set_direction(RX_GPIO_NUM, GPIO_MODE_INPUT);
+		gpio_wakeup_enable(RX_GPIO_NUM, GPIO_INTR_LOW_LEVEL);
+	}
+	// Light sleep isolates every other pin, floating it. Bus 0's TX: the
+	// SN65HVD233 datasheet specifies standby current with D high (recessive)
+	gpio_sleep_set_direction(TX_GPIO_NUM, GPIO_MODE_INPUT);
+	gpio_sleep_set_pull_mode(TX_GPIO_NUM, GPIO_PULLUP_ONLY);
+#if HW_HAS_MCP2518FD
+	// A floating SDO raises the controller's Sleep current (datasheet, SPI
+	// section), and floating SCK and SDI inputs can draw current too: SCK
+	// down, its idle level in SPI mode 0, and nCS, SDO and SDI up.
+	gpio_sleep_set_direction(MCP2518FD_MISO_GPIO_NUM, GPIO_MODE_INPUT);
+	gpio_sleep_set_pull_mode(MCP2518FD_MISO_GPIO_NUM, GPIO_PULLUP_ONLY);
+	gpio_sleep_set_direction(MCP2518FD_CS_GPIO_NUM, GPIO_MODE_INPUT);
+	gpio_sleep_set_pull_mode(MCP2518FD_CS_GPIO_NUM, GPIO_PULLUP_ONLY);
+	gpio_sleep_set_direction(MCP2518FD_MOSI_GPIO_NUM, GPIO_MODE_INPUT);
+	gpio_sleep_set_pull_mode(MCP2518FD_MOSI_GPIO_NUM, GPIO_PULLUP_ONLY);
+	gpio_sleep_set_direction(MCP2518FD_SCLK_GPIO_NUM, GPIO_MODE_INPUT);
+	gpio_sleep_set_pull_mode(MCP2518FD_SCLK_GPIO_NUM, GPIO_PULLDOWN_ONLY);
+	if (twai_mcp251xfd_wake_armed())
+	{
+		gpio_wakeup_enable(MCP2518FD_INT_GPIO_NUM, GPIO_INTR_LOW_LEVEL);
+	}
+	else if (!bus1_logged)
+	{
+		bus1_logged = true;
+		ESP_LOGE(TAG, "bus 1 can't wake the board: only bus 0 traffic will");
+	}
+#else
+	(void)bus1_logged;
+#endif
+	esp_sleep_enable_gpio_wakeup();
+}
+
+void can_park(bool wake_on_bus)
 {
 	if (!can_parked)
 	{
 		ESP_LOGI(TAG, "buses parked for sleep");
+	}
+	if (wake_on_bus)
+	{
+		can_set_bus_wake(true);
 	}
 	// Before taking the buses down, so a retry or recovery re-enable
 	// already in progress can't bring one back
@@ -928,6 +1005,52 @@ void can_park(void)
 	{
 		can_disable_node((can_bus_t)bus);
 	}
+	if (wake_on_bus)
+	{
+		can_arm_wake();
+	}
+}
+
+bool can_wake_stuck(void)
+{
+	return rx_wake_stuck;
+}
+
+uint32_t can_rx_frame_count(void)
+{
+	uint32_t n = 0;
+	for (int bus = 0; bus < CAN_BUS_COUNT; bus++)
+	{
+		n += rx_frame_count[bus];
+	}
+	return n;
+}
+
+bool can_woke_on_traffic(void)
+{
+#if HW_HAS_MCP2518FD
+	// Held low by the controller until the next reset
+	if (twai_mcp251xfd_wake_armed() && gpio_get_level(MCP2518FD_INT_GPIO_NUM) == 0)
+	{
+		return true;
+	}
+#endif
+	if (rx_wake_stuck)
+	{
+		return false;
+	}
+	int64_t start = esp_timer_get_time();
+	while (esp_timer_get_time() - start < CAN_WAKE_STUCK_US)
+	{
+		if (gpio_get_level(RX_GPIO_NUM))
+		{
+			return true;
+		}
+	}
+	rx_wake_stuck = true;
+	gpio_wakeup_disable(RX_GPIO_NUM);
+	ESP_LOGE(TAG, "bus 0 is stuck dominant: it won't wake the board until it's released");
+	return false;
 }
 
 // Quiesces CAN TX for the length of a flash write (an OTA upload). The nodes
