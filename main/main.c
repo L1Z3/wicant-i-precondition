@@ -873,7 +873,7 @@ void app_main(void)
     // same state machine in sleep_mode.c and use sleep_voltage as the battery
     // sleep threshold; car-off sleep additionally refuses to sleep while the
     // car is awake (CAR_ON_THRESHOLD_V on the sense pin, or the CAN-derived
-    // car_in_ready()). 
+    // car_in_ready_or_above()).
     uint8_t sleep_config = config_server_get_sleep_config();
 	if(sleep_config == 1 || sleep_config == 2) // "enable" or "car_off"
 	{

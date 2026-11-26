@@ -723,16 +723,24 @@ static void run_ioniq6_battery_frames(void) {
 
 // The power-status frame is published on every car-side frame from either
 // identifier, with the plug state decoded from both bytes together: byte 0's
-// ambiguous 0x06 nibble plus byte 1 0x8D, rather than byte 1 alone.
+// ambiguous 0x06 nibble plus byte 1 0x8D, rather than byte 1 alone. The same
+// latched bytes back car_power_state() (the DBC VAL_ codes, with 0x06 split by
+// byte 1 and everything else undocumented) and car_in_ready_or_above()
+// (byte 0 >= 0x04), which car-off sleep uses.
 static void run_car_power_state(void) {
     precondition_init();
     precondition_power_t power;
     uint8_t d[8] = {0x06, 0x8D};
 
     CHECK(!precondition_get_car_power(&power));
+    // No frame yet: the state is unknown rather than a guessed "off".
+    CHECK(car_power_state() == CAR_POWER_STATE_UNKNOWN);
+    CHECK(!car_in_ready_or_above());
     // car-side only, like the READY tracking
     rx_frame(0x038, d, CAN_BUS_1);
     CHECK(!precondition_get_car_power(&power));
+    CHECK(car_power_state() == CAR_POWER_STATE_UNKNOWN);
+    CHECK(!car_in_ready_or_above());
 
     fake_now = 123456;
     rx_frame(0x038, d, CAN_BUS_0);
@@ -740,6 +748,8 @@ static void run_car_power_state(void) {
     CHECK(power.plugged_in);
     CHECK(power.updated_at_us == fake_now);
     CHECK(!car_in_ready());
+    CHECK(car_power_state() == CAR_POWER_STATE_PLUGGED_IN);
+    CHECK(car_in_ready_or_above());
 
     // 0x06 also covers a remote wake: byte 1 0xAB is the VCU boot/wake
     // transient (1-6 frames), not a plug state.
@@ -747,6 +757,8 @@ static void run_car_power_state(void) {
     rx_frame(0x038, d, CAN_BUS_0);
     CHECK(precondition_get_car_power(&power));
     CHECK(!power.plugged_in);
+    CHECK(car_power_state() == CAR_POWER_STATE_REMOTE_WAKE);
+    CHECK(car_in_ready_or_above());
 
     // ON but not READY, unplugged
     d[0] = 0x02;
@@ -754,6 +766,8 @@ static void run_car_power_state(void) {
     rx_frame(0x038, d, CAN_BUS_0);
     CHECK(precondition_get_car_power(&power));
     CHECK(!power.plugged_in);
+    CHECK(car_power_state() == CAR_POWER_STATE_ON_NOT_READY);
+    CHECK(!car_in_ready_or_above());
 
     // READY reads 0x04, and a repeated frame still refreshes the age
     car_power(true);
@@ -762,6 +776,8 @@ static void run_car_power_state(void) {
     CHECK(precondition_get_car_power(&power));
     CHECK(!power.plugged_in);
     CHECK(power.updated_at_us == fake_now);
+    CHECK(car_power_state() == CAR_POWER_STATE_READY);
+    CHECK(car_in_ready_or_above());
 
     // The decode only accepts 0x8D together with byte 0's 0x06, so a READY
     // (0x04) frame carrying 0x8D is not treated as plugged in.
@@ -770,14 +786,76 @@ static void run_car_power_state(void) {
     rx_frame(0x038, d, CAN_BUS_0);
     CHECK(precondition_get_car_power(&power));
     CHECK(!power.plugged_in);
+    CHECK(car_power_state() == CAR_POWER_STATE_READY);
 
     // the Ioniq 6 identifier decodes the same way
     ioniq6_power(0x06, 0x8D, CAN_BUS_0);
     CHECK(precondition_get_car_power(&power));
     CHECK(power.plugged_in);
+    CHECK(car_power_state() == CAR_POWER_STATE_PLUGGED_IN);
     ioniq6_power(0x06, 0xAB, CAN_BUS_0);
     CHECK(precondition_get_car_power(&power));
     CHECK(!power.plugged_in);
+    CHECK(car_power_state() == CAR_POWER_STATE_REMOTE_WAKE);
+
+    // 0x06 is only documented with byte 1 0x8D or 0xAB; anything else is
+    // undocumented even though it still counts as READY-or-above.
+    d[0] = 0x06;
+    d[1] = 0x00;
+    rx_frame(0x038, d, CAN_BUS_0);
+    CHECK(car_power_state() == CAR_POWER_STATE_UNDOCUMENTED);
+    CHECK(car_in_ready_or_above());
+    CHECK(!car_in_ready());
+
+    // The remaining documented low codes, including the asleep/awake pair.
+    d[0] = 0x00;
+    d[1] = 0x00;
+    rx_frame(0x038, d, CAN_BUS_0);
+    CHECK(car_power_state() == CAR_POWER_STATE_OFF_ASLEEP);
+    CHECK(!car_in_ready_or_above());
+    d[0] = 0x01;
+    rx_frame(0x038, d, CAN_BUS_0);
+    CHECK(car_power_state() == CAR_POWER_STATE_OFF_AWAKE);
+    CHECK(!car_in_ready_or_above());
+
+    // Any other nibble is undocumented. 0x07 is not a DBC code even though the
+    // >= 0x04 test accepts it, and 0x05/0x03/0x0F are outside the VAL_ table.
+    d[1] = 0x8D;
+    d[0] = 0x07;
+    rx_frame(0x038, d, CAN_BUS_0);
+    CHECK(car_power_state() == CAR_POWER_STATE_UNDOCUMENTED);
+    CHECK(car_in_ready_or_above());
+    d[0] = 0x05;
+    rx_frame(0x038, d, CAN_BUS_0);
+    CHECK(car_power_state() == CAR_POWER_STATE_UNDOCUMENTED);
+    d[0] = 0x03;
+    rx_frame(0x038, d, CAN_BUS_0);
+    CHECK(car_power_state() == CAR_POWER_STATE_UNDOCUMENTED);
+    CHECK(!car_in_ready_or_above());
+    d[0] = 0x0F;
+    rx_frame(0x038, d, CAN_BUS_0);
+    CHECK(car_power_state() == CAR_POWER_STATE_UNDOCUMENTED);
+    CHECK(car_in_ready_or_above());
+
+    // Only byte 0's low nibble is the signal; the high nibble is not part of
+    // Power_Status_Ready and must be masked off.
+    d[0] = 0xF4;
+    d[1] = 0x00;
+    rx_frame(0x038, d, CAN_BUS_0);
+    CHECK(car_power_state() == CAR_POWER_STATE_READY);
+    CHECK(car_in_ready_or_above());
+
+    // A frame with only byte 0 still decodes the state; byte 1 stays zero, so
+    // the 0x06 pairing cannot be resolved and is undocumented.
+    d[0] = 0x01;
+    d[1] = 0x8D;
+    rx_frame_len(0x038, d, 1, CAN_BUS_0);
+    CHECK(car_power_state() == CAR_POWER_STATE_OFF_AWAKE);
+    CHECK(!car_in_ready_or_above());
+    d[0] = 0x06;
+    rx_frame_len(0x038, d, 1, CAN_BUS_0);
+    CHECK(car_power_state() == CAR_POWER_STATE_UNDOCUMENTED);
+    CHECK(car_in_ready_or_above());
 }
 
 // Charging power is published from either identifier, car-side only, and a

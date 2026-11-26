@@ -1157,6 +1157,30 @@ static esp_err_t check_status_handler(httpd_req_t *req)
 	return ESP_OK;
 }
 
+// Name for the DBC's Power_Status_Ready codes. Byte 1 splits the 0x06 code
+// into plugged in and remote wake; anything else decoded as undocumented.
+static const char *car_power_state_name(int state)
+{
+	switch (state) {
+	case CAR_POWER_STATE_OFF_ASLEEP:
+		return "Off (Asleep)";
+	case CAR_POWER_STATE_OFF_AWAKE:
+		return "Off (Awake)";
+	case CAR_POWER_STATE_ON_NOT_READY:
+		return "ON (Not Ready)";
+	case CAR_POWER_STATE_READY:
+		return "Ready";
+	case CAR_POWER_STATE_PLUGGED_IN:
+		return "Plugged In";
+	case CAR_POWER_STATE_REMOTE_WAKE:
+		return "Remote Wake";
+	case CAR_POWER_STATE_UNDOCUMENTED:
+		return "Undocumented";
+	default:
+		return "Unknown";
+	}
+}
+
 char *config_server_get_status_json(bool remove_sensitive_info)
 {
 	char ip_str[20] = {0};
@@ -1318,10 +1342,10 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 		cJSON_AddStringToObject(root, "car_on_sense_voltage", car_on_sense_voltage_str);
 	}
 
-	// CAN-derived READY state (0x038 power status, 0x00C03503 on Ioniq 6);
+	// CAN-derived power state (0x038 power status, 0x00C03503 on Ioniq 6);
 	// shown by the web UI in place of the car-on sense voltage on boards
 	// without the sense pin.
-	cJSON_AddStringToObject(root, "can_ready_state", car_in_ready() ? "Ready" : "Not Ready");
+	cJSON_AddStringToObject(root, "can_ready_state", car_power_state_name(car_power_state()));
 
 	precondition_power_t car_power;
 

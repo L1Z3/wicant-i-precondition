@@ -180,6 +180,7 @@ static bool is_utility_request(const twai_message_t *frame) {
 #define POWER_STATUS_CHARGING_OR_WAKE(power_status_byte) \
     (((power_status_byte) & POWER_STATUS_MASK) == 0x06U)
 #define POWER_STATUS_BYTE1_PLUGGED_IN 0x8DU
+#define POWER_STATUS_BYTE1_REMOTE_WAKE 0xABU
 #define POWER_STATUS_PLUGGED_IN(power_status_byte1) \
     ((power_status_byte1) == POWER_STATUS_BYTE1_PLUGGED_IN)
 
@@ -450,6 +451,12 @@ static struct {
     // readers; relaxed accesses suffice because this value does not signal that
     // other shared data is ready to read.
     _Atomic ready_status_t ready_status;
+    // raw bytes behind ready_status, kept for car_power_state() and
+    // car_in_ready_or_above(): byte 0's low nibble in the low byte, byte 1 in
+    // the high byte. Packed so a reader cannot mix bytes from two frames;
+    // power_status_valid latches on the first frame that has byte 0.
+    _Atomic uint16_t power_status;
+    _Atomic bool power_status_valid;
     bool car_in_utility;
     // most recent battery conditioning mode reported by the car
     conditioning_mode_t conditioning_mode;
@@ -1552,6 +1559,20 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
     if (IS_POWER_STATUS_FRAME(to_push->identifier)
             && rx_bus == CAR_BUS
             && to_push->data_length_code >= 1U) {
+        // Keep the raw bytes too, for car_power_state() and
+        // car_in_ready_or_above(). A frame with only byte 0 still updates the
+        // state; byte 1 stays zero when the frame is too short to carry it.
+        uint16_t power_status = (uint16_t)(to_push->data[0] & POWER_STATUS_MASK);
+        if (to_push->data_length_code >= 2U) {
+            power_status |= (uint16_t)to_push->data[1] << 8U;
+        }
+        atomic_store_explicit(
+            &platform.power_status, power_status, memory_order_relaxed
+        );
+        atomic_store_explicit(
+            &platform.power_status_valid, true, memory_order_release
+        );
+
         // byte 1 carries the plug state; a frame too short to have it is not
         // enough to decode, so leave the last published value alone.
         if (to_push->data_length_code >= 2U) {
@@ -1880,4 +1901,58 @@ bool precondition_get_car_model(egmp_car_model_t *out) {
 bool car_in_ready(void) {
     return atomic_load_explicit(&platform.ready_status, memory_order_relaxed)
            == READY_STATUS_READY;
+}
+
+// Read the packed power-status bytes. The acquire pairs with the release store
+// in precondition_global_rx, so a reader that sees valid also sees the bytes it
+// was set with.
+static bool load_power_status(uint16_t *out) {
+    if (!atomic_load_explicit(&platform.power_status_valid, memory_order_acquire)) {
+        return false;
+    }
+
+    *out = atomic_load_explicit(&platform.power_status, memory_order_relaxed);
+    return true;
+}
+
+bool car_in_ready_or_above(void) {
+    uint16_t power_status;
+
+    if (!load_power_status(&power_status)) {
+        return false;
+    }
+
+    return (power_status & POWER_STATUS_MASK) >= 0x04U;
+}
+
+int car_power_state(void) {
+    uint16_t power_status;
+
+    if (!load_power_status(&power_status)) {
+        return CAR_POWER_STATE_UNKNOWN;
+    }
+
+    uint8_t state = (uint8_t)(power_status & POWER_STATUS_MASK);
+    uint8_t detail = (uint8_t)(power_status >> 8U);
+
+    switch (state) {
+    case 0x00U:
+        return CAR_POWER_STATE_OFF_ASLEEP;
+    case 0x01U:
+        return CAR_POWER_STATE_OFF_AWAKE;
+    case 0x02U:
+        return CAR_POWER_STATE_ON_NOT_READY;
+    case 0x04U:
+        return CAR_POWER_STATE_READY;
+    case 0x06U:
+        if (detail == POWER_STATUS_BYTE1_PLUGGED_IN) {
+            return CAR_POWER_STATE_PLUGGED_IN;
+        }
+        if (detail == POWER_STATUS_BYTE1_REMOTE_WAKE) {
+            return CAR_POWER_STATE_REMOTE_WAKE;
+        }
+        return CAR_POWER_STATE_UNDOCUMENTED;
+    default:
+        return CAR_POWER_STATE_UNDOCUMENTED;
+    }
 }
