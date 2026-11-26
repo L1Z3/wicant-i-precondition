@@ -1158,7 +1158,8 @@ static esp_err_t check_status_handler(httpd_req_t *req)
 }
 
 // Name for the DBC's Power_Status_Ready codes. Byte 1 splits the 0x06 code
-// into plugged in and remote wake; anything else decoded as undocumented.
+// into an active charging session and remote wake; anything else decodes as
+// undocumented.
 static const char *car_power_state_name(int state)
 {
 	switch (state) {
@@ -1170,8 +1171,8 @@ static const char *car_power_state_name(int state)
 		return "ON (Not Ready)";
 	case CAR_POWER_STATE_READY:
 		return "Ready";
-	case CAR_POWER_STATE_PLUGGED_IN:
-		return "Plugged In";
+	case CAR_POWER_STATE_CHARGING_SESSION:
+		return "Charging Session";
 	case CAR_POWER_STATE_REMOTE_WAKE:
 		return "Remote Wake";
 	case CAR_POWER_STATE_UNDOCUMENTED:
@@ -1278,6 +1279,9 @@ char *config_server_get_status_json(bool remove_sensitive_info)
         cJSON_AddBoolToObject(root, "battery_temp_valid", false);
 	}
 
+	// 0x30E byte 6: 0x00 in every recorded Ioniq 5 row; the DBC scopes it to
+	// the EV6. Kept as-is until the label/byte decision in
+	// charging_status_semantics_to-be-continued.md is made.
 	precondition_charging_power_t charging_power;
 
 	if (precondition_get_charging_power(&charging_power)) {
@@ -1351,7 +1355,11 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 
 	if (precondition_get_car_power(&car_power)) {
         cJSON_AddBoolToObject(root, "car_power_valid", true);
-        cJSON_AddBoolToObject(root, "plugged_in", car_power.plugged_in);
+        // A charging session is active (0x038 = 0x06/0x8D). 0x8D tracks the
+        // session, not cable presence. `plugged_in` is the old name, kept for a
+        // release so external pages/scripts reading it do not break.
+        cJSON_AddBoolToObject(root, "charging_session", car_power.charging_session);
+        cJSON_AddBoolToObject(root, "plugged_in", car_power.charging_session);
         cJSON_AddNumberToObject(
             root,
             "car_power_age_ms",

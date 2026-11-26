@@ -142,8 +142,8 @@ static void ioniq6_status(uint8_t b, can_bus_t bus) { uint8_t d[8] = {0}; d[1] =
 static void car_power(bool ready) { uint8_t d[8] = {0}; d[0] = ready ? 0x04 : 0x00; rx_frame(0x038, d, CAN_BUS_0); }
 // Ioniq 6 carries the power status on the 29-bit 0x00C03503 (the CCU-hub remap
 // of the 11-bit 0x038). Byte 0's low nibble reads 0x04 in READY and 0x01 awake
-// but off; byte 1 carries the plug state (0x8D plugged in, 0xAB remote wake),
-// so this takes both raw bytes rather than a bool.
+// but off; byte 1 marks an active charging session (0x8D) or the remote wake
+// (0xAB), so this takes both raw bytes rather than a bool.
 static void ioniq6_power(uint8_t byte0, uint8_t byte1, can_bus_t bus) {
     uint8_t d[8] = {0};
     d[0] = byte0;
@@ -722,11 +722,12 @@ static void run_ioniq6_battery_frames(void) {
 }
 
 // The power-status frame is published on every car-side frame from either
-// identifier, with the plug state decoded from both bytes together: byte 0's
-// ambiguous 0x06 nibble plus byte 1 0x8D, rather than byte 1 alone. The same
-// latched bytes back car_power_state() (the DBC VAL_ codes, with 0x06 split by
-// byte 1 and everything else undocumented) and car_in_ready_or_above()
-// (byte 0 >= 0x04), which car-off sleep uses.
+// identifier, with the charging-session state decoded from both bytes together:
+// byte 0's ambiguous 0x06 nibble plus byte 1 0x8D, rather than byte 1 alone.
+// 0x8D tracks the charging session, not cable presence. The same latched bytes
+// back car_power_state() (the DBC VAL_ codes, with 0x06 split by byte 1 and
+// everything else undocumented) and car_in_ready_or_above() (byte 0 >= 0x04),
+// which car-off sleep uses.
 static void run_car_power_state(void) {
     precondition_init();
     precondition_power_t power;
@@ -745,10 +746,10 @@ static void run_car_power_state(void) {
     fake_now = 123456;
     rx_frame(0x038, d, CAN_BUS_0);
     CHECK(precondition_get_car_power(&power));
-    CHECK(power.plugged_in);
+    CHECK(power.charging_session);
     CHECK(power.updated_at_us == fake_now);
     CHECK(!car_in_ready());
-    CHECK(car_power_state() == CAR_POWER_STATE_PLUGGED_IN);
+    CHECK(car_power_state() == CAR_POWER_STATE_CHARGING_SESSION);
     CHECK(car_in_ready_or_above());
 
     // 0x06 also covers a remote wake: byte 1 0xAB is the VCU boot/wake
@@ -756,7 +757,7 @@ static void run_car_power_state(void) {
     d[1] = 0xAB;
     rx_frame(0x038, d, CAN_BUS_0);
     CHECK(precondition_get_car_power(&power));
-    CHECK(!power.plugged_in);
+    CHECK(!power.charging_session);
     CHECK(car_power_state() == CAR_POWER_STATE_REMOTE_WAKE);
     CHECK(car_in_ready_or_above());
 
@@ -765,7 +766,7 @@ static void run_car_power_state(void) {
     d[1] = 0x00;
     rx_frame(0x038, d, CAN_BUS_0);
     CHECK(precondition_get_car_power(&power));
-    CHECK(!power.plugged_in);
+    CHECK(!power.charging_session);
     CHECK(car_power_state() == CAR_POWER_STATE_ON_NOT_READY);
     CHECK(!car_in_ready_or_above());
 
@@ -774,35 +775,39 @@ static void run_car_power_state(void) {
     fake_now += 1000;
     car_power(true);
     CHECK(precondition_get_car_power(&power));
-    CHECK(!power.plugged_in);
+    CHECK(!power.charging_session);
     CHECK(power.updated_at_us == fake_now);
     CHECK(car_power_state() == CAR_POWER_STATE_READY);
     CHECK(car_in_ready_or_above());
 
     // The decode only accepts 0x8D together with byte 0's 0x06, so a READY
-    // (0x04) frame carrying 0x8D is not treated as plugged in.
+    // (0x04) frame carrying 0x8D is not treated as a charging session.
     d[0] = 0x04;
     d[1] = 0x8D;
     rx_frame(0x038, d, CAN_BUS_0);
     CHECK(precondition_get_car_power(&power));
-    CHECK(!power.plugged_in);
+    CHECK(!power.charging_session);
     CHECK(car_power_state() == CAR_POWER_STATE_READY);
 
     // the Ioniq 6 identifier decodes the same way
     ioniq6_power(0x06, 0x8D, CAN_BUS_0);
     CHECK(precondition_get_car_power(&power));
-    CHECK(power.plugged_in);
-    CHECK(car_power_state() == CAR_POWER_STATE_PLUGGED_IN);
+    CHECK(power.charging_session);
+    CHECK(car_power_state() == CAR_POWER_STATE_CHARGING_SESSION);
     ioniq6_power(0x06, 0xAB, CAN_BUS_0);
     CHECK(precondition_get_car_power(&power));
-    CHECK(!power.plugged_in);
+    CHECK(!power.charging_session);
     CHECK(car_power_state() == CAR_POWER_STATE_REMOTE_WAKE);
 
-    // 0x06 is only documented with byte 1 0x8D or 0xAB; anything else is
-    // undocumented even though it still counts as READY-or-above.
+    // 0x06's detail is only observed with 0x8D and 0xAB. The DBC now documents
+    // 0x00 as "Idle", but the captured plugged-but-idle frame is 0x01 0x00, so
+    // the 0x06/0x00 pair is unevidenced and stays undocumented even though it
+    // still counts as READY-or-above.
     d[0] = 0x06;
     d[1] = 0x00;
     rx_frame(0x038, d, CAN_BUS_0);
+    CHECK(precondition_get_car_power(&power));
+    CHECK(!power.charging_session);
     CHECK(car_power_state() == CAR_POWER_STATE_UNDOCUMENTED);
     CHECK(car_in_ready_or_above());
     CHECK(!car_in_ready());

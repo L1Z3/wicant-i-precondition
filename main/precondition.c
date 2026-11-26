@@ -173,16 +173,17 @@ static bool is_utility_request(const twai_message_t *frame) {
 #define POWER_STATUS_MASK 0x0FU
 #define POWER_STATUS_READY(power_status_byte) \
     (((power_status_byte) & POWER_STATUS_MASK) == 0x04U)
-// Byte 1 disambiguates the low nibble's 0x06, which is either "charging/plugged
-// in" or "remotely woken up": 0x8D means the charge cable is connected (whether
-// charging or not), 0xAB is the 1-6 frame VCU boot/wake transient after a
-// remote wake. The 0x06 nibble alone cannot tell those apart.
+// Byte 1 disambiguates the low nibble's 0x06, which is either an active
+// charging session or "remotely woken up": 0x8D means a charging session is
+// running (the cable can stay connected with byte 1 back at 0x00), 0xAB is the
+// 1-6 frame VCU boot/wake transient after a remote wake. The 0x06 nibble alone
+// cannot tell those apart.
 #define POWER_STATUS_CHARGING_OR_WAKE(power_status_byte) \
     (((power_status_byte) & POWER_STATUS_MASK) == 0x06U)
-#define POWER_STATUS_BYTE1_PLUGGED_IN 0x8DU
+#define POWER_STATUS_BYTE1_CHARGING_SESSION 0x8DU
 #define POWER_STATUS_BYTE1_REMOTE_WAKE 0xABU
-#define POWER_STATUS_PLUGGED_IN(power_status_byte1) \
-    ((power_status_byte1) == POWER_STATUS_BYTE1_PLUGGED_IN)
+#define POWER_STATUS_CHARGING_SESSION(power_status_byte1) \
+    ((power_status_byte1) == POWER_STATUS_BYTE1_CHARGING_SESSION)
 
 #define PRECONDITION_DEBOUNCE_US 1000000U  // 1 second
 #define PRECONDITION_LONG_PRESS_US 1000000U  // short/long press threshold: 1 second
@@ -246,9 +247,14 @@ static bool is_utility_request(const twai_message_t *frame) {
 #define IS_CONDITIONING_MODE_FRAME(frame_id) \
     ((frame_id) == CONDITIONING_MODE_FRAME_ID || (frame_id) == CONDITIONING_MODE_FRAME_ID_IONIQ6)
 
-// Charging power: byte 6 is kW on 0x30E (Ioniq 5/EV6). The Ioniq 6 uses the
-// CCU-hub remap 0x0C030A04 (family base 0x30A, index 4), seen in its captures
-// and defined in gv60-2024.dbc; ioniq6-2024.dbc does not list the frame.
+// Charging power: 0x30E byte 6. It is 0x00 in every Ioniq 5 row of the
+// recorded corpus, and the DBC now scopes it to the EV6
+// (EV6_Charging_Power_kW); byte 2 is the Ioniq 5 charging-power-shaped byte but
+// is probably a negotiated limit, not a measurement. Do not re-wire this to byte
+// 2 without deciding what the label means; see
+// charging_status_semantics_to-be-continued.md. The Ioniq 6 uses the CCU-hub
+// remap 0x0C030A04 (family base 0x30A, index 4), seen in its captures and
+// defined in gv60-2024.dbc; ioniq6-2024.dbc does not list the frame.
 #define CHARGING_POWER_INDEX 6U
 #define CHARGING_POWER_DATA_LENGTH 7U
 #define IS_CHARGING_POWER_FRAME(frame_id) \
@@ -1573,12 +1579,12 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
             &platform.power_status_valid, true, memory_order_release
         );
 
-        // byte 1 carries the plug state; a frame too short to have it is not
-        // enough to decode, so leave the last published value alone.
+        // byte 1 marks the charging session; a frame too short to have it is
+        // not enough to decode, so leave the last published value alone.
         if (to_push->data_length_code >= 2U) {
             precondition_power_t power = {
-                .plugged_in = POWER_STATUS_CHARGING_OR_WAKE(to_push->data[0])
-                              && POWER_STATUS_PLUGGED_IN(to_push->data[1]),
+                .charging_session = POWER_STATUS_CHARGING_OR_WAKE(to_push->data[0])
+                                    && POWER_STATUS_CHARGING_SESSION(to_push->data[1]),
                 .updated_at_us = sm_now(sm),
             };
             xQueueOverwrite(car_power_queue, &power);
@@ -1945,8 +1951,8 @@ int car_power_state(void) {
     case 0x04U:
         return CAR_POWER_STATE_READY;
     case 0x06U:
-        if (detail == POWER_STATUS_BYTE1_PLUGGED_IN) {
-            return CAR_POWER_STATE_PLUGGED_IN;
+        if (detail == POWER_STATUS_BYTE1_CHARGING_SESSION) {
+            return CAR_POWER_STATE_CHARGING_SESSION;
         }
         if (detail == POWER_STATUS_BYTE1_REMOTE_WAKE) {
             return CAR_POWER_STATE_REMOTE_WAKE;

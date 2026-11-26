@@ -39,8 +39,11 @@ typedef struct {
 
 bool precondition_get_battery_soc(precondition_soc_t *out);
 
-// Charging power in kW. 0x30E byte 6 on Ioniq 5/EV6, or the 29-bit
-// 0x0C030A04 CCU-hub remap on Ioniq 6.
+// Charging power in kW. 0x30E byte 6, or the 29-bit 0x0C030A04 CCU-hub remap
+// on Ioniq 6. Byte 6 is 0x00 in every recorded Ioniq 5 row; the DBC now scopes
+// that signal to the EV6 (EV6_Charging_Power_kW). Byte 2 is the Ioniq 5
+// charging-power-shaped byte but is probably a negotiated limit, not a
+// measurement. See charging_status_semantics_to-be-continued.md.
 typedef struct {
     uint8_t kw;
     int64_t updated_at_us;
@@ -66,26 +69,29 @@ bool precondition_get_car_model(egmp_car_model_t *out);
 bool car_in_ready(void);
 
 // True when the car is in READY or a higher power state: byte 0's low nibble
-// (the DBC's Power_Status_Ready signal) is >= 0x04, i.e. READY, plugged in, or
-// the remote-wake transient. False until a power-status frame is seen. Car-off
-// sleep uses this instead of car_in_ready() so a charging or remotely woken car
-// is not mistaken for a sleeping one.
+// (the DBC's Power_Status_Ready signal) is >= 0x04, i.e. READY, an active
+// charging session, or the remote-wake transient. False until a power-status
+// frame is seen. Car-off sleep uses this instead of car_in_ready() so a
+// charging or remotely woken car is not mistaken for a sleeping one.
 bool car_in_ready_or_above(void);
 
 // Decoded 0x038/0x00C03503 power state. 0x00/0x01/0x02/0x04/0x06 are the DBC's
 // Power_Status_Ready codes. 0x06 is split by byte 1 (Power_Status_Detail)
-// because the nibble alone cannot tell a plugged-in car from a remote wake, so
-// REMOTE_WAKE is a synthetic code for that documented pairing. Any other code,
-// including 0x06 with an unrecognised byte 1, is UNDOCUMENTED.
+// because the nibble alone cannot tell an active charging session from a remote
+// wake: 0x8D is Charging_Session_Active, 0xAB is the Boot_Wake_Transient.
+// REMOTE_WAKE is a synthetic code for the latter pairing. Any other code is
+// UNDOCUMENTED, including 0x06 with byte 1 0x00: 0x00 is now documented as
+// "Idle", but the observed plugged-but-idle frame is 0x01 0x00, so the 0x06/0x00
+// pairing is unevidenced.
 typedef enum {
-    CAR_POWER_STATE_UNKNOWN = -1,         // no power-status frame seen yet
-    CAR_POWER_STATE_UNDOCUMENTED = -2,    // not a byte 0/byte 1 pair in the DBC
-    CAR_POWER_STATE_OFF_ASLEEP = 0x00,    // 0 "Off_Asleep"
-    CAR_POWER_STATE_OFF_AWAKE = 0x01,     // 1 "Off_Awake"
-    CAR_POWER_STATE_ON_NOT_READY = 0x02,  // 2 "ON_Not_Ready"
-    CAR_POWER_STATE_READY = 0x04,         // 4 "READY"
-    CAR_POWER_STATE_PLUGGED_IN = 0x06,    // 6 with byte 1 0x8D "Plugged_In"
-    CAR_POWER_STATE_REMOTE_WAKE = 0x07,   // 6 with byte 1 0xAB "Boot_Wake_Transient"
+    CAR_POWER_STATE_UNKNOWN = -1,           // no power-status frame seen yet
+    CAR_POWER_STATE_UNDOCUMENTED = -2,      // not a byte 0/byte 1 pair in the DBC
+    CAR_POWER_STATE_OFF_ASLEEP = 0x00,      // 0 "Off_Asleep"
+    CAR_POWER_STATE_OFF_AWAKE = 0x01,       // 1 "Off_Awake"
+    CAR_POWER_STATE_ON_NOT_READY = 0x02,    // 2 "ON_Not_Ready"
+    CAR_POWER_STATE_READY = 0x04,           // 4 "READY"
+    CAR_POWER_STATE_CHARGING_SESSION = 0x06, // 6 with byte 1 0x8D "Charging_Session_Active"
+    CAR_POWER_STATE_REMOTE_WAKE = 0x07,     // 6 with byte 1 0xAB "Boot_Wake_Transient"
 } car_power_state_t;
 
 // Latest decoded power state, for display. CAR_POWER_STATE_UNKNOWN until the
@@ -96,9 +102,10 @@ int car_power_state(void);
 // READY edges, so a reader can tell a live value from one left behind when the
 // bus went quiet.
 typedef struct {
-    // byte 0's low nibble is 0x06 and byte 1 is 0x8D: the charge cable is
-    // connected, charging or not
-    bool plugged_in;
+    // byte 0's low nibble is 0x06 and byte 1 is 0x8D: a charging session is
+    // active. 0x8D tracks the session, not the connector, so the cable can stay
+    // plugged in with this false.
+    bool charging_session;
     int64_t updated_at_us;
 } precondition_power_t;
 

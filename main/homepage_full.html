@@ -566,9 +566,13 @@
                         <div id="can_ready_state">Unknown&nbsp;</div>
                     </td>
                 </tr>
+                <!-- 0x038 byte 1 0x8D is "Charging_Session_Active", not cable
+                     presence: in M-CAN_MITM_plugged_in_car-off_charging.csv the
+                     cable stays in while byte 1 flips 0x8D -> 0x00 at t=10.24 s
+                     and back at t=16.48 s. -->
                 <tr>
-                    <td>Plugged In (CAN):</td>
-                    <td><div id="plugged_in_status">Waiting for CAN data</div></td>
+                    <td>Charging Session (CAN):</td>
+                    <td><div id="charging_session_status">Waiting for CAN data</div></td>
                 </tr>
                 <tr>
                     <td>HV Battery State of Charge:</td>
@@ -587,6 +591,15 @@
                         </div>
                     </td>
                 </tr>
+                <!-- NOTE 2026-11-26: charging_power_kw is 0x30E byte 6, which is
+                     0x00 in every Ioniq 5 row of the recorded corpus, so this row
+                     always reads "0 kW" there. The DBC now scopes byte 6 to the
+                     EV6 (EV6_Charging_Power_kW). 0x30E byte 2 is the Ioniq 5
+                     charging-power-shaped byte (0.2 kW/count, 4.8-11.2 kW) but it
+                     looks like a negotiated limit, not a measurement; measured HV
+                     power is 0x1F7 bytes 2-3 LE (0.01 kW/count), which is not
+                     charging-specific. Do not relabel this row until one of the
+                     two is chosen; see charging_status_semantics_to-be-continued.md. -->
                 <tr>
                     <td>Charging Power:</td>
                     <td><div id="charging_power_status">Waiting for CAN data</div></td>
@@ -2740,9 +2753,10 @@ function loadAutoTable(jsonData) {
 				document.getElementById("port_type_status").innerHTML = "UDP";
 			}
 			if (obj.car_power_valid) {
-				document.getElementById("plugged_in_status").textContent = `${obj.plugged_in ? "Yes" : "No"}; (${formatAge(obj.car_power_age_ms)} ago)`;
+				const chargingSession = (obj.charging_session !== undefined) ? obj.charging_session : obj.plugged_in;
+				document.getElementById("charging_session_status").textContent = `${chargingSession ? "Yes" : "No"}; (${formatAge(obj.car_power_age_ms)} ago)`;
 			} else {
-				document.getElementById("plugged_in_status").textContent = "Waiting for CAN data";
+				document.getElementById("charging_session_status").textContent = "Waiting for CAN data";
 			}
 			if (obj.battery_soc_valid) {
 				document.getElementById("battery_soc_status").textContent = `${obj.battery_soc_pct}%; (${formatAge(obj.battery_soc_age_ms)} ago)`;
