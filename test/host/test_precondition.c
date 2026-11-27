@@ -166,10 +166,10 @@ static void battery_soc_frame(uint32_t frame_id, uint8_t raw, can_bus_t bus) {
     uint8_t d[8] = {[7] = raw};
     rx_frame(frame_id, d, bus);
 }
-// Charging power is 0x30E byte 6 on Ioniq 5/EV6, and the same payload on the
-// 29-bit 0x0C030A04 CCU-hub remap used by the Ioniq 6.
-static void charging_power_frame(uint32_t frame_id, uint8_t kw, can_bus_t bus) {
-    uint8_t d[8] = {[6] = kw};
+// Charging power is 0x3B7 byte 3 (0.1 kW per count) on the Ioniq 5; no CCU-hub
+// 29-bit form is matched because no Ioniq 6 capture shows the frame.
+static void charging_power_frame(uint32_t frame_id, uint8_t deci_kw, can_bus_t bus) {
+    uint8_t d[8] = {[3] = deci_kw};
     rx_frame(frame_id, d, bus);
 }
 static void battery_soc(uint8_t raw) {
@@ -863,8 +863,8 @@ static void run_car_power_state(void) {
     CHECK(car_in_ready_or_above());
 }
 
-// Charging power is published from either identifier, car-side only, and a
-// frame too short for byte 6 is not decoded.
+// Charging power is published from 0x3B7 byte 3 (0.1 kW per count), car-side
+// only, and a frame too short for byte 3 is not decoded.
 static void run_charging_power(void) {
     precondition_init();
     precondition_charging_power_t power;
@@ -872,35 +872,39 @@ static void run_charging_power(void) {
     CHECK(!precondition_get_charging_power(&power));
 
     // car-side only
-    charging_power_frame(0x30E, 120, CAN_BUS_1);
+    charging_power_frame(0x3B7, 120, CAN_BUS_1);
     CHECK(!precondition_get_charging_power(&power));
 
     fake_now = 654321;
-    charging_power_frame(0x30E, 120, CAN_BUS_0);
+    charging_power_frame(0x3B7, 96, CAN_BUS_0);
     CHECK(precondition_get_charging_power(&power));
-    CHECK(power.kw == 120);
+    CHECK(power.deci_kw == 96);   // 9.6 kW
     CHECK(power.updated_at_us == fake_now);
 
-    // 0 kW is a real reading while not charging, not a missing value
+    // 0 is a real reading (session ramping up), not a missing value
     fake_now += 1000;
-    charging_power_frame(0x30E, 0, CAN_BUS_0);
+    charging_power_frame(0x3B7, 0, CAN_BUS_0);
     CHECK(precondition_get_charging_power(&power));
-    CHECK(power.kw == 0);
+    CHECK(power.deci_kw == 0);
     CHECK(power.updated_at_us == fake_now);
 
-    // Ioniq 6 CCU-hub remap of 0x30E
+    // The old sources no longer publish: 0x30E byte 6 (0x00 in every Ioniq 5
+    // row) and its Ioniq 6 CCU-hub remap both leave the queue alone.
+    charging_power_frame(0x30E, 235, CAN_BUS_0);
+    CHECK(precondition_get_charging_power(&power));
+    CHECK(power.deci_kw == 0);
     charging_power_frame(0x0C030A04, 235, CAN_BUS_0);
     CHECK(precondition_get_charging_power(&power));
-    CHECK(power.kw == 235);
+    CHECK(power.deci_kw == 0);
 
-    // A frame too short for byte 6 leaves the last reading alone.
+    // A frame too short for byte 3 leaves the last reading alone.
     twai_message_t short_frame = {0};
-    short_frame.identifier = 0x30E;
-    short_frame.data_length_code = 6;
-    short_frame.data[6] = 99;
+    short_frame.identifier = 0x3B7;
+    short_frame.data_length_code = 3;
+    short_frame.data[3] = 99;
     precondition_can_rx_hook(&short_frame, CAN_BUS_0);
     CHECK(precondition_get_charging_power(&power));
-    CHECK(power.kw == 235);
+    CHECK(power.deci_kw == 0);
 }
 
 // The Ioniq 6 form of the precondition status frame, 0x0A82AA03. It must drive

@@ -591,15 +591,17 @@
                         </div>
                     </td>
                 </tr>
-                <!-- NOTE 2026-11-26: charging_power_kw is 0x30E byte 6, which is
-                     0x00 in every Ioniq 5 row of the recorded corpus, so this row
-                     always reads "0 kW" there. The DBC now scopes byte 6 to the
-                     EV6 (EV6_Charging_Power_kW). 0x30E byte 2 is the Ioniq 5
-                     charging-power-shaped byte (0.2 kW/count, 4.8-11.2 kW) but it
-                     looks like a negotiated limit, not a measurement; measured HV
-                     power is 0x1F7 bytes 2-3 LE (0.01 kW/count), which is not
-                     charging-specific. Do not relabel this row until one of the
-                     two is chosen; see charging_status_semantics_to-be-continued.md. -->
+                <!-- NOTE 2026-11-27: charging_power_kw is 0x3B7 byte 3 at 0.1 kW
+                     per count, the measured charge power (9.6 kW = 0x60, 1.4 kW =
+                     0x0E, 96/14 matching 9.6/1.4 so it cannot be voltage or
+                     current). 0x3B7 exists only while a session runs, so the row
+                     shows "Waiting for CAN data" whenever charging stops - the
+                     firmware reports the sample invalid after
+                     CHARGING_POWER_STALE_US rather than freezing the last rate.
+                     Do not re-wire this to 0x30E byte 6 (0x00 in every Ioniq 5
+                     row) or byte 2 (an AC current limit in amps, 48 A in both the
+                     9.6 kW and the 1.4 kW session). See
+                     charging_status_semantics_to-be-continued.md. -->
                 <tr>
                     <td>Charging Power:</td>
                     <td><div id="charging_power_status">Waiting for CAN data</div></td>

@@ -39,13 +39,17 @@ typedef struct {
 
 bool precondition_get_battery_soc(precondition_soc_t *out);
 
-// Charging power in kW. 0x30E byte 6, or the 29-bit 0x0C030A04 CCU-hub remap
-// on Ioniq 6. Byte 6 is 0x00 in every recorded Ioniq 5 row; the DBC now scopes
-// that signal to the EV6 (EV6_Charging_Power_kW). Byte 2 is the Ioniq 5
-// charging-power-shaped byte but is probably a negotiated limit, not a
-// measurement. See charging_status_semantics_to-be-continued.md.
+// Charging power, measured: 0x3B7 (OBC_02_200ms_2) byte 3, 0.1 kW per count.
+// Verified against three captures whose real draw differs by 6.9x: 0x60 = 9.6 kW
+//
+// 0x3B7 is transmitted only while a session is running - it is absent when the
+// car is plugged in and idle, and from every driving capture - so an old sample
+// means charging stopped, not that a frame was missed. Callers should treat a
+// sample older than CHARGING_POWER_STALE_US as invalid.
+#define CHARGING_POWER_STALE_US (5 * 1000 * 1000LL)
+
 typedef struct {
-    uint8_t kw;
+    uint16_t deci_kw;       // 0.1 kW per count; weird but nice to keep it uint
     int64_t updated_at_us;
 } precondition_charging_power_t;
 

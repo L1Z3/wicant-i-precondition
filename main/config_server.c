@@ -1279,19 +1279,31 @@ char *config_server_get_status_json(bool remove_sensitive_info)
         cJSON_AddBoolToObject(root, "battery_temp_valid", false);
 	}
 
-	// 0x30E byte 6: 0x00 in every recorded Ioniq 5 row; the DBC scopes it to
-	// the EV6. Kept as-is until the label/byte decision in
-	// charging_status_semantics_to-be-continued.md is made.
+	// 0x3B7 byte 3, 0.1 kW per count: the measured charge power (9.6 kW reads
+	// 0x60, 1.4 kW reads 0x0E). The frame is sent only while a session is
+	// running, so an old sample means charging stopped rather than that a frame
+	// was missed - report it as invalid instead of showing the last rate
+	// forever.
 	precondition_charging_power_t charging_power;
 
 	if (precondition_get_charging_power(&charging_power)) {
-        cJSON_AddBoolToObject(root, "charging_power_valid", true);
-        cJSON_AddNumberToObject(root, "charging_power_kw", charging_power.kw);
-        cJSON_AddNumberToObject(
-            root,
-            "charging_power_age_ms",
-            (esp_timer_get_time() - charging_power.updated_at_us) / 1000
-        );
+        int64_t age_us = esp_timer_get_time() - charging_power.updated_at_us;
+
+        if (age_us >= 0 && age_us <= CHARGING_POWER_STALE_US) {
+            cJSON_AddBoolToObject(root, "charging_power_valid", true);
+            cJSON_AddNumberToObject(
+                root,
+                "charging_power_kw",
+                charging_power.deci_kw / 10.0
+            );
+            cJSON_AddNumberToObject(
+                root,
+                "charging_power_age_ms",
+                age_us / 1000
+            );
+        } else {
+            cJSON_AddBoolToObject(root, "charging_power_valid", false);
+        }
 	} else {
         cJSON_AddBoolToObject(root, "charging_power_valid", false);
 	}

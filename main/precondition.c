@@ -175,7 +175,7 @@ static bool is_utility_request(const twai_message_t *frame) {
     (((power_status_byte) & POWER_STATUS_MASK) == 0x04U)
 // Byte 1 disambiguates the low nibble's 0x06, which is either an active
 // charging session or "remotely woken up": 0x8D means a charging session is
-// running (the cable can stay connected with byte 1 back at 0x00), 0xAB is the
+// running (plugged in but not charging has byte 1 == 0x00), 0xAB is the
 // 1-6 frame VCU boot/wake transient after a remote wake. The 0x06 nibble alone
 // cannot tell those apart.
 #define POWER_STATUS_CHARGING_OR_WAKE(power_status_byte) \
@@ -247,18 +247,19 @@ static bool is_utility_request(const twai_message_t *frame) {
 #define IS_CONDITIONING_MODE_FRAME(frame_id) \
     ((frame_id) == CONDITIONING_MODE_FRAME_ID || (frame_id) == CONDITIONING_MODE_FRAME_ID_IONIQ6)
 
-// Charging power: 0x30E byte 6. It is 0x00 in every Ioniq 5 row of the
-// recorded corpus, and the DBC now scopes it to the EV6
-// (EV6_Charging_Power_kW); byte 2 is the Ioniq 5 charging-power-shaped byte but
-// is probably a negotiated limit, not a measurement. Do not re-wire this to byte
-// 2 without deciding what the label means; see
-// charging_status_semantics_to-be-continued.md. The Ioniq 6 uses the CCU-hub
-// remap 0x0C030A04 (family base 0x30A, index 4), seen in its captures and
-// defined in gv60-2024.dbc; ioniq6-2024.dbc does not list the frame.
-#define CHARGING_POWER_INDEX 6U
-#define CHARGING_POWER_DATA_LENGTH 7U
-#define IS_CHARGING_POWER_FRAME(frame_id) \
-    ((frame_id) == 0x30EU || (frame_id) == 0x0C030A04U)
+// Charging power: 0x3B7 (OBC_02_200ms_2) byte 3, 0.1 kW per count. Measured, not
+// a negotiated limit: 0x60 = 9.6 kW, 0x5F = 9.5 kW and 0x0E = 1.4 kW across
+// three captures whose real draw differs by 6.9x, and it ramps 0 -> 95 over ~14 s
+// at session start. See precondition.h for the evidence.
+//
+// 0x30E (VCMS_02_100ms_4) is NOT used: byte 6 is 0x00 in every Ioniq 5 row, and
+// byte 2 (0x30 = 48 A in both the 9.6 kW and the 1.4 kW session) is an AC
+// current limit, not a measurement. No CCU-hub 29-bit remap is matched for
+// 0x3B7 because no Ioniq 6 capture shows the frame; add one only once a capture
+// proves the id.
+#define CHARGING_POWER_INDEX 3U
+#define CHARGING_POWER_DATA_LENGTH 4U  // index 3 + 1
+#define IS_CHARGING_POWER_FRAME(frame_id) ((frame_id) == 0x3B7U)
 
 #define CAR_BUS CAN_BUS_0
 #if CAN_BUS_COUNT > 1
@@ -1731,7 +1732,7 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
             && rx_bus == CAR_BUS
             && to_push->data_length_code >= CHARGING_POWER_DATA_LENGTH) {
         precondition_charging_power_t charging_power = {
-            .kw = to_push->data[CHARGING_POWER_INDEX],
+            .deci_kw = to_push->data[CHARGING_POWER_INDEX],
             .updated_at_us = sm_now(sm),
         };
 
