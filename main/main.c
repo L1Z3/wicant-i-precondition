@@ -57,6 +57,7 @@
 #include "hw_config.h"
 #include "dev_status.h"
 #include "precondition.h"
+#include "ble_button.h"
 #include "beep.h"
 #include "debug_logs.h"
 #include "debug_logs_config.h"
@@ -666,6 +667,7 @@ void app_main(void)
 	// These services read wiring and preconditioning settings during initialization.
 	beep_init();
 	precondition_init();
+	ble_button_init();
 	slcan_init(&send_to_host);
 
 	int8_t can_datarate = config_server_get_can_rate();

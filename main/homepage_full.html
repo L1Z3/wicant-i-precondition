@@ -600,6 +600,19 @@
                     <td><div id="precondition_active_status">Loading...</div></td>
                 </tr>
                 <tr>
+                    <td>BLE Button:</td>
+                    <td>
+                        <div style="display: flex; align-items: center; gap: 1rem;">
+                            <div id="ble_button_pair_status">Not paired</div>
+                            <div id="ble_button_last_press" style="color: #555;">Last pressed: never</div>
+                        </div>
+                    </td>
+                </tr>
+                <tr>
+                    <td>BLE Connection:</td>
+                    <td><div id="ble_button_connection">Not paired</div></td>
+                </tr>
+                <tr>
                     <td><input id="check_status_button" name="check_status_button" type="button" onclick="checkStatus()"
                             value="Check status" /></td>
                     <td>&nbsp;</td>
@@ -1434,6 +1447,16 @@
                     <td>
                         <input id="precon_activate_button" name="precon_activate_button" type="button"
                             onclick="preconActivate()" value="Toggle" />
+                    </td>
+                </tr>
+                <tr>
+                    <td>BLE Button:</td>
+                    <td>
+                        <input id="ble_pair_button" name="ble_pair_button" type="button"
+                            onclick="pairBleButton()" value="Pair BLE Button" />
+                        <input id="ble_unpair_button" name="ble_unpair_button" type="button"
+                            onclick="unpairBleButton()" value="Unpair BLE Button" disabled />
+                        <div id="ble_pair_status" style="font-size: 0.85rem; color: #555; margin-top: 4px;"></div>
                     </td>
                 </tr>
                 <tr>
@@ -3147,6 +3170,137 @@ function loadAutoTable(jsonData) {
 		xhttp.send();
 	}
 
+	// ---- BLE button pairing and status ----
+
+	let blePairTimer = null;
+
+	function bleButtonAge(ms) {
+		const seconds = Math.max(0, Math.floor(ms / 1000));
+		if (seconds < 60) return `${seconds} s`;
+		const minutes = Math.floor(seconds / 60);
+		if (minutes < 60) return `${minutes} min`;
+		return `${Math.floor(minutes / 60)} h`;
+	}
+
+	function refreshBleButtonStatus() {
+		fetch('/ble_button?action=status')
+			.then(response => response.ok ? response.json() : null)
+			.then(obj => {
+				if (!obj) return;
+				const paired = !!obj.paired || !!obj.bound_addr;
+				const statusEl = document.getElementById('ble_button_pair_status');
+				const lastEl = document.getElementById('ble_button_last_press');
+				const connEl = document.getElementById('ble_button_connection');
+				const pairBtn = document.getElementById('ble_pair_button');
+				const unpairBtn = document.getElementById('ble_unpair_button');
+				if (statusEl) {
+					statusEl.textContent = paired ? 'Paired' : 'Not paired';
+				}
+				if (lastEl) {
+					if (paired && typeof obj.last_press_age_ms === 'number') {
+						lastEl.textContent = `Last pressed: ${bleButtonAge(obj.last_press_age_ms)} ago`;
+					} else {
+						lastEl.textContent = 'Last pressed: never';
+					}
+				}
+				if (connEl) {
+					let conn = 'Not paired';
+					if (paired) {
+						if (obj.connected && obj.subscribed) {
+							conn = 'Connected';
+						} else if (obj.connected) {
+							conn = 'Connected, subscribing';
+						} else if (obj.paused) {
+							conn = 'Paused';
+						} else if (obj.learning) {
+							conn = 'Pairing';
+						} else {
+							conn = 'Searching';
+						}
+						const fails = Number(obj.connect_fails) || 0;
+						if (fails > 0) conn += ` (${fails} failed)`;
+					}
+					connEl.textContent = conn;
+				}
+				if (pairBtn && !blePairTimer) {
+					pairBtn.value = paired ? 'Re-pair BLE Button' : 'Pair BLE Button';
+				}
+				if (unpairBtn) {
+					unpairBtn.disabled = !paired;
+				}
+			})
+			.catch(() => {});
+	}
+
+	function pairBleButton() {
+		const pairBtn = document.getElementById('ble_pair_button');
+		const statusEl = document.getElementById('ble_pair_status');
+		if (!pairBtn || !statusEl) return;
+
+		if (blePairTimer) {
+			clearInterval(blePairTimer);
+			blePairTimer = null;
+		}
+		pairBtn.disabled = true;
+		statusEl.textContent = 'Searching… long-press the button to wake it, then short-press once.';
+
+		fetch('/ble_button?action=learn')
+			.then(response => response.json())
+			.then(() => {
+				let elapsed = 0;
+				blePairTimer = setInterval(() => {
+					elapsed += 1;
+					fetch('/ble_button?action=status')
+						.then(response => response.json())
+						.then(obj => {
+							if (obj.bound_addr) {
+								clearInterval(blePairTimer);
+								blePairTimer = null;
+								pairBtn.disabled = false;
+								pairBtn.value = 'Re-pair BLE Button';
+								statusEl.textContent =
+									`Paired with ${obj.bound_addr}. Press it again to toggle preconditioning.`;
+								refreshBleButtonStatus();
+							} else if (elapsed >= 30) {
+								clearInterval(blePairTimer);
+								blePairTimer = null;
+								pairBtn.disabled = false;
+								statusEl.textContent =
+									'No button found. Press it once while this is searching, then try again.';
+							}
+						})
+						.catch(() => {});
+				}, 1000);
+			})
+			.catch(() => {
+				pairBtn.disabled = false;
+				statusEl.textContent = 'Pairing request failed.';
+			});
+	}
+
+	function unpairBleButton() {
+		const statusEl = document.getElementById('ble_pair_status');
+		const unpairBtn = document.getElementById('ble_unpair_button');
+		if (!confirm('Unpair this BLE button? You will need to pair it again before it can toggle preconditioning.')) {
+			return;
+		}
+		if (unpairBtn) unpairBtn.disabled = true;
+		if (statusEl) statusEl.textContent = 'Unpairing…';
+		fetch('/ble_button?action=forget')
+			.then(response => {
+				if (!response.ok) throw new Error('unpair failed');
+				return response.json();
+			})
+			.then(() => {
+				if (statusEl) statusEl.textContent = 'Unpaired. The listener is paused until you pair again.';
+				refreshBleButtonStatus();
+			})
+			.catch(() => {
+				if (statusEl) statusEl.textContent = 'Unpair request failed.';
+				if (unpairBtn) unpairBtn.disabled = false;
+			});
+	}
+
 	function showTrackPopup() {
 		const textInput = document.getElementById("track_popup_text");
 		const popupButton = document.getElementById("track_popup_button");
@@ -3621,6 +3775,8 @@ function loadAutoTable(jsonData) {
             document.getElementById("submit_button").disabled = true;
 		};
 		checkStatus();
+		refreshBleButtonStatus();
+		setInterval(refreshBleButtonStatus, 2000);
 		xhttp.open("GET", "/load_config");
 		xhttp.send();
 	}

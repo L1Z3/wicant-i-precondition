@@ -49,6 +49,7 @@
 #include "dev_status.h"
 #include<stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 
 #include <esp_wifi.h>
 #include <esp_event.h>
@@ -77,6 +78,8 @@
 #include "ha_webhooks.h"
 #include "precondition.h"
 #include "track_popup.h"
+#include "ble_scan.h"
+#include "ble_button.h"
 #include "esp_timer.h"
 
 #define WIFI_CONNECTED_BIT			BIT0
@@ -939,6 +942,125 @@ static esp_err_t precondition_toggle_handler(httpd_req_t *req)
 	precondition_toggle_request();
 	const char *resp_str = "Preconditioning toggled";
     httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+/* httpd_query_key_value() returns the raw query value; decode %XX and '+' so
+ * names with spaces (common on BLE buttons) match what the phone shows. */
+static void ble_scan_url_decode(char *s)
+{
+    char *dst = s;
+    for (char *src = s; *src != '\0'; src++)
+    {
+        if (src[0] == '%' && src[1] != '\0' && src[2] != '\0'
+            && isxdigit((unsigned char)src[1]) && isxdigit((unsigned char)src[2]))
+        {
+            char hex[3] = {src[1], src[2], '\0'};
+            *dst++ = (char)strtol(hex, NULL, 16);
+            src += 2;
+        }
+        else if (src[0] == '+')
+        {
+            *dst++ = ' ';
+        }
+        else
+        {
+            *dst++ = *src;
+        }
+    }
+    *dst = '\0';
+}
+
+static esp_err_t ble_scan_handler(httpd_req_t *req)
+{
+    char qbuf[512] = {0};
+    char val[128] = {0};
+    char name[128] = {0};
+    char uuid[128] = {0};
+    uint32_t ms = 15000;
+
+    if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) == ESP_OK)
+    {
+        if (httpd_query_key_value(qbuf, "ms", val, sizeof(val)) == ESP_OK)
+        {
+            long v = atol(val);
+            if (v > 0 && v <= 300000)
+            {
+                ms = (uint32_t)v;
+            }
+        }
+        if (httpd_query_key_value(qbuf, "name", name, sizeof(name)) != ESP_OK)
+        {
+            name[0] = '\0';
+        }
+        if (httpd_query_key_value(qbuf, "uuid", uuid, sizeof(uuid)) != ESP_OK)
+        {
+            uuid[0] = '\0';
+        }
+        ble_scan_url_decode(name);
+        ble_scan_url_decode(uuid);
+    }
+
+    char *json = ble_scan_json(ms, name[0] ? name : NULL, uuid[0] ? uuid : NULL);
+    if (json == NULL)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "BLE scan failed (is ble_status=enable?)");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    free(json);
+    return ESP_OK;
+}
+
+static esp_err_t ble_button_handler(httpd_req_t *req)
+{
+    char qbuf[128] = {0};
+    char action[16] = "status";
+
+    if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) == ESP_OK)
+    {
+        if (httpd_query_key_value(qbuf, "action", action, sizeof(action)) != ESP_OK)
+        {
+            snprintf(action, sizeof(action), "status");
+        }
+    }
+
+    if (strcmp(action, "learn") == 0)
+    {
+        ble_button_learn();
+    }
+    else if (strcmp(action, "forget") == 0)
+    {
+        ble_button_forget();
+    }
+    else if (strcmp(action, "pause") == 0)
+    {
+        ble_button_set_paused(true);
+    }
+    else if (strcmp(action, "resume") == 0)
+    {
+        ble_button_set_paused(false);
+    }
+    else if (strcmp(action, "status") != 0)
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "action must be status, learn, forget, pause or resume");
+        return ESP_FAIL;
+    }
+
+    char *json = ble_button_status_json();
+    if (json == NULL)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "BLE button status unavailable");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    free(json);
     return ESP_OK;
 }
 
@@ -2094,6 +2216,18 @@ static const httpd_uri_t precondition_toggle = {
     .handler   = precondition_toggle_handler,
     .user_ctx  = NULL
 };
+static const httpd_uri_t ble_scan_uri = {
+    .uri       = "/ble_scan",
+    .method    = HTTP_GET,
+    .handler   = ble_scan_handler,
+    .user_ctx  = NULL
+};
+static const httpd_uri_t ble_button_uri = {
+    .uri       = "/ble_button",
+    .method    = HTTP_GET,
+    .handler   = ble_button_handler,
+    .user_ctx  = NULL
+};
 static const httpd_uri_t track_popup = {
     .uri       = "/track_popup",
     .method    = HTTP_POST,
@@ -2933,6 +3067,8 @@ static httpd_handle_t config_server_init(void)
         httpd_register_uri_handler(server, &file_upload);
 		httpd_register_uri_handler(server, &system_reboot);
 		httpd_register_uri_handler(server, &precondition_toggle);
+		httpd_register_uri_handler(server, &ble_scan_uri);
+		httpd_register_uri_handler(server, &ble_button_uri);
 		httpd_register_uri_handler(server, &track_popup);
 		httpd_register_uri_handler(server, &store_canflt_uri);
 		httpd_register_uri_handler(server, &load_canflt_uri);
@@ -2975,6 +3111,8 @@ void config_server_restart(void)
         httpd_register_uri_handler(server, &file_upload);
 		httpd_register_uri_handler(server, &system_reboot);
 		httpd_register_uri_handler(server, &precondition_toggle);
+		httpd_register_uri_handler(server, &ble_scan_uri);
+		httpd_register_uri_handler(server, &ble_button_uri);
 		httpd_register_uri_handler(server, &track_popup);
 		httpd_register_uri_handler(server, &store_canflt_uri);
 		httpd_register_uri_handler(server, &load_canflt_uri);
