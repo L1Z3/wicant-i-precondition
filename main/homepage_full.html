@@ -561,24 +561,28 @@
                     </td>
                 </tr>
                 <tr id="can_ready_state_row">
-                    <td>Car Power Status (CAN):</td>
+                    <td>Car Power Status:</td>
                     <td>
                         <div id="can_ready_state">Unknown&nbsp;</div>
                     </td>
                 </tr>
+                <!-- 0x038 byte 1 0x8D is "Charging_Session_Active", not cable
+                     presence: in M-CAN_MITM_plugged_in_car-off_charging.csv the
+                     cable stays in while byte 1 flips 0x8D -> 0x00 at t=10.24 s
+                     and back at t=16.48 s. -->
                 <tr>
-                    <td>Plugged In (CAN):</td>
-                    <td><div id="plugged_in_status">Waiting for CAN data</div></td>
+                    <td>Charging Session:</td>
+                    <td><div id="charging_session_status">Waiting for CAN data&nbsp;</div></td>
                 </tr>
                 <tr>
                     <td>HV Battery State of Charge:</td>
-                    <td><div id="battery_soc_status">Waiting for CAN data</div></td>
+                    <td><div id="battery_soc_status">Waiting for CAN data&nbsp;</div></td>
                 </tr>
                 <tr>
                     <td>HV Battery Temperature:</td>
                     <td>
                         <div style="display: flex; align-items: center; gap: 0.5rem;">
-                            <div id="battery_temp_status">Waiting for CAN data</div>
+                            <div id="battery_temp_status">Waiting for CAN data&nbsp;</div>
                             <select id="battery_temp_unit" name="battery_temp_unit" onchange="updatePreconModeHelp(); submit_enable();"
                                 style="width: auto; padding: 0.25rem 0.5rem; font-size: 0.85rem;">
                                 <option value="c">°C</option>
@@ -587,17 +591,25 @@
                         </div>
                     </td>
                 </tr>
+                <!-- NOTE 2026-11-27: charging_power_kw is 0x3B7 byte 3 at 0.1 kW
+                     per count, the measured charge power (9.6 kW = 0x60, 1.4 kW =
+                     0x0E, 96/14 matching 9.6/1.4 so it cannot be voltage or
+                     current). 0x3B7 exists only while a session runs, so the row
+                     shows "Waiting for CAN data" whenever charging stops - the
+                     firmware reports the sample invalid after
+                     CHARGING_POWER_STALE_US rather than freezing the last rate.
+                     -->
                 <tr>
                     <td>Charging Power:</td>
-                    <td><div id="charging_power_status">Waiting for CAN data</div></td>
+                    <td><div id="charging_power_status">Waiting for CAN data&nbsp;</div></td>
                 </tr>
                 <tr>
                     <td>Preconditioning Requested:</td>
-                    <td><div id="precondition_requested_status">Loading...</div></td>
+                    <td><div id="precondition_requested_status">Loading...&nbsp;</div></td>
                 </tr>
                 <tr>
                     <td>Preconditioning Active:</td>
-                    <td><div id="precondition_active_status">Loading...</div></td>
+                    <td><div id="precondition_active_status">Loading...&nbsp;</div></td>
                 </tr>
                 <tr>
                     <td><input id="check_status_button" name="check_status_button" type="button" onclick="checkStatus()"
@@ -2740,9 +2752,10 @@ function loadAutoTable(jsonData) {
 				document.getElementById("port_type_status").innerHTML = "UDP";
 			}
 			if (obj.car_power_valid) {
-				document.getElementById("plugged_in_status").textContent = `${obj.plugged_in ? "Yes" : "No"}; (${formatAge(obj.car_power_age_ms)} ago)`;
+				const chargingSession = (obj.charging_session !== undefined) ? obj.charging_session : obj.plugged_in;
+				document.getElementById("charging_session_status").textContent = `${chargingSession ? "Yes" : "No"}; (${formatAge(obj.car_power_age_ms)} ago)`;
 			} else {
-				document.getElementById("plugged_in_status").textContent = "Waiting for CAN data";
+				document.getElementById("charging_session_status").textContent = "Waiting for CAN data";
 			}
 			if (obj.battery_soc_valid) {
 				document.getElementById("battery_soc_status").textContent = `${obj.battery_soc_pct}%; (${formatAge(obj.battery_soc_age_ms)} ago)`;

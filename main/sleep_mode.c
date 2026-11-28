@@ -409,27 +409,27 @@ static void adc_task(void *pvParameters)
         // but a car that looks "on" inhibits sleeping and forces a wake. The
         // car looks on if either the hot-when-on sense pin is above the fixed
         // CAR_ON_THRESHOLD_V (pin-equipped boards only), or the CAN-derived
-        // READY state (0x038, or the 29-bit 0x00C03503 on Ioniq 6) is set.
+        // power state (0x038, or the 29-bit 0x00C03503 on Ioniq 6) is READY or
+        // above.
         //
         // NOTE: neither signal is guaranteed to be reachable today, so this
         // condition may never fire on some setups. Without the sense pin the
-        // first term is constant false; car_in_ready() stays false until a
-        // power-status frame is seen, which the bus may never carry; and once
-        // asleep the CAN buses are disabled, so car_in_ready() can no longer
+        // first term is constant false; car_in_ready_or_above() stays false
+        // until a power-status frame is seen, which the bus may never carry;
+        // and once asleep the CAN buses are disabled, so it can no longer
         // change and the wake path falls back to the battery voltage crossing
         // the setpoint. Keep the condition anyway: it is the correct one
         // wherever those signals do exist.
         //
         // The two signals are not completely equivalent. The car-on sense pin
-        // uses MODULE5 voltage, which is `HOT IN ON OR START`, so lower power 
-        // states than READY are accepted, whereas car_in_ready() only looks 
-        // for ready. This distinction probably isn't that important but could 
-        // be fixed later.
+        // uses MODULE5 voltage, which is `HOT IN ON OR START`, so it also
+        // asserts in the lower ON/not-READY state, whereas
+        // car_in_ready_or_above() starts at READY (byte 0 >= 0x04).
 #if HW_HAS_CAR_ON_SENSE
         bool car_awake = (car_on_sense_voltage > CAR_ON_THRESHOLD_V)
-                || car_in_ready();
+                || car_in_ready_or_above();
 #else
-        bool car_awake = car_in_ready();
+        bool car_awake = car_in_ready_or_above();
 #endif
 
         if(enable_sleep == 1) {

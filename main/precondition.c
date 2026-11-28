@@ -173,15 +173,17 @@ static bool is_utility_request(const twai_message_t *frame) {
 #define POWER_STATUS_MASK 0x0FU
 #define POWER_STATUS_READY(power_status_byte) \
     (((power_status_byte) & POWER_STATUS_MASK) == 0x04U)
-// Byte 1 disambiguates the low nibble's 0x06, which is either "charging/plugged
-// in" or "remotely woken up": 0x8D means the charge cable is connected (whether
-// charging or not), 0xAB is the 1-6 frame VCU boot/wake transient after a
-// remote wake. The 0x06 nibble alone cannot tell those apart.
+// Byte 1 disambiguates the low nibble's 0x06, which is either an active
+// charging session or "remotely woken up": 0x8D means a charging session is
+// running (plugged in but not charging has byte 1 == 0x00), 0xAB is the
+// 1-6 frame VCU boot/wake transient after a remote wake. The 0x06 nibble alone
+// cannot tell those apart.
 #define POWER_STATUS_CHARGING_OR_WAKE(power_status_byte) \
     (((power_status_byte) & POWER_STATUS_MASK) == 0x06U)
-#define POWER_STATUS_BYTE1_PLUGGED_IN 0x8DU
-#define POWER_STATUS_PLUGGED_IN(power_status_byte1) \
-    ((power_status_byte1) == POWER_STATUS_BYTE1_PLUGGED_IN)
+#define POWER_STATUS_BYTE1_CHARGING_SESSION 0x8DU
+#define POWER_STATUS_BYTE1_REMOTE_WAKE 0xABU
+#define POWER_STATUS_CHARGING_SESSION(power_status_byte1) \
+    ((power_status_byte1) == POWER_STATUS_BYTE1_CHARGING_SESSION)
 
 #define PRECONDITION_DEBOUNCE_US 1000000U  // 1 second
 #define PRECONDITION_LONG_PRESS_US 1000000U  // short/long press threshold: 1 second
@@ -245,13 +247,19 @@ static bool is_utility_request(const twai_message_t *frame) {
 #define IS_CONDITIONING_MODE_FRAME(frame_id) \
     ((frame_id) == CONDITIONING_MODE_FRAME_ID || (frame_id) == CONDITIONING_MODE_FRAME_ID_IONIQ6)
 
-// Charging power: byte 6 is kW on 0x30E (Ioniq 5/EV6). The Ioniq 6 uses the
-// CCU-hub remap 0x0C030A04 (family base 0x30A, index 4), seen in its captures
-// and defined in gv60-2024.dbc; ioniq6-2024.dbc does not list the frame.
-#define CHARGING_POWER_INDEX 6U
-#define CHARGING_POWER_DATA_LENGTH 7U
-#define IS_CHARGING_POWER_FRAME(frame_id) \
-    ((frame_id) == 0x30EU || (frame_id) == 0x0C030A04U)
+// Charging power: 0x3B7 (OBC_02_200ms_2) byte 3, 0.1 kW per count. Measured, not
+// a negotiated limit: 0x60 = 9.6 kW, 0x5F = 9.5 kW and 0x0E = 1.4 kW across
+// three captures whose real draw differs by 6.9x, and it ramps 0 -> 95 over ~14 s
+// at session start. See precondition.h for the evidence.
+//
+// 0x30E (VCMS_02_100ms_4) is NOT used: byte 6 is 0x00 in every Ioniq 5 row, and
+// byte 2 (0x30 = 48 A in both the 9.6 kW and the 1.4 kW session) is an AC
+// current limit, not a measurement. No CCU-hub 29-bit remap is matched for
+// 0x3B7 because no Ioniq 6 capture shows the frame; add one only once a capture
+// proves the id.
+#define CHARGING_POWER_INDEX 3U
+#define CHARGING_POWER_DATA_LENGTH 4U  // index 3 + 1
+#define IS_CHARGING_POWER_FRAME(frame_id) ((frame_id) == 0x3B7U)
 
 #define CAR_BUS CAN_BUS_0
 #if CAN_BUS_COUNT > 1
@@ -450,6 +458,12 @@ static struct {
     // readers; relaxed accesses suffice because this value does not signal that
     // other shared data is ready to read.
     _Atomic ready_status_t ready_status;
+    // raw bytes behind ready_status, kept for car_power_state() and
+    // car_in_ready_or_above(): byte 0's low nibble in the low byte, byte 1 in
+    // the high byte. Packed so a reader cannot mix bytes from two frames;
+    // power_status_valid latches on the first frame that has byte 0.
+    _Atomic uint16_t power_status;
+    _Atomic bool power_status_valid;
     bool car_in_utility;
     // most recent battery conditioning mode reported by the car
     conditioning_mode_t conditioning_mode;
@@ -1552,12 +1566,26 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
     if (IS_POWER_STATUS_FRAME(to_push->identifier)
             && rx_bus == CAR_BUS
             && to_push->data_length_code >= 1U) {
-        // byte 1 carries the plug state; a frame too short to have it is not
-        // enough to decode, so leave the last published value alone.
+        // Keep the raw bytes too, for car_power_state() and
+        // car_in_ready_or_above(). A frame with only byte 0 still updates the
+        // state; byte 1 stays zero when the frame is too short to carry it.
+        uint16_t power_status = (uint16_t)(to_push->data[0] & POWER_STATUS_MASK);
+        if (to_push->data_length_code >= 2U) {
+            power_status |= (uint16_t)to_push->data[1] << 8U;
+        }
+        atomic_store_explicit(
+            &platform.power_status, power_status, memory_order_relaxed
+        );
+        atomic_store_explicit(
+            &platform.power_status_valid, true, memory_order_release
+        );
+
+        // byte 1 marks the charging session; a frame too short to have it is
+        // not enough to decode, so leave the last published value alone.
         if (to_push->data_length_code >= 2U) {
             precondition_power_t power = {
-                .plugged_in = POWER_STATUS_CHARGING_OR_WAKE(to_push->data[0])
-                              && POWER_STATUS_PLUGGED_IN(to_push->data[1]),
+                .charging_session = POWER_STATUS_CHARGING_OR_WAKE(to_push->data[0])
+                                    && POWER_STATUS_CHARGING_SESSION(to_push->data[1]),
                 .updated_at_us = sm_now(sm),
             };
             xQueueOverwrite(car_power_queue, &power);
@@ -1704,7 +1732,7 @@ static void precondition_global_rx(sm_t *sm, const twai_message_t *to_push, can_
             && rx_bus == CAR_BUS
             && to_push->data_length_code >= CHARGING_POWER_DATA_LENGTH) {
         precondition_charging_power_t charging_power = {
-            .kw = to_push->data[CHARGING_POWER_INDEX],
+            .deci_kw = to_push->data[CHARGING_POWER_INDEX],
             .updated_at_us = sm_now(sm),
         };
 
@@ -1880,4 +1908,58 @@ bool precondition_get_car_model(egmp_car_model_t *out) {
 bool car_in_ready(void) {
     return atomic_load_explicit(&platform.ready_status, memory_order_relaxed)
            == READY_STATUS_READY;
+}
+
+// Read the packed power-status bytes. The acquire pairs with the release store
+// in precondition_global_rx, so a reader that sees valid also sees the bytes it
+// was set with.
+static bool load_power_status(uint16_t *out) {
+    if (!atomic_load_explicit(&platform.power_status_valid, memory_order_acquire)) {
+        return false;
+    }
+
+    *out = atomic_load_explicit(&platform.power_status, memory_order_relaxed);
+    return true;
+}
+
+bool car_in_ready_or_above(void) {
+    uint16_t power_status;
+
+    if (!load_power_status(&power_status)) {
+        return false;
+    }
+
+    return (power_status & POWER_STATUS_MASK) >= 0x04U;
+}
+
+int car_power_state(void) {
+    uint16_t power_status;
+
+    if (!load_power_status(&power_status)) {
+        return CAR_POWER_STATE_UNKNOWN;
+    }
+
+    uint8_t state = (uint8_t)(power_status & POWER_STATUS_MASK);
+    uint8_t detail = (uint8_t)(power_status >> 8U);
+
+    switch (state) {
+    case 0x00U:
+        return CAR_POWER_STATE_OFF_ASLEEP;
+    case 0x01U:
+        return CAR_POWER_STATE_OFF_AWAKE;
+    case 0x02U:
+        return CAR_POWER_STATE_ON_NOT_READY;
+    case 0x04U:
+        return CAR_POWER_STATE_READY;
+    case 0x06U:
+        if (detail == POWER_STATUS_BYTE1_CHARGING_SESSION) {
+            return CAR_POWER_STATE_CHARGING_SESSION;
+        }
+        if (detail == POWER_STATUS_BYTE1_REMOTE_WAKE) {
+            return CAR_POWER_STATE_REMOTE_WAKE;
+        }
+        return CAR_POWER_STATE_UNDOCUMENTED;
+    default:
+        return CAR_POWER_STATE_UNDOCUMENTED;
+    }
 }

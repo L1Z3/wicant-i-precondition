@@ -1157,6 +1157,31 @@ static esp_err_t check_status_handler(httpd_req_t *req)
 	return ESP_OK;
 }
 
+// Name for the DBC's Power_Status_Ready codes. Byte 1 splits the 0x06 code
+// into an active charging session and remote wake; anything else decodes as
+// undocumented.
+static const char *car_power_state_name(int state)
+{
+	switch (state) {
+	case CAR_POWER_STATE_OFF_ASLEEP:
+		return "Off (Asleep)";
+	case CAR_POWER_STATE_OFF_AWAKE:
+		return "Off (Awake)";
+	case CAR_POWER_STATE_ON_NOT_READY:
+		return "ON (Not Ready)";
+	case CAR_POWER_STATE_READY:
+		return "Ready";
+	case CAR_POWER_STATE_CHARGING_SESSION:
+		return "Charging Session";
+	case CAR_POWER_STATE_REMOTE_WAKE:
+		return "Remote Wake";
+	case CAR_POWER_STATE_UNDOCUMENTED:
+		return "Undocumented";
+	default:
+		return "Unknown";
+	}
+}
+
 char *config_server_get_status_json(bool remove_sensitive_info)
 {
 	char ip_str[20] = {0};
@@ -1254,16 +1279,31 @@ char *config_server_get_status_json(bool remove_sensitive_info)
         cJSON_AddBoolToObject(root, "battery_temp_valid", false);
 	}
 
+	// 0x3B7 byte 3, 0.1 kW per count: the measured charge power (9.6 kW reads
+	// 0x60, 1.4 kW reads 0x0E). The frame is sent only while a session is
+	// running, so an old sample means charging stopped rather than that a frame
+	// was missed - report it as invalid instead of showing the last rate
+	// forever.
 	precondition_charging_power_t charging_power;
 
 	if (precondition_get_charging_power(&charging_power)) {
-        cJSON_AddBoolToObject(root, "charging_power_valid", true);
-        cJSON_AddNumberToObject(root, "charging_power_kw", charging_power.kw);
-        cJSON_AddNumberToObject(
-            root,
-            "charging_power_age_ms",
-            (esp_timer_get_time() - charging_power.updated_at_us) / 1000
-        );
+        int64_t age_us = esp_timer_get_time() - charging_power.updated_at_us;
+
+        if (age_us >= 0 && age_us <= CHARGING_POWER_STALE_US) {
+            cJSON_AddBoolToObject(root, "charging_power_valid", true);
+            cJSON_AddNumberToObject(
+                root,
+                "charging_power_kw",
+                charging_power.deci_kw / 10.0
+            );
+            cJSON_AddNumberToObject(
+                root,
+                "charging_power_age_ms",
+                age_us / 1000
+            );
+        } else {
+            cJSON_AddBoolToObject(root, "charging_power_valid", false);
+        }
 	} else {
         cJSON_AddBoolToObject(root, "charging_power_valid", false);
 	}
@@ -1318,16 +1358,20 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 		cJSON_AddStringToObject(root, "car_on_sense_voltage", car_on_sense_voltage_str);
 	}
 
-	// CAN-derived READY state (0x038 power status, 0x00C03503 on Ioniq 6);
+	// CAN-derived power state (0x038 power status, 0x00C03503 on Ioniq 6);
 	// shown by the web UI in place of the car-on sense voltage on boards
 	// without the sense pin.
-	cJSON_AddStringToObject(root, "can_ready_state", car_in_ready() ? "Ready" : "Not Ready");
+	cJSON_AddStringToObject(root, "can_ready_state", car_power_state_name(car_power_state()));
 
 	precondition_power_t car_power;
 
 	if (precondition_get_car_power(&car_power)) {
         cJSON_AddBoolToObject(root, "car_power_valid", true);
-        cJSON_AddBoolToObject(root, "plugged_in", car_power.plugged_in);
+        // A charging session is active (0x038 = 0x06/0x8D). 0x8D tracks the
+        // session, not cable presence. `plugged_in` is the old name, kept for a
+        // release so external pages/scripts reading it do not break.
+        cJSON_AddBoolToObject(root, "charging_session", car_power.charging_session);
+        cJSON_AddBoolToObject(root, "plugged_in", car_power.charging_session);
         cJSON_AddNumberToObject(
             root,
             "car_power_age_ms",
